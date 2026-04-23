@@ -13,6 +13,8 @@ This enables per-submodule quantization with different strategies.
 
 from __future__ import annotations
 
+from physicalai.export.mixin_policy import _postprocess_openvino_model
+
 import logging
 from typing import Any
 
@@ -338,10 +340,10 @@ class Pi05PartitionedOVModel(nn.Module):
 
         # Stage 1: Prefix encoding via PaliGemma IR (single camera)
         paligemma_inputs = {
-            "image": images[0].numpy(),
-            "img_mask": img_masks[0].numpy(),
-            "tokens": tokens.numpy(),
-            "masks": masks.numpy(),
+            "images": images[0].numpy(),
+            "image_masks": img_masks[0].numpy(),
+            "tokenized_prompt": tokens.numpy(),
+            "tokenized_prompt_mask": masks.numpy(),
         }
 
         paligemma_result = self._paligemma_compiled(paligemma_inputs)
@@ -404,7 +406,6 @@ class Pi05PartitionedOVModel(nn.Module):
 def export_partitioned_openvino(
     pi05_model: Pi05Model,
     output_dir: str,
-    input_sample: dict[str, Tensor] | None = None,
     compress_to_fp16: bool = True,
     tokenizer: Any | None = None,
 ) -> dict[str, str]:
@@ -448,20 +449,14 @@ def export_partitioned_openvino(
 
     # --- Export PaliGemma Encoder ---
     logger.info("Exporting PaliGemma encoder...")
-    # Find image shape from dataset stats or vision config
-    image_shape = None
-    for feature_id in pi05_model._dataset_stats:
-        if "image" in feature_id:
-            image_shape = tuple(pi05_model._dataset_stats[feature_id]["shape"])
-            break
-
-    if image_shape is None:
-        # Fallback: derive from the PaliGemma vision config
-        vision_cfg = pi05_model.paligemma_with_expert.paligemma.config.vision_config
-        img_size = vision_cfg.image_size
-        num_channels = vision_cfg.num_channels
-        image_shape = (num_channels, img_size, img_size)
-        logger.info("No image features in dataset_stats, using vision config: %s", image_shape)
+    # Always use the vision tower's expected resolution for tracing inputs.
+    # Dataset stats may store the original (pre-resize) image shape, but the
+    # SigLIP vision tower requires images at its configured resolution.
+    vision_cfg = pi05_model.paligemma_with_expert.paligemma.config.vision_config
+    img_size = vision_cfg.image_size
+    num_channels = vision_cfg.num_channels
+    image_shape = (num_channels, img_size, img_size)
+    logger.info("Using vision config image shape for tracing: %s", image_shape)
 
     # Create sample inputs for encoder tracing (single image)
     sample_image = torch.randn(batch_size, *image_shape, device=device)
@@ -482,10 +477,20 @@ def export_partitioned_openvino(
         paligemma_encoder,
         args=(sample_image, sample_img_mask, sample_tokens, sample_masks),
         f=str(paligemma_onnx_path),
-        input_names=["image", "img_mask", "tokens", "masks"],
+        input_names=["images", "image_masks", "tokenized_prompt", "tokenized_prompt_mask"],
         output_names=["cache_keys", "cache_values", "prefix_pad_masks"],
+        dynamic_axes={
+            "images": {0: "batch"},
+            "image_masks": {0: "batch"},
+            "tokenized_prompt": {0: "batch"},
+            "tokenized_prompt_mask": {0: "batch"},
+            "cache_keys": {1: "batch"},
+            "cache_values": {1: "batch"},
+            "prefix_pad_masks": {0: "batch"},
+        },
     )
     ov_paligemma = openvino.convert_model(str(paligemma_onnx_path))
+    _postprocess_openvino_model(ov_paligemma, ["cache_keys", "cache_values", "prefix_pad_masks"])
     paligemma_xml = output_path / "paligemma_encoder.xml"
     openvino.save_model(ov_paligemma, str(paligemma_xml), compress_to_fp16=compress_to_fp16)
     paligemma_onnx_path.unlink()  # cleanup intermediate onnx
@@ -503,8 +508,17 @@ def export_partitioned_openvino(
         f=str(expert_onnx_path),
         input_names=["x_t", "timestep", "cache_keys", "cache_values", "prefix_pad_masks"],
         output_names=["suffix_out"],
+        dynamic_axes={
+            "x_t": {0: "batch"},
+            "timestep": {0: "batch"},
+            "cache_keys": {1: "batch"},
+            "cache_values": {1: "batch"},
+            "prefix_pad_masks": {0: "batch"},
+            "suffix_out": {0: "batch"},
+        },
     )
     ov_expert = openvino.convert_model(str(expert_onnx_path))
+    _postprocess_openvino_model(ov_expert, ["suffix_out"])
     expert_xml = output_path / "gemma_expert_decoder.xml"
     openvino.save_model(ov_expert, str(expert_xml), compress_to_fp16=compress_to_fp16)
     expert_onnx_path.unlink()
@@ -521,8 +535,13 @@ def export_partitioned_openvino(
         f=str(head_onnx_path),
         input_names=["suffix_out"],
         output_names=["action"],
+        dynamic_axes={
+            "suffix_out": {0: "batch"},
+            "action": {0: "batch"},
+        },
     )
     ov_head = openvino.convert_model(str(head_onnx_path))
+    _postprocess_openvino_model(ov_head, ["action"])
     head_xml = output_path / "action_output_head.xml"
     openvino.save_model(ov_head, str(head_xml), compress_to_fp16=compress_to_fp16)
     head_onnx_path.unlink()
@@ -534,11 +553,19 @@ def export_partitioned_openvino(
     logger.info("Preprocessor config saved to %s", output_path / "preprocessor_config.json")
 
     # --- Write manifest.json so InferenceModel.load() works ---
+    # Derive actual action dimension from dataset stats
+    action_dim = None
+    if pi05_model._dataset_stats and "action" in pi05_model._dataset_stats:
+        action_dim = pi05_model._dataset_stats["action"]["shape"][0]
+
     _write_partitioned_manifest(
         output_path,
         chunk_size=chunk_size,
         max_action_dim=max_action_dim,
         num_inference_steps=pi05_model._num_inference_steps,
+        action_dim=action_dim,
+        dataset_stats=pi05_model._dataset_stats,
+        image_resolution=image_shape[1:] if image_shape is not None else (224, 224),
     )
     logger.info("Manifest written to %s", output_path / "manifest.json")
 
@@ -553,7 +580,7 @@ def _save_preprocessor_config(pi05_model: Pi05Model, output_dir: Any) -> None:
     """Save preprocessor configuration for inference-time observation preprocessing.
 
     Writes ``preprocessor_config.json`` containing dataset stats, tokenizer name,
-    image resolution, and other parameters needed by Pi05InferencePreprocessor.
+    image resolution, and other parameters needed by Pi05Preprocessor.
 
     Args:
         pi05_model: The Pi05Model with dataset stats.
@@ -634,29 +661,60 @@ def _save_tokenizer(pi05_model: Pi05Model, output_dir: Any, tokenizer: Any | Non
     logger.info("Tokenizer saved to %s", tokenizer_dir)
 
 
+def _stats_to_serializable(stats_dict: dict[str, Any]) -> dict[str, Any]:
+    """Convert stats values (tensors/arrays) to JSON-serializable lists.
+
+    Args:
+        stats_dict: Dict mapping stat names to tensor/array/list values.
+
+    Returns:
+        Dict with all values converted to plain Python lists.
+    """
+    result: dict[str, Any] = {}
+    for key, value in stats_dict.items():
+        if hasattr(value, "tolist"):
+            result[key] = value.tolist()
+        elif isinstance(value, (list, tuple)):
+            result[key] = list(value)
+        else:
+            result[key] = value
+    return result
+
+
 def _write_partitioned_manifest(
     output_dir: Any,
     chunk_size: int,
     max_action_dim: int,
     num_inference_steps: int,
+    action_dim: int | None = None,
+    dataset_stats: dict[str, Any] | None = None,
+    image_resolution: tuple[int, int] = (224, 224),
+    normalization_mode: str = "mean_std",
+    tokenizer_max_length: int = 200,
 ) -> None:
     """Write a manifest.json for the partitioned export.
 
     The manifest includes an ``adapter`` ComponentSpec that tells
     InferenceModel to use PartitionedOpenVINOAdapter instead of the
-    default monolithic OpenVINO adapter, and a preprocessor spec
-    for observation-to-tokenized-input conversion.
+    default monolithic OpenVINO adapter, and preprocessor/postprocessor
+    specs for observation-to-tokenized-input conversion and action
+    denormalization.
 
     Args:
         output_dir: Directory containing the exported IR files.
         chunk_size: Action chunk size.
         max_action_dim: Maximum action dimension.
         num_inference_steps: Number of denoising steps.
+        dataset_stats: Dataset statistics dict for normalization.
+        image_resolution: Target image resolution (H, W).
+        normalization_mode: Normalization mode ('mean_std', 'min_max', etc.).
+        tokenizer_max_length: Maximum tokenizer length.
     """
-    from physicalai.inference.adapters.openvino_partitioned import PartitionedOpenVINOAdapter
-    from physicalai.inference.manifest import ComponentSpec, Manifest, PolicySpec
-    from physicalai.inference.runners.action_chunking import ActionChunking
-    from physicalai.inference.runners.single_pass import SinglePass
+    from physicalai.data.observation import ACTION, STATE  # noqa: PLC0415
+    from physicalai.inference.adapters.openvino_partitioned import PartitionedOpenVINOAdapter  # noqa: PLC0415
+    from physicalai.inference.manifest import ComponentSpec, Manifest, ModelSpec, PolicySpec  # noqa: PLC0415
+    from physicalai.inference.runners.action_chunking import ActionChunking  # noqa: PLC0415
+    from physicalai.inference.runners.single_pass import SinglePass  # noqa: PLC0415
 
     adapter_spec = ComponentSpec.from_class(
         PartitionedOpenVINOAdapter,
@@ -664,6 +722,7 @@ def _write_partitioned_manifest(
         num_inference_steps=num_inference_steps,
         chunk_size=chunk_size,
         max_action_dim=max_action_dim,
+        action_dim=action_dim,
     )
 
     runner_spec = ComponentSpec.from_class(
@@ -672,18 +731,62 @@ def _write_partitioned_manifest(
         chunk_size=chunk_size,
     )
 
+    # Build preprocessor specs
+    preprocessor_specs = [
+        ComponentSpec(
+            type="pi05",
+            image_resolution=list(image_resolution),
+            empty_cameras=0,
+        ),
+    ]
+
+    postprocessor_specs = []
+
+    if dataset_stats is not None:
+        # State normalization preprocessor
+        state_key = f"observation.{STATE}"
+        if state_key in dataset_stats:
+            state_stats = _stats_to_serializable(dataset_stats[state_key])
+            preprocessor_specs.append(
+                ComponentSpec(
+                    type="normalize",
+                    stats={STATE: state_stats},
+                    mode=normalization_mode,
+                ),
+            )
+
+        # HF tokenizer preprocessor (partitioned uses HF tokenizer, not OV)
+        preprocessor_specs.append(
+            ComponentSpec(
+                type="hf_tokenizer",
+                tokenizer_name="google/paligemma-3b-pt-224",
+                revision="35e4f46485b4d07967e7e9935bc3786aad50687c",
+                max_token_len=tokenizer_max_length,
+            ),
+        )
+
+        # Action denormalization postprocessor
+        if ACTION in dataset_stats:
+            action_stats = _stats_to_serializable(dataset_stats[ACTION])
+            postprocessor_specs.append(
+                ComponentSpec(
+                    type="denormalize",
+                    stats={ACTION: action_stats},
+                    mode=normalization_mode,
+                ),
+            )
+
     manifest = Manifest(
         policy=PolicySpec(
             name="pi05",
-            kind="action_chunking",
-            class_path="physicalai.policies.pi05.policy.Pi05",
+            source={"class_path": "physicalai.policies.pi05.policy.Pi05"},
         ),
-        artifacts={
-            "openvino": "paligemma_encoder.xml",
-        },
-        adapter=adapter_spec,
-        runner=runner_spec,
-        preprocessors=[],
-        postprocessors=[],
+        model=ModelSpec(
+            artifacts={"openvino": "paligemma_encoder.xml"},
+            adapter=adapter_spec,
+            runner=runner_spec,
+            preprocessors=preprocessor_specs,
+            postprocessors=postprocessor_specs,
+        ),
     )
     manifest.save(output_dir / "manifest.json")

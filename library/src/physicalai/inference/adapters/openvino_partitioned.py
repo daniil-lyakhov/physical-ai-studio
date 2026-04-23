@@ -48,6 +48,7 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         num_inference_steps: int = 10,
         chunk_size: int = 50,
         max_action_dim: int = 32,
+        action_dim: int | None = None,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
         """Initialize the partitioned adapter.
@@ -57,12 +58,15 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             num_inference_steps: Number of denoising iterations.
             chunk_size: Number of action steps in a chunk.
             max_action_dim: Maximum action dimension (padded).
+            action_dim: Actual action dimension (unpadded). If provided,
+                output actions are trimmed to this size.
             **kwargs: Additional OpenVINO compile options.
         """
         super().__init__(device, **kwargs)
         self._num_inference_steps = num_inference_steps
         self._chunk_size = chunk_size
         self._max_action_dim = max_action_dim
+        self._action_dim = action_dim
 
         self._paligemma_compiled: openvino.CompiledModel | None = None
         self._expert_compiled: openvino.CompiledModel | None = None
@@ -149,14 +153,25 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             raise RuntimeError(msg)
 
         # Stage 1: Prefix encoding
-        paligemma_result = self._paligemma_compiled(inputs)
+        # The preprocessor outputs images as (n_cameras, batch, C, H, W).
+        # The paligemma encoder expects a single image (batch, C, H, W),
+        # so extract the first camera before feeding to the IR model.
+        paligemma_inputs = dict(inputs)
+        images = paligemma_inputs.get("images")
+        if images is not None and images.ndim == 5:  # noqa: PLR2004
+            paligemma_inputs["images"] = images[0]
+        image_masks = paligemma_inputs.get("image_masks")
+        if image_masks is not None and image_masks.ndim == 2:  # noqa: PLR2004
+            paligemma_inputs["image_masks"] = image_masks[0]
+
+        paligemma_result = self._paligemma_compiled(paligemma_inputs)
         cache_keys = paligemma_result[0]
         cache_values = paligemma_result[1]
         prefix_pad_masks = paligemma_result[2]
 
-        # Determine batch size from first input
-        first_input = next(iter(inputs.values()))
-        batch_size = first_input.shape[0]
+        # Determine batch size from the paligemma inputs (after camera extraction)
+        # not from original inputs where images may have an extra camera dimension.
+        batch_size = paligemma_inputs["images"].shape[0] if "images" in paligemma_inputs else next(iter(paligemma_inputs.values())).shape[0]
 
         # Stage 2: Iterative denoising
         x_t = np.zeros(
@@ -184,6 +199,10 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             v_t = head_result[0]
 
             x_t = x_t + dt * v_t
+
+        # Trim padded action dimension to actual action size
+        if self._action_dim is not None:
+            x_t = x_t[:, :, :self._action_dim]
 
         return {"action": x_t}
 

@@ -117,7 +117,14 @@ class InferenceModel:
             device = self._detect_device()
         self.device = device
 
-        self.adapter: RuntimeAdapter = get_adapter(self.backend, device=device, **adapter_kwargs)
+        if self.manifest.model.adapter is not None:
+            adapter_spec = self.manifest.model.adapter
+            if adapter_spec.class_path:
+                overridden_args = {**adapter_spec.init_args, "device": device, **adapter_kwargs}
+                adapter_spec = ComponentSpec(class_path=adapter_spec.class_path, init_args=overridden_args)
+            self.adapter = instantiate_component(adapter_spec)
+        else:
+            self.adapter = get_adapter(self.backend, device=device, **adapter_kwargs)
         model_path = self._get_model_path()
         self.adapter.load(model_path)
 

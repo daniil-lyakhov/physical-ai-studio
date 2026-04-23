@@ -105,10 +105,10 @@ def _make_reference_inputs(batch_size: int = 1) -> dict[str, np.ndarray]:
     """Create deterministic model inputs."""
     np.random.seed(_REFERENCE_INPUT_SEED)
     return {
-        "image": np.random.randn(batch_size, 3, 224, 224).astype(np.float32),
-        "img_mask": np.ones((batch_size,), dtype=bool),
-        "tokens": np.zeros((batch_size, 200), dtype=np.int64),
-        "masks": np.ones((batch_size, 200), dtype=bool),
+        "images": np.random.randn(batch_size, 3, 224, 224).astype(np.float32),
+        "image_masks": np.ones((batch_size,), dtype=bool),
+        "tokenized_prompt": np.zeros((batch_size, 200), dtype=np.int64),
+        "tokenized_prompt_mask": np.ones((batch_size, 200), dtype=bool),
     }
 
 
@@ -133,10 +133,10 @@ def pi05_reference(request):
         )
         with torch.no_grad():
             pytorch_actions = pi05_model.sample_actions(
-                [torch.from_numpy(inputs["image"]).to(_DEVICE)],
-                [torch.from_numpy(inputs["img_mask"]).to(_DEVICE)],
-                torch.from_numpy(inputs["tokens"]).to(_DEVICE),
-                torch.from_numpy(inputs["masks"]).to(_DEVICE),
+                [torch.from_numpy(inputs["images"]).to(_DEVICE)],
+                [torch.from_numpy(inputs["image_masks"]).to(_DEVICE)],
+                torch.from_numpy(inputs["tokenized_prompt"]).to(_DEVICE),
+                torch.from_numpy(inputs["tokenized_prompt_mask"]).to(_DEVICE),
                 noise=noise,
             ).numpy()
         cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -244,7 +244,7 @@ class TestInferenceModelPipeline:
         model.metadata = {}
 
         obs = pi05_reference["inputs"]
-        batch_size = obs["image"].shape[0]
+        batch_size = obs["images"].shape[0]
 
         model.reset()
         action_1 = model.select_action(obs)
@@ -311,7 +311,7 @@ class TestQuantizedPartitionedModel:
 
         inputs = pi05_reference["inputs"]
         pytorch_actions = pi05_reference["pytorch_actions"]
-        batch_size = inputs["image"].shape[0]
+        batch_size = inputs["images"].shape[0]
 
         outputs = adapter.predict(inputs)
         assert "action" in outputs

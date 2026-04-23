@@ -267,6 +267,7 @@ class ModelSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
     n_obs_steps: int = 1
     runner: ComponentSpec | None = None
+    adapter: ComponentSpec | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)
     preprocessors: list[ComponentSpec] = Field(default_factory=list)
     postprocessors: list[ComponentSpec] = Field(default_factory=list)
