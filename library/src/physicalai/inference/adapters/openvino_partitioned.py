@@ -129,17 +129,25 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             inp.any_name for inp in self._paligemma_compiled.inputs
         ]
 
-    def predict(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def predict(
+        self,
+        inputs: dict[str, np.ndarray],
+        *,
+        noise: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
         """Run the full 3-stage denoising inference pipeline.
 
         Executes:
         1. PaliGemma encoder: inputs → KV cache + prefix masks
         2. Expert decoder × N steps: denoising loop
-        3. Action head: final projection
+        3. Action head: final action projection
 
         Args:
             inputs: Dict with keys matching paligemma encoder inputs
                 (e.g., "image", "img_mask", "tokens", "masks").
+            noise: Optional initial noise tensor of shape
+                (batch, chunk_size, max_action_dim). If ``None``,
+                random noise is sampled.
 
         Returns:
             Dict with "action" key containing the denoised action chunk
@@ -155,9 +163,9 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         # Stage 1: Prefix encoding
         # The preprocessor outputs images as (n_cameras, batch, C, H, W)
         # and image_masks as (n_cameras, batch).
-        # Run the paligemma encoder once per camera and concatenate
-        # KV caches along the sequence dimension — matching how
-        # embed_prefix processes each camera independently.
+        # Pass all cameras to the encoder in a single call — the encoder
+        # handles multi-camera internally via embed_prefix, producing the
+        # correct [img1, img2, ..., lang] KV cache sequence.
         paligemma_inputs = dict(inputs)
         images = paligemma_inputs.pop("images")
         image_masks = paligemma_inputs.pop("image_masks")
@@ -167,35 +175,25 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             images = images[np.newaxis]
             image_masks = image_masks[np.newaxis]
 
-        n_cameras = images.shape[0]
         batch_size = images.shape[1]
 
-        all_cache_keys = []
-        all_cache_values = []
-        all_prefix_masks = []
-
-        for cam_idx in range(n_cameras):
-            cam_inputs = {
-                **paligemma_inputs,
-                "images": images[cam_idx],
-                "image_masks": image_masks[cam_idx],
-            }
-            result = self._paligemma_compiled(cam_inputs)
-            all_cache_keys.append(result[0])
-            all_cache_values.append(result[1])
-            all_prefix_masks.append(result[2])
-
-        # Concatenate along sequence dimension
-        # cache shape: (n_layers, batch, n_heads, seq, head_dim) → concat on dim=3
-        cache_keys = np.concatenate(all_cache_keys, axis=3)
-        cache_values = np.concatenate(all_cache_values, axis=3)
-        # prefix_pad_masks shape: (batch, seq) → concat on dim=1
-        prefix_pad_masks = np.concatenate(all_prefix_masks, axis=1)
+        cam_inputs = {
+            **paligemma_inputs,
+            "images": images,
+            "image_masks": image_masks,
+        }
+        result = self._paligemma_compiled(cam_inputs)
+        cache_keys = result[0]
+        cache_values = result[1]
+        prefix_pad_masks = result[2]
 
         # Stage 2: Iterative denoising
-        x_t = np.random.randn(
-            batch_size, self._chunk_size, self._max_action_dim,
-        ).astype(np.float32)
+        if noise is not None:
+            x_t = noise
+        else:
+            x_t = np.random.randn(
+                batch_size, self._chunk_size, self._max_action_dim,
+            ).astype(np.float32)
         dt = -1.0 / self._num_inference_steps
 
         for step in range(self._num_inference_steps):

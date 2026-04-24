@@ -71,11 +71,12 @@ def _tensors_to_dynamic_cache(all_keys: Tensor, all_values: Tensor) -> DynamicCa
 class PaliGemmaEncoder(nn.Module):
     """Wrapper for the PaliGemma prefix encoding stage.
 
-    Takes a single image, image mask, tokens, and token masks, and returns
+    Takes images, image masks, tokens, and token masks, and returns
     the KV cache (as flat tensors) and prefix padding masks.
 
-    Note: For simplicity this wrapper supports a single camera input.
-    Multi-camera support can be added by extending the forward signature.
+    Supports multiple cameras: the first dimension of the image/mask
+    inputs is ``n_cameras``, which is treated as a dynamic ONNX axis
+    so that one exported model works for any number of cameras.
     """
 
     def __init__(self, pi05_model: Pi05Model) -> None:
@@ -91,16 +92,16 @@ class PaliGemmaEncoder(nn.Module):
 
     def forward(
         self,
-        image: Tensor,
-        img_mask: Tensor,
+        images: Tensor,
+        img_masks: Tensor,
         tokens: Tensor,
         masks: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Encode prefix (images + language tokens) and produce KV cache.
 
         Args:
-            image: Single image tensor (batch, C, H, W).
-            img_mask: Image mask (batch,) boolean.
+            images: Image tensor (n_cameras, batch, C, H, W).
+            img_masks: Image masks (n_cameras, batch) boolean.
             tokens: Tokenized prompt (batch, seq_len).
             masks: Token masks (batch, seq_len).
 
@@ -108,12 +109,12 @@ class PaliGemmaEncoder(nn.Module):
             Tuple of (cache_keys, cache_values, prefix_pad_masks).
             cache_keys/values shape: (num_layers, batch, num_heads, seq_len, head_dim)
         """
-        # Wrap single image/mask as lists for embed_prefix
-        images = [image]
-        img_masks = [img_mask]
+        # Unpack camera dimension into lists for embed_prefix
+        images_list = [images[i] for i in range(images.shape[0])]
+        img_masks_list = [img_masks[i] for i in range(img_masks.shape[0])]
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self._pi05_model.embed_prefix(
-            images, img_masks, tokens, masks
+            images_list, img_masks_list, tokens, masks
         )
         prefix_att_2d_masks = _make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -458,9 +459,9 @@ def export_partitioned_openvino(
     image_shape = (num_channels, img_size, img_size)
     logger.info("Using vision config image shape for tracing: %s", image_shape)
 
-    # Create sample inputs for encoder tracing (single image)
-    sample_image = torch.randn(batch_size, *image_shape, device=device)
-    sample_img_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+    # Create sample inputs for encoder tracing (single image with n_cameras dim)
+    sample_image = torch.randn(1, batch_size, *image_shape, device=device)
+    sample_img_mask = torch.ones(1, batch_size, dtype=torch.bool, device=device)
     token_len = 200  # default max tokenizer length
     sample_tokens = torch.zeros(batch_size, token_len, dtype=torch.long, device=device)
     sample_masks = torch.ones(batch_size, token_len, dtype=torch.bool, device=device)
@@ -480,8 +481,8 @@ def export_partitioned_openvino(
         input_names=["images", "image_masks", "tokenized_prompt", "tokenized_prompt_mask"],
         output_names=["cache_keys", "cache_values", "prefix_pad_masks"],
         dynamic_axes={
-            "images": {0: "batch"},
-            "image_masks": {0: "batch"},
+            "images": {0: "n_cameras", 1: "batch"},
+            "image_masks": {0: "n_cameras", 1: "batch"},
             "tokenized_prompt": {0: "batch"},
             "tokenized_prompt_mask": {0: "batch"},
             "cache_keys": {1: "batch", 3: "seq"},

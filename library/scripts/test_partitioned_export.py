@@ -19,6 +19,33 @@ _MAX_ACTION_DIM = 32
 _NUM_INFERENCE_STEPS = 3
 _DEVICE = "cpu"
 
+_DATASET_STATS = {
+    "observation.state": {
+        "shape": (14,),
+        "mean": [0.0] * 14,
+        "std": [1.0] * 14,
+        "name": "state",
+    },
+    "observation.images.top": {
+        "shape": (3, 224, 224),
+        "mean": [0.5, 0.5, 0.5],
+        "std": [0.5, 0.5, 0.5],
+        "name": "top",
+    },
+    "observation.images.wrist": {
+        "shape": (3, 224, 224),
+        "mean": [0.5, 0.5, 0.5],
+        "std": [0.5, 0.5, 0.5],
+        "name": "wrist",
+    },
+    "action": {
+        "shape": (14,),
+        "mean": [0.0] * 14,
+        "std": [1.0] * 14,
+        "name": "action",
+    },
+}
+
 
 @pytest.fixture(scope="module")
 def pi05_model():
@@ -32,29 +59,8 @@ def pi05_model():
 
     torch.manual_seed(_MODEL_SEED)
 
-    dataset_stats = {
-        "observation.state": {
-            "shape": (14,),
-            "mean": [0.0] * 14,
-            "std": [1.0] * 14,
-            "name": "state",
-        },
-        "observation.images.top": {
-            "shape": (3, 224, 224),
-            "mean": [0.5, 0.5, 0.5],
-            "std": [0.5, 0.5, 0.5],
-            "name": "top",
-        },
-        "action": {
-            "shape": (14,),
-            "mean": [0.0] * 14,
-            "std": [1.0] * 14,
-            "name": "action",
-        },
-    }
-
     model = Pi05Model(
-        dataset_stats,
+        _DATASET_STATS,
         paligemma_variant="gemma_2b",
         action_expert_variant="gemma_300m",
         dtype="float32",
@@ -150,45 +156,72 @@ def pi05_reference(request):
     return {"inputs": inputs, "pytorch_actions": pytorch_actions}
 
 
+def _run_partitioned_wrappers(pi05_model, images, img_masks, tokens, masks, noise):
+    """Run partitioned wrappers and return denoised actions.
+
+    Passes all cameras to the encoder in a single call, matching how
+    embed_prefix processes all cameras together with language tokens.
+    """
+    from physicalai.policies.pi05.partitioned_export import (
+        ActionOutputHead,
+        GemmaExpertDecoder,
+        PaliGemmaEncoder,
+    )
+
+    device = noise.device
+    batch_size = noise.shape[0]
+
+    encoder = PaliGemmaEncoder(pi05_model).eval()
+    decoder = GemmaExpertDecoder(pi05_model).eval()
+    head = ActionOutputHead(pi05_model).eval()
+
+    # Stack camera lists into (n_cameras, batch, ...) tensors
+    images_stacked = torch.stack(images, dim=0)
+    img_masks_stacked = torch.stack(img_masks, dim=0)
+
+    cache_keys, cache_values, prefix_pad_masks = encoder(
+        images_stacked, img_masks_stacked, tokens, masks,
+    )
+
+    x_t = torch.zeros_like(noise)
+    dt = -1.0 / _NUM_INFERENCE_STEPS
+
+    for step in range(_NUM_INFERENCE_STEPS):
+        t = 1.0 + step * dt
+        time_tensor = torch.tensor(t, dtype=torch.float32, device=device).expand(batch_size)
+        suffix_out = decoder(x_t, time_tensor, cache_keys, cache_values, prefix_pad_masks)
+        v_t = head(suffix_out)
+        x_t = x_t + dt * v_t
+
+    return x_t
+
+
 class TestPytorchWrappers:
     """Test 1: PyTorch wrapper modules reproduce original sample_actions."""
 
-    def test_wrappers_match_original(self, pi05_model):
-        from physicalai.policies.pi05.partitioned_export import (
-            ActionOutputHead,
-            GemmaExpertDecoder,
-            PaliGemmaEncoder,
-        )
-
+    @pytest.mark.parametrize(
+        ("batch_size", "n_cameras"),
+        [(1, 1), (2, 1), (1, 2), (2, 2)],
+        ids=["bs1_cam1", "bs2_cam1", "bs1_cam2", "bs2_cam2"],
+    )
+    def test_wrappers_match_original(self, pi05_model, batch_size, n_cameras):
         device = _DEVICE
-        batch_size = 1
 
-        image = torch.randn(batch_size, 3, 224, 224, device=device)
-        img_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        images = [torch.randn(batch_size, 3, 224, 224, device=device) for _ in range(n_cameras)]
+        img_masks = [torch.ones(batch_size, dtype=torch.bool, device=device) for _ in range(n_cameras)]
         tokens = torch.randint(0, 1000, (batch_size, 200), device=device)
         masks = torch.ones(batch_size, 200, dtype=torch.bool, device=device)
         noise = torch.zeros(batch_size, _CHUNK_SIZE, _MAX_ACTION_DIM,
                             dtype=torch.float32, device=device)
 
         with torch.no_grad():
-            original = pi05_model.sample_actions([image], [img_mask], tokens, masks, noise=noise)
+            original = pi05_model.sample_actions(images, img_masks, tokens, masks, noise=noise)
+            wrapper_result = _run_partitioned_wrappers(
+                pi05_model, images, img_masks, tokens, masks, noise,
+            )
 
-            encoder = PaliGemmaEncoder(pi05_model).eval()
-            decoder = GemmaExpertDecoder(pi05_model).eval()
-            head = ActionOutputHead(pi05_model).eval()
-
-            cache_keys, cache_values, prefix_pad_masks = encoder(image, img_mask, tokens, masks)
-            x_t = torch.zeros_like(noise)
-            dt = -1.0 / _NUM_INFERENCE_STEPS
-
-            for step in range(_NUM_INFERENCE_STEPS):
-                t = 1.0 + step * dt
-                time_tensor = torch.tensor(t, dtype=torch.float32, device=device).expand(batch_size)
-                suffix_out = decoder(x_t, time_tensor, cache_keys, cache_values, prefix_pad_masks)
-                v_t = head(suffix_out)
-                x_t = x_t + dt * v_t
-
-        assert torch.max(torch.abs(original - x_t)).item() < 1e-4
+        max_diff = torch.max(torch.abs(original - wrapper_result)).item()
+        assert max_diff < 1e-4, f"bs={batch_size}, cams={n_cameras}: max_diff={max_diff}"
 
 
 class TestOpenVINOExport:
@@ -217,48 +250,147 @@ class TestOpenVINOExport:
         assert np.max(np.abs(action - pytorch_actions)) < 1e-3
 
 
-class TestInferenceModelPipeline:
-    """Test 3: InferenceModel + ActionChunking runner."""
+@pytest.fixture(scope="module")
+def pi05_policy():
+    """Create a full Pi05 policy with preprocessor/postprocessor.
 
-    # Dlyakhov: not sure about this exact test
-    def test_select_action_and_reset(self, pi05_reference, export_dir):
-        from physicalai.inference.adapters.openvino_partitioned import PartitionedOpenVINOAdapter
+    Uses the same seed and config as ``pi05_model`` so weights are identical
+    and the OV export cache can be reused.
+    """
+    from physicalai.policies.pi05.policy import Pi05
+
+    torch.manual_seed(_MODEL_SEED)
+
+    policy = Pi05(
+        paligemma_variant="gemma_2b",
+        action_expert_variant="gemma_300m",
+        dtype="float32",
+        chunk_size=_CHUNK_SIZE,
+        n_action_steps=_CHUNK_SIZE,
+        max_action_dim=_MAX_ACTION_DIM,
+        num_inference_steps=_NUM_INFERENCE_STEPS,
+        image_resolution=(224, 224),
+        gradient_checkpointing=False,
+        normalization_mode="MEAN_STD",
+        use_random_input_noise=False,
+        dataset_stats=_DATASET_STATS,
+    )
+    policy.eval()
+    return policy
+
+
+_POLICY_REF_SEED = 456
+
+
+@pytest.fixture(scope="module")
+def policy_reference(request, export_dir):
+    """Provide a raw Observation, its numpy form, and cached PyTorch reference actions.
+
+    Caches ``pt_actions.npy`` and ``observation.npz`` inside *export_dir* so
+    the heavy ``Pi05`` policy is only built when cached artifacts are missing.
+    Use ``--force-reexport`` to regenerate.
+    """
+    from physicalai.data.observation import ACTION, Observation
+
+    cache_obs = export_dir / "policy_ref_observation.npz"
+    cache_actions = export_dir / "policy_ref_actions.npy"
+
+    force = request.config.getoption("--force-reexport", default=False)
+
+    if not force and cache_obs.exists() and cache_actions.exists():
+        print(f"Loading cached policy reference from {export_dir}")
+        obs_data = dict(np.load(str(cache_obs), allow_pickle=False))
+        pt_actions_np = np.load(str(cache_actions))
+
+        # Rebuild numpy inputs dict (same structure InferenceModel expects)
+        np_inputs = {
+            "state": obs_data["state"],
+            "images": {
+                "top": obs_data["images_top"],
+                "wrist": obs_data["images_wrist"],
+            },
+            "task": str(obs_data["task"]),
+        }
+    else:
+        print("Generating policy reference outputs...")
+        pi05_policy = request.getfixturevalue("pi05_policy")
+
+        batch_size = 1
+        device = _DEVICE
+
+        torch.manual_seed(_POLICY_REF_SEED)
+        obs = Observation(
+            state=torch.randn(batch_size, 14, device=device),
+            images={
+                "top": torch.randn(batch_size, 3, 224, 224, device=device),
+                "wrist": torch.randn(batch_size, 3, 224, 224, device=device),
+            },
+            task="pick up the object",
+        )
+
+        with torch.no_grad():
+            pt_actions = pi05_policy.predict_action_chunk(obs)
+        pt_actions_np = pt_actions.cpu().numpy()
+
+        # Convert observation to numpy for caching and OV inference
+        np_obs = obs.to_numpy().to_dict(flatten=False)
+        np_inputs = {k: v for k, v in np_obs.items() if v is not None}
+
+        # Cache to disk
+        export_dir.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            str(cache_obs),
+            state=np_inputs["state"],
+            images_top=np_inputs["images"]["top"],
+            images_wrist=np_inputs["images"]["wrist"],
+            task=np.array(np_inputs["task"]),
+        )
+        np.save(str(cache_actions), pt_actions_np)
+        print(f"Policy reference cached to {export_dir}")
+
+    return {"np_inputs": np_inputs, "pt_actions_np": pt_actions_np}
+
+
+class TestInferenceModelVsPolicy:
+    """Test 5: InferenceModel (OV + pre/postprocessors) vs Pi05 predict_action_chunk."""
+
+    def test_inference_model_matches_predict_action_chunk(self, policy_reference, export_dir):
+        """Full InferenceModel pipeline should match Pi05.predict_action_chunk."""
+        from unittest.mock import patch
+
+        from physicalai.data.observation import ACTION
         from physicalai.inference.model import InferenceModel
-        from physicalai.inference.runners.action_chunking import ActionChunking
         from physicalai.inference.runners.single_pass import SinglePass
 
-        adapter = PartitionedOpenVINOAdapter(
-            device="CPU",
-            num_inference_steps=_NUM_INFERENCE_STEPS,
-            chunk_size=_CHUNK_SIZE,
-            max_action_dim=_MAX_ACTION_DIM,
+        pt_actions_np = policy_reference["pt_actions_np"]
+        np_inputs = policy_reference["np_inputs"]
+
+        # --- OpenVINO InferenceModel path ---
+        inf_model = InferenceModel(
+            export_dir=export_dir,
+            runner=SinglePass(),
         )
-        adapter.load(export_dir)
 
-        model = InferenceModel.__new__(InferenceModel)
-        model.adapter = adapter
-        model.runner = ActionChunking(SinglePass(), chunk_size=_CHUNK_SIZE)
-        model.preprocessors = []
-        model.postprocessors = []
-        model.callbacks = []
-        model.metadata = {}
+        # Patch np.random.randn → zeros to match Pi05's use_random_input_noise=False
+        def _zeros_like_randn(*shape):
+            return np.zeros(shape, dtype=np.float32)
 
-        obs = pi05_reference["inputs"]
-        batch_size = obs["images"].shape[0]
+        with patch("physicalai.inference.adapters.openvino_partitioned.np.random.randn", _zeros_like_randn):
+            ov_outputs = inf_model(np_inputs)
 
-        model.reset()
-        action_1 = model.select_action(obs)
-        assert action_1.shape == (batch_size, _MAX_ACTION_DIM)
+        ov_actions = ov_outputs[ACTION]
 
-        action_2 = model.select_action(obs)
-        assert not np.allclose(action_1, action_2)
+        # Align shapes: predict_action_chunk trims to original_action_dim (14)
+        # and n_action_steps; OV adapter trims to action_dim from manifest.
+        min_action_dim = min(pt_actions_np.shape[-1], ov_actions.shape[-1])
+        min_chunk = min(pt_actions_np.shape[-2], ov_actions.shape[-2])
+        pt_trimmed = pt_actions_np[:, :min_chunk, :min_action_dim]
+        ov_trimmed = ov_actions[:, :min_chunk, :min_action_dim]
 
-        for _ in range(_CHUNK_SIZE - 2):
-            model.select_action(obs)
+        max_diff = np.max(np.abs(pt_trimmed - ov_trimmed))
+        assert max_diff < 1e-3, f"InferenceModel vs predict_action_chunk max diff: {max_diff}"
+        print(f"InferenceModel vs predict_action_chunk max diff: {max_diff}")
 
-        model.reset()
-        action_post_reset = model.select_action(obs)
-        assert action_post_reset.shape == (batch_size, _MAX_ACTION_DIM)
 
 class TestQuantizedPartitionedModel:
     """Test 4: Weight-compressed (INT8) partitioned OV model vs PyTorch."""
