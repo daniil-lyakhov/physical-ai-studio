@@ -3,12 +3,17 @@
 
 """Partitioned export for Pi0.5 model.
 
-Splits Pi05Model into three independently exportable sub-modules:
-1. PaliGemmaEncoder — prefix encoding (vision + language) → KV cache
-2. GemmaExpertDecoder — denoising step (suffix embedding + expert forward)
-3. ActionOutputHead — action projection
+Splits Pi05Model into independently exportable sub-modules:
+1. ImageEmbedder — SigLIP vision encoder (single image → patch embeddings)
+2. PrefixLM — prefix self-attention over concatenated embeddings → KV cache
+3. GemmaExpertDecoder — denoising step (suffix embedding + expert forward)
+4. ActionOutputHead — action projection
 
-This enables per-submodule quantization with different strategies.
+The language embedding is a simple table lookup exported as a NumPy
+weight file, so the adapter performs it directly without a separate IR.
+
+This enables per-submodule quantization with different strategies and
+supports a variable number of cameras without re-export.
 """
 
 from __future__ import annotations
@@ -68,26 +73,89 @@ def _tensors_to_dynamic_cache(all_keys: Tensor, all_values: Tensor) -> DynamicCa
     return cache
 
 
-class PaliGemmaEncoder(nn.Module):
-    """Wrapper for the PaliGemma prefix encoding stage.
+class ImageEmbedder(nn.Module):
+    """Wrapper for the SigLIP vision encoder.
 
-    Takes images, image masks, tokens, and token masks, and returns
-    the KV cache (as flat tensors) and prefix padding masks.
-
-    Supports multiple cameras: the first dimension of the image/mask
-    inputs is ``n_cameras``, which is treated as a dynamic ONNX axis
-    so that one exported model works for any number of cameras.
+    Takes a single image and returns patch embeddings. Called once per
+    camera — the adapter loops over cameras and concatenates the results.
     """
 
     def __init__(self, pi05_model: Pi05Model) -> None:
         """Initialize from a Pi05Model instance."""
         super().__init__()
         self.paligemma_with_expert = pi05_model.paligemma_with_expert
-        self._chunk_size = pi05_model._chunk_size
-        self._max_action_dim = pi05_model._max_action_dim
-        self._min_period = pi05_model._min_period
-        self._max_period = pi05_model._max_period
-        # Store reference to parent model for embed_prefix
+
+    def forward(self, image: Tensor) -> Tensor:
+        """Embed a single image through SigLIP.
+
+        Args:
+            image: (batch, C, H, W)
+
+        Returns:
+            Image patch embeddings (batch, num_patches, hidden_dim).
+        """
+        return self.paligemma_with_expert.embed_image(image)
+
+
+class PrefixLM(nn.Module):
+    """Wrapper for the PaliGemma prefix self-attention.
+
+    Takes pre-built concatenated embeddings (from image embedder + language
+    embedding) and runs the full PaliGemma transformer to produce the KV
+    cache consumed by the expert decoder.
+    """
+
+    def __init__(self, pi05_model: Pi05Model) -> None:
+        """Initialize from a Pi05Model instance."""
+        super().__init__()
+        self.paligemma_with_expert = pi05_model.paligemma_with_expert
+
+    def forward(
+        self,
+        prefix_embs: Tensor,
+        prefix_att_2d_masks_4d: Tensor,
+        prefix_position_ids: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Run prefix self-attention and produce KV cache.
+
+        Args:
+            prefix_embs: Concatenated embeddings (batch, seq, hidden).
+            prefix_att_2d_masks_4d: Pre-computed 4D attention mask
+                (batch, 1, seq, seq) with 0.0 for attend and
+                OPENPI_ATTENTION_MASK_VALUE for masked positions.
+            prefix_position_ids: Pre-computed position IDs (batch, seq).
+
+        Returns:
+            Tuple of (cache_keys, cache_values).
+        """
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        cache_keys, cache_values = _dynamic_cache_to_tensors(past_key_values)
+        return cache_keys, cache_values
+
+
+# Keep PaliGemmaEncoder as a convenience wrapper for tests that use the
+# combined interface — it delegates to ImageEmbedder + PrefixLM internally.
+class PaliGemmaEncoder(nn.Module):
+    """Combined encoder that wraps ImageEmbedder + language embedding + PrefixLM.
+
+    Kept for backward compatibility with tests. For export, the individual
+    components are used directly.
+    """
+
+    def __init__(self, pi05_model: Pi05Model) -> None:
+        """Initialize from a Pi05Model instance."""
+        super().__init__()
+        self.image_embedder = ImageEmbedder(pi05_model)
+        self.prefix_lm = PrefixLM(pi05_model)
         self._pi05_model = pi05_model
 
     def forward(
@@ -107,35 +175,49 @@ class PaliGemmaEncoder(nn.Module):
 
         Returns:
             Tuple of (cache_keys, cache_values, prefix_pad_masks).
-            cache_keys/values shape: (num_layers, batch, num_heads, seq_len, head_dim)
         """
-        # Unpack camera dimension into lists for embed_prefix
-        images_list = [images[i] for i in range(images.shape[0])]
-        img_masks_list = [img_masks[i] for i in range(img_masks.shape[0])]
+        import math  # noqa: PLC0415
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self._pi05_model.embed_prefix(
-            images_list, img_masks_list, tokens, masks
+        embs = []
+        pad_masks = []
+        att_masks: list[int] = []
+
+        for i in range(images.shape[0]):
+            img_emb = self.image_embedder(images[i])
+            bsize, num_img_embs = img_emb.shape[:2]
+            embs.append(img_emb)
+            pad_masks.append(img_masks[i][:, None].expand(bsize, num_img_embs))
+            att_masks += [0] * num_img_embs
+
+        # Language embedding
+        lang_emb = self._pi05_model.paligemma_with_expert.embed_language_tokens(tokens)
+        lang_emb_dim = lang_emb.shape[-1]
+        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        embs.append(lang_emb)
+        pad_masks.append(masks)
+        att_masks += [0] * lang_emb.shape[1]
+
+        prefix_embs = torch.cat(embs, dim=1)
+        prefix_pad_masks = torch.cat(pad_masks, dim=1)
+        prefix_att_masks = torch.tensor(
+            att_masks, dtype=torch.bool, device=prefix_pad_masks.device,
         )
+        bsize = prefix_pad_masks.shape[0]
+        prefix_att_masks = prefix_att_masks[None, :].expand(bsize, len(att_masks))
+
+        # Pre-compute 4D attention mask and position IDs (moved out of PrefixLM
+        # so the exported IR doesn't contain shape-dependent mask ops).
         prefix_att_2d_masks = _make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+        prefix_att_2d_masks_4d = prefix_att_2d_masks[:, None, :, :]
+        prefix_att_2d_masks_4d = torch.where(
+            prefix_att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE,
         )
 
-        cache_keys, cache_values = _dynamic_cache_to_tensors(past_key_values)
+        cache_keys, cache_values = self.prefix_lm(
+            prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids,
+        )
         return cache_keys, cache_values, prefix_pad_masks
-
-    def _prepare_attention_masks_4d(self, att_2d_masks: Tensor) -> Tensor:
-        att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
 
 class GemmaExpertDecoder(nn.Module):
@@ -434,73 +516,129 @@ def export_partitioned_openvino(
     device = next(pi05_model.parameters()).device
 
     # Create wrapper modules (they share parameters with pi05_model)
-    paligemma_encoder = PaliGemmaEncoder(pi05_model)
+    image_embedder = ImageEmbedder(pi05_model)
+    prefix_lm = PrefixLM(pi05_model)
     expert_decoder = GemmaExpertDecoder(pi05_model)
     action_head = ActionOutputHead(pi05_model)
 
-    paligemma_encoder.eval()
+    image_embedder.eval()
+    prefix_lm.eval()
     expert_decoder.eval()
     action_head.eval()
 
     # Generate sample inputs for tracing
-    batch_size = 1
+    # Use batch_size=2 so that ONNX keeps the batch dimension symbolic.
+    # Tracing with batch=1 causes internal reshape/view ops to hardcode
+    # the value ``1``, breaking inference with larger batches.
+    batch_size = 2
     chunk_size = pi05_model._chunk_size
     max_action_dim = pi05_model._max_action_dim
     expert_width = pi05_model.action_in_proj.out_features
 
-    # --- Export PaliGemma Encoder ---
-    logger.info("Exporting PaliGemma encoder...")
+    # --- Export Image Embedder ---
+    logger.info("Exporting image embedder...")
     # Always use the vision tower's expected resolution for tracing inputs.
-    # Dataset stats may store the original (pre-resize) image shape, but the
-    # SigLIP vision tower requires images at its configured resolution.
     vision_cfg = pi05_model.paligemma_with_expert.paligemma.config.vision_config
     img_size = vision_cfg.image_size
     num_channels = vision_cfg.num_channels
     image_shape = (num_channels, img_size, img_size)
     logger.info("Using vision config image shape for tracing: %s", image_shape)
 
-    # Create sample inputs for encoder tracing (single image with n_cameras dim)
-    sample_image = torch.randn(1, batch_size, *image_shape, device=device)
-    sample_img_mask = torch.ones(1, batch_size, dtype=torch.bool, device=device)
-    token_len = 200  # default max tokenizer length
-    sample_tokens = torch.zeros(batch_size, token_len, dtype=torch.long, device=device)
-    sample_masks = torch.ones(batch_size, token_len, dtype=torch.bool, device=device)
+    sample_image = torch.randn(batch_size, *image_shape, device=device)
 
-    # Run once to get output shapes for expert tracing
     with torch.no_grad():
-        cache_keys, cache_values, prefix_pad_masks = paligemma_encoder(
-            sample_image, sample_img_mask, sample_tokens, sample_masks
-        )
+        sample_img_emb = image_embedder(sample_image)
+    num_patches = sample_img_emb.shape[1]
+    hidden_dim = sample_img_emb.shape[2]
 
-    # Trace PaliGemma encoder via ONNX
-    paligemma_onnx_path = output_path / "paligemma_encoder.onnx"
+    embedder_onnx_path = output_path / "image_embedder.onnx"
     torch.onnx.export(
-        paligemma_encoder,
-        args=(sample_image, sample_img_mask, sample_tokens, sample_masks),
-        f=str(paligemma_onnx_path),
-        input_names=["images", "image_masks", "tokenized_prompt", "tokenized_prompt_mask"],
-        output_names=["cache_keys", "cache_values", "prefix_pad_masks"],
+        image_embedder,
+        args=(sample_image,),
+        f=str(embedder_onnx_path),
+        input_names=["image"],
+        output_names=["image_embedding"],
         dynamic_axes={
-            "images": {0: "n_cameras", 1: "batch"},
-            "image_masks": {0: "n_cameras", 1: "batch"},
-            "tokenized_prompt": {0: "batch"},
-            "tokenized_prompt_mask": {0: "batch"},
-            "cache_keys": {1: "batch", 3: "seq"},
-            "cache_values": {1: "batch", 3: "seq"},
-            "prefix_pad_masks": {0: "batch", 1: "seq"},
+            "image": {0: "batch"},
+            "image_embedding": {0: "batch"},
         },
     )
-    ov_paligemma = openvino.convert_model(str(paligemma_onnx_path))
-    _postprocess_openvino_model(ov_paligemma, ["cache_keys", "cache_values", "prefix_pad_masks"])
-    paligemma_xml = output_path / "paligemma_encoder.xml"
-    openvino.save_model(ov_paligemma, str(paligemma_xml), compress_to_fp16=compress_to_fp16)
-    paligemma_onnx_path.unlink()  # cleanup intermediate onnx
-    logger.info("PaliGemma encoder exported to %s", paligemma_xml)
+    ov_embedder = openvino.convert_model(str(embedder_onnx_path))
+    _postprocess_openvino_model(ov_embedder, ["image_embedding"])
+    embedder_xml = output_path / "image_embedder.xml"
+    openvino.save_model(ov_embedder, str(embedder_xml), compress_to_fp16=compress_to_fp16)
+    embedder_onnx_path.unlink()
+    logger.info("Image embedder exported to %s", embedder_xml)
+
+    # --- Save language embedding weights ---
+    logger.info("Saving language embedding weights...")
+    import math  # noqa: PLC0415
+
+    # Get the raw weight matrix and scale factor
+    lang_weight = pi05_model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight
+    lang_scale = math.sqrt(lang_weight.shape[1])  # sqrt(hidden_dim)
+    lang_weight_np = (lang_weight.detach().cpu().float().numpy() * lang_scale).astype("float32")
+    lang_embed_path = output_path / "language_embedding.npy"
+    import numpy as _np  # noqa: PLC0415
+    _np.save(str(lang_embed_path), lang_weight_np)
+    logger.info("Language embedding weights saved to %s (scale=%.1f)", lang_embed_path, lang_scale)
+
+    # --- Export Prefix LM ---
+    logger.info("Exporting prefix LM...")
+    # Build sample prefix embeddings: 1 camera (256 patches) + 200 tokens
+    token_len = 200
+    sample_tokens = torch.zeros(batch_size, token_len, dtype=torch.long, device=device)
+
+    # Build concatenated embeddings matching embed_prefix layout
+    sample_lang_emb = torch.from_numpy(lang_weight_np).to(device)[sample_tokens]  # (batch, token_len, hidden)
+    sample_prefix_embs = torch.cat([sample_img_emb, sample_lang_emb], dim=1)  # (batch, 256+200, hidden)
+    total_seq = num_patches + token_len
+
+    sample_pad_masks = torch.ones(batch_size, total_seq, dtype=torch.bool, device=device)
+    sample_att_masks = torch.zeros(batch_size, total_seq, dtype=torch.bool, device=device)
+
+    # Pre-compute 4D attention mask and position IDs outside PrefixLM
+    # so the exported IR has no shape-dependent mask construction ops.
+    sample_att_2d_masks = _make_att_2d_masks(sample_pad_masks, sample_att_masks)
+    sample_position_ids = torch.cumsum(sample_pad_masks, dim=1) - 1
+    sample_att_2d_masks_4d = sample_att_2d_masks[:, None, :, :]
+    sample_att_2d_masks_4d = torch.where(
+        sample_att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE,
+    )
+
+    with torch.no_grad():
+        cache_keys, cache_values = prefix_lm(
+            sample_prefix_embs, sample_att_2d_masks_4d, sample_position_ids,
+        )
+    # Keep prefix_pad_masks for the expert decoder export below
+    prefix_pad_masks = sample_pad_masks
+
+    prefix_lm_onnx_path = output_path / "prefix_lm.onnx"
+    torch.onnx.export(
+        prefix_lm,
+        args=(sample_prefix_embs, sample_att_2d_masks_4d, sample_position_ids),
+        f=str(prefix_lm_onnx_path),
+        input_names=["prefix_embs", "prefix_att_2d_masks_4d", "prefix_position_ids"],
+        output_names=["cache_keys", "cache_values"],
+        dynamic_axes={
+            "prefix_embs": {0: "batch", 1: "seq"},
+            "prefix_att_2d_masks_4d": {0: "batch", 2: "seq", 3: "seq"},
+            "prefix_position_ids": {0: "batch", 1: "seq"},
+            "cache_keys": {1: "batch", 3: "seq"},
+            "cache_values": {1: "batch", 3: "seq"},
+        },
+    )
+    ov_prefix_lm = openvino.convert_model(str(prefix_lm_onnx_path))
+    _postprocess_openvino_model(ov_prefix_lm, ["cache_keys", "cache_values"])
+    prefix_lm_xml = output_path / "prefix_lm.xml"
+    openvino.save_model(ov_prefix_lm, str(prefix_lm_xml), compress_to_fp16=compress_to_fp16)
+    prefix_lm_onnx_path.unlink()
+    logger.info("Prefix LM exported to %s", prefix_lm_xml)
 
     # --- Export Gemma Expert Decoder ---
     logger.info("Exporting Gemma expert decoder...")
     sample_x_t = torch.randn(batch_size, chunk_size, max_action_dim, device=device)
-    sample_timestep = torch.tensor([0.9], device=device)
+    sample_timestep = torch.full((batch_size,), 0.9, device=device)
 
     expert_onnx_path = output_path / "gemma_expert_decoder.onnx"
     torch.onnx.export(
@@ -571,7 +709,8 @@ def export_partitioned_openvino(
     logger.info("Manifest written to %s", output_path / "manifest.json")
 
     return {
-        "paligemma": str(paligemma_xml),
+        "image_embedder": str(embedder_xml),
+        "prefix_lm": str(prefix_lm_xml),
         "expert": str(expert_xml),
         "head": str(head_xml),
     }
@@ -783,7 +922,7 @@ def _write_partitioned_manifest(
             source={"class_path": "physicalai.policies.pi05.policy.Pi05"},
         ),
         model=ModelSpec(
-            artifacts={"openvino": "paligemma_encoder.xml"},
+            artifacts={"openvino": "image_embedder.xml"},
             adapter=adapter_spec,
             runner=runner_spec,
             preprocessors=preprocessor_specs,

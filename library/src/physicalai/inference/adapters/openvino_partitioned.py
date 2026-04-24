@@ -3,9 +3,14 @@
 
 """Partitioned OpenVINO adapter for Pi0.5 inference.
 
-Wraps 3 separate OpenVINO IR models (paligemma encoder, gemma expert decoder,
-action output head) behind the standard RuntimeAdapter interface, enabling
-integration with InferenceModel and the evaluation pipeline.
+Wraps 4 separate OpenVINO IR models (image embedder, prefix LM, gemma expert
+decoder, action output head) plus a language embedding weight file behind the
+standard RuntimeAdapter interface, enabling integration with InferenceModel
+and the evaluation pipeline.
+
+The image embedder is called once per camera, language embedding is done via
+NumPy lookup, and the prefix LM fuses all embeddings into a KV cache — so
+the same exported model works for any number of cameras.
 """
 
 from __future__ import annotations
@@ -25,9 +30,9 @@ if TYPE_CHECKING:
 class PartitionedOpenVINOAdapter(RuntimeAdapter):
     """OpenVINO adapter for partitioned Pi0.5 models.
 
-    Loads 3 separately exported IR models and runs the full denoising
-    inference pipeline (paligemma → N×expert → head) in a single
-    ``ppredict_action_chunkredict()`` call, returning the action chunk.
+    Loads 4 separately exported IR models and runs the full denoising
+    inference pipeline (embedder × N cameras → prefix LM → N×expert → head)
+    in a single ``predict()`` call, returning the action chunk.
 
     The denoising loop runs inside ``predict()`` so that from the
     runner's perspective, one call = one full action chunk — matching
@@ -68,25 +73,28 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         self._max_action_dim = max_action_dim
         self._action_dim = action_dim
 
-        self._paligemma_compiled: openvino.CompiledModel | None = None
+        self._embedder_compiled: openvino.CompiledModel | None = None
+        self._prefix_lm_compiled: openvino.CompiledModel | None = None
         self._expert_compiled: openvino.CompiledModel | None = None
         self._head_compiled: openvino.CompiledModel | None = None
+        self._lang_weight: np.ndarray | None = None  # (vocab, hidden) pre-scaled
 
         self._input_names: list[str] = []
         self._output_names: list[str] = ["action"]
 
     def load(self, model_path: Path) -> None:
-        """Load the 3 partitioned IR models from a directory.
+        """Load the 4 partitioned IR models and language embedding from a directory.
 
         Expects the directory to contain:
-        - paligemma_encoder.xml / .bin
+        - image_embedder.xml / .bin
+        - prefix_lm.xml / .bin
         - gemma_expert_decoder.xml / .bin
         - action_output_head.xml / .bin
+        - language_embedding.npy
 
         Args:
-            model_path: Path to directory containing the 3 model files.
-                Can also be a path to the paligemma .xml file (directory
-                is inferred).
+            model_path: Path to directory containing the model files.
+                Can also be a path to any .xml file (directory is inferred).
 
         Raises:
             ImportError: If OpenVINO is not installed.
@@ -104,30 +112,36 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         if model_dir.is_file():
             model_dir = model_dir.parent
 
-        paligemma_path = model_dir / "paligemma_encoder.xml"
+        embedder_path = model_dir / "image_embedder.xml"
+        prefix_lm_path = model_dir / "prefix_lm.xml"
         expert_path = model_dir / "gemma_expert_decoder.xml"
         head_path = model_dir / "action_output_head.xml"
+        lang_embed_path = model_dir / "language_embedding.npy"
 
-        for path in (paligemma_path, expert_path, head_path):
+        for path in (embedder_path, prefix_lm_path, expert_path, head_path, lang_embed_path):
             if not path.exists():
                 msg = f"Model file not found: {path}"
                 raise FileNotFoundError(msg)
 
         core = ov.Core()
-        self._paligemma_compiled = core.compile_model(
-            core.read_model(str(paligemma_path)), device_name=self.device, config=self.config
+        self._embedder_compiled = core.compile_model(
+            core.read_model(str(embedder_path)), device_name=self.device, config=self.config,
+        )
+        self._prefix_lm_compiled = core.compile_model(
+            core.read_model(str(prefix_lm_path)), device_name=self.device, config=self.config,
         )
         self._expert_compiled = core.compile_model(
-            core.read_model(str(expert_path)), device_name=self.device, config=self.config
+            core.read_model(str(expert_path)), device_name=self.device, config=self.config,
         )
         self._head_compiled = core.compile_model(
-            core.read_model(str(head_path)), device_name=self.device, config=self.config
+            core.read_model(str(head_path)), device_name=self.device, config=self.config,
         )
+        self._lang_weight = np.load(str(lang_embed_path))
 
-        # Input names come from the paligemma encoder (first model in the chain)
-        self._input_names = [
-            inp.any_name for inp in self._paligemma_compiled.inputs
-        ]
+        # NOTE: input_names is left empty so that InferenceModel._prepare_inputs
+        # passes all preprocessor outputs through. The adapter's predict() method
+        # picks the keys it needs (images, image_masks, tokenized_prompt, etc.).
+        self._input_names = []
 
     def predict(
         self,
@@ -135,59 +149,98 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         *,
         noise: np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
-        """Run the full 3-stage denoising inference pipeline.
+        """Run the full denoising inference pipeline.
 
         Executes:
-        1. PaliGemma encoder: inputs → KV cache + prefix masks
-        2. Expert decoder × N steps: denoising loop
-        3. Action head: final action projection
+        1. Image embedder × N cameras → image embeddings
+        2. Language embedding via NumPy lookup
+        3. Prefix LM: concatenated embeddings → KV cache
+        4. Expert decoder × num_inference_steps: denoising loop
+        5. Action head: final action projection
 
         Args:
-            inputs: Dict with keys matching paligemma encoder inputs
-                (e.g., "image", "img_mask", "tokens", "masks").
+            inputs: Dict with keys: ``images`` (n_cameras, batch, C, H, W),
+                ``image_masks`` (n_cameras, batch), ``tokenized_prompt``
+                (batch, seq), ``tokenized_prompt_mask`` (batch, seq).
             noise: Optional initial noise tensor of shape
                 (batch, chunk_size, max_action_dim). If ``None``,
                 random noise is sampled.
 
         Returns:
-            Dict with "action" key containing the denoised action chunk
-            of shape (batch, chunk_size, max_action_dim).
+            Dict with "action" key containing the denoised action chunk.
 
         Raises:
             RuntimeError: If models are not loaded.
         """
-        if self._paligemma_compiled is None:
+        if self._embedder_compiled is None:
             msg = "Models not loaded. Call load() first."
             raise RuntimeError(msg)
 
-        # Stage 1: Prefix encoding
-        # The preprocessor outputs images as (n_cameras, batch, C, H, W)
-        # and image_masks as (n_cameras, batch).
-        # Pass all cameras to the encoder in a single call — the encoder
-        # handles multi-camera internally via embed_prefix, producing the
-        # correct [img1, img2, ..., lang] KV cache sequence.
+        # --- Parse inputs ---
         paligemma_inputs = dict(inputs)
         images = paligemma_inputs.pop("images")
         image_masks = paligemma_inputs.pop("image_masks")
+        tokens = paligemma_inputs["tokenized_prompt"]
+        token_masks = paligemma_inputs["tokenized_prompt_mask"]
 
         if images.ndim == 4:  # noqa: PLR2004
-            # Single camera without camera dim — add it
             images = images[np.newaxis]
             image_masks = image_masks[np.newaxis]
 
+        n_cameras = images.shape[0]
         batch_size = images.shape[1]
 
-        cam_inputs = {
-            **paligemma_inputs,
-            "images": images,
-            "image_masks": image_masks,
-        }
-        result = self._paligemma_compiled(cam_inputs)
-        cache_keys = result[0]
-        cache_values = result[1]
-        prefix_pad_masks = result[2]
+        # --- Stage 1: Image embedding (per camera) ---
+        embs = []
+        pad_masks = []
+        att_masks_list: list[int] = []
 
-        # Stage 2: Iterative denoising
+        for cam_idx in range(n_cameras):
+            result = self._embedder_compiled({"image": images[cam_idx]})
+            img_emb = result[0]  # (batch, num_patches, hidden)
+            num_patches = img_emb.shape[1]
+
+            embs.append(img_emb)
+            # Expand image mask (batch,) → (batch, num_patches)
+            cam_mask = image_masks[cam_idx][:, np.newaxis]  # (batch, 1)
+            pad_masks.append(np.broadcast_to(cam_mask, (batch_size, num_patches)))
+            att_masks_list.extend([0] * num_patches)
+
+        # --- Stage 2: Language embedding (NumPy lookup) ---
+        lang_emb = self._lang_weight[tokens]  # (batch, token_len, hidden)
+        embs.append(lang_emb)
+        pad_masks.append(token_masks)
+        att_masks_list.extend([0] * tokens.shape[1])
+
+        # --- Concatenate and build masks ---
+        prefix_embs = np.concatenate(embs, axis=1).astype(np.float32)
+        prefix_pad_masks = np.concatenate(pad_masks, axis=1).astype(bool)
+        prefix_att_masks = np.broadcast_to(
+            np.array(att_masks_list, dtype=bool)[np.newaxis, :],
+            (batch_size, len(att_masks_list)),
+        ).copy()
+
+        # Pre-compute 4D attention mask and position IDs in NumPy
+        # (these ops were moved out of the exported PrefixLM IR).
+        MASK_VALUE = -2.3819763e38  # OPENPI_ATTENTION_MASK_VALUE  # noqa: N806
+        cumsum = np.cumsum(prefix_att_masks.astype(np.int64), axis=1)
+        att_2d = (cumsum[:, np.newaxis, :] <= cumsum[:, :, np.newaxis])  # (B, seq, seq)
+        pad_2d = (prefix_pad_masks[:, np.newaxis, :] & prefix_pad_masks[:, :, np.newaxis])
+        att_2d = att_2d & pad_2d
+        att_4d = att_2d[:, np.newaxis, :, :]  # (B, 1, seq, seq)
+        prefix_att_2d_masks_4d = np.where(att_4d, 0.0, MASK_VALUE).astype(np.float32)
+        prefix_position_ids = (np.cumsum(prefix_pad_masks.astype(np.int64), axis=1) - 1)
+
+        # --- Stage 3: Prefix LM → KV cache ---
+        prefix_result = self._prefix_lm_compiled({
+            "prefix_embs": prefix_embs,
+            "prefix_att_2d_masks_4d": prefix_att_2d_masks_4d,
+            "prefix_position_ids": prefix_position_ids,
+        })
+        cache_keys = prefix_result[0]
+        cache_values = prefix_result[1]
+
+        # --- Stage 4: Iterative denoising ---
         if noise is not None:
             x_t = noise
         else:
@@ -210,7 +263,7 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             expert_result = self._expert_compiled(expert_inputs)
             suffix_out = expert_result[0]
 
-            # Stage 3: Action projection
+            # Stage 5: Action projection
             head_result = self._head_compiled({"suffix_out": suffix_out})
             v_t = head_result[0]
 

@@ -25,7 +25,7 @@ class InferenceModelPolicyWrapper:
 
 if __name__ == "__main__":
     # Load from HuggingFace (equivalent to your lerobot command)
-    if True:
+    if False:
         policy = Pi05(
             pretrained_name_or_path="lerobot/pi05_libero_finetuned",
             n_action_steps=10,       # same as --policy.n_action_steps=10
@@ -39,7 +39,7 @@ if __name__ == "__main__":
         task_suite="libero_10",   # --env.task=libero_10
         task_ids=[6],             # --env.task_ids=[6] — reproduces libero_10_6
         num_episodes=1,          # --env.num_episodes=10
-        max_steps=10,            # match the 500 steps seen in the failing run
+        max_steps=500,            # match the 500 steps seen in the failing run
     )
 
     #policy.to("xpu")
