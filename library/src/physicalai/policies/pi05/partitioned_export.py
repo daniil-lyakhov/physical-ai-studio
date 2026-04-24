@@ -484,9 +484,9 @@ def export_partitioned_openvino(
             "image_masks": {0: "batch"},
             "tokenized_prompt": {0: "batch"},
             "tokenized_prompt_mask": {0: "batch"},
-            "cache_keys": {1: "batch"},
-            "cache_values": {1: "batch"},
-            "prefix_pad_masks": {0: "batch"},
+            "cache_keys": {1: "batch", 3: "seq"},
+            "cache_values": {1: "batch", 3: "seq"},
+            "prefix_pad_masks": {0: "batch", 1: "seq"},
         },
     )
     ov_paligemma = openvino.convert_model(str(paligemma_onnx_path))
@@ -511,9 +511,9 @@ def export_partitioned_openvino(
         dynamic_axes={
             "x_t": {0: "batch"},
             "timestep": {0: "batch"},
-            "cache_keys": {1: "batch"},
-            "cache_values": {1: "batch"},
-            "prefix_pad_masks": {0: "batch"},
+            "cache_keys": {1: "batch", 3: "seq"},
+            "cache_values": {1: "batch", 3: "seq"},
+            "prefix_pad_masks": {0: "batch", 1: "seq"},
             "suffix_out": {0: "batch"},
         },
     )

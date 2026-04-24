@@ -27,7 +27,7 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
 
     Loads 3 separately exported IR models and runs the full denoising
     inference pipeline (paligemma → N×expert → head) in a single
-    ``predict()`` call, returning the action chunk.
+    ``ppredict_action_chunkredict()`` call, returning the action chunk.
 
     The denoising loop runs inside ``predict()`` so that from the
     runner's perspective, one call = one full action chunk — matching
@@ -153,31 +153,49 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             raise RuntimeError(msg)
 
         # Stage 1: Prefix encoding
-        # The preprocessor outputs images as (n_cameras, batch, C, H, W).
-        # The paligemma encoder expects a single image (batch, C, H, W),
-        # so extract the first camera before feeding to the IR model.
+        # The preprocessor outputs images as (n_cameras, batch, C, H, W)
+        # and image_masks as (n_cameras, batch).
+        # Run the paligemma encoder once per camera and concatenate
+        # KV caches along the sequence dimension — matching how
+        # embed_prefix processes each camera independently.
         paligemma_inputs = dict(inputs)
-        images = paligemma_inputs.get("images")
-        if images is not None and images.ndim == 5:  # noqa: PLR2004
-            paligemma_inputs["images"] = images[0]
-        image_masks = paligemma_inputs.get("image_masks")
-        if image_masks is not None and image_masks.ndim == 2:  # noqa: PLR2004
-            paligemma_inputs["image_masks"] = image_masks[0]
+        images = paligemma_inputs.pop("images")
+        image_masks = paligemma_inputs.pop("image_masks")
 
-        paligemma_result = self._paligemma_compiled(paligemma_inputs)
-        cache_keys = paligemma_result[0]
-        cache_values = paligemma_result[1]
-        prefix_pad_masks = paligemma_result[2]
+        if images.ndim == 4:  # noqa: PLR2004
+            # Single camera without camera dim — add it
+            images = images[np.newaxis]
+            image_masks = image_masks[np.newaxis]
 
-        # Determine batch size from the paligemma inputs (after camera extraction)
-        # not from original inputs where images may have an extra camera dimension.
-        batch_size = paligemma_inputs["images"].shape[0] if "images" in paligemma_inputs else next(iter(paligemma_inputs.values())).shape[0]
+        n_cameras = images.shape[0]
+        batch_size = images.shape[1]
+
+        all_cache_keys = []
+        all_cache_values = []
+        all_prefix_masks = []
+
+        for cam_idx in range(n_cameras):
+            cam_inputs = {
+                **paligemma_inputs,
+                "images": images[cam_idx],
+                "image_masks": image_masks[cam_idx],
+            }
+            result = self._paligemma_compiled(cam_inputs)
+            all_cache_keys.append(result[0])
+            all_cache_values.append(result[1])
+            all_prefix_masks.append(result[2])
+
+        # Concatenate along sequence dimension
+        # cache shape: (n_layers, batch, n_heads, seq, head_dim) → concat on dim=3
+        cache_keys = np.concatenate(all_cache_keys, axis=3)
+        cache_values = np.concatenate(all_cache_values, axis=3)
+        # prefix_pad_masks shape: (batch, seq) → concat on dim=1
+        prefix_pad_masks = np.concatenate(all_prefix_masks, axis=1)
 
         # Stage 2: Iterative denoising
-        x_t = np.zeros(
-            (batch_size, self._chunk_size, self._max_action_dim),
-            dtype=np.float32,
-        )
+        x_t = np.random.randn(
+            batch_size, self._chunk_size, self._max_action_dim,
+        ).astype(np.float32)
         dt = -1.0 / self._num_inference_steps
 
         for step in range(self._num_inference_steps):
