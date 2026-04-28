@@ -177,6 +177,55 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             raise RuntimeError(msg)
 
         # --- Parse inputs ---
+        lm_inputs, prefix_pad_masks, batch_size = self._embed_inputs(inputs)
+
+        # --- Stage 3: Prefix LM → KV cache ---
+        prefix_result = self._prefix_lm_compiled(lm_inputs)
+        cache_keys = prefix_result[0]
+        cache_values = prefix_result[1]
+
+        # --- Stage 4: Iterative denoising ---
+        x_t = noise
+        if noise is None:
+            x_t = self._sample_noise(batch_size)
+            
+        dt = -1.0 / self._num_inference_steps
+
+        for step in range(self._num_inference_steps):
+            time = 1.0 + step * dt
+            time_tensor = np.full((batch_size,), time, dtype=np.float32)
+
+            expert_inputs = {
+                "x_t": x_t,
+                "timestep": time_tensor,
+                "cache_keys": cache_keys,
+                "cache_values": cache_values,
+                "prefix_pad_masks": prefix_pad_masks,
+            }
+
+            x_t = self._apply_expert(expert_inputs, dt)
+
+        # Trim padded action dimension to actual action size
+        if self._action_dim is not None:
+            x_t = x_t[:, :, :self._action_dim]
+
+        return {"action": x_t}
+
+    def _apply_expert(self, expert_inputs, dt):
+        expert_result = self._expert_compiled(expert_inputs)
+        suffix_out = expert_result[0]
+
+        # Stage 5: Action projection
+        head_result = self._head_compiled({"suffix_out": suffix_out})
+        v_t = head_result[0]
+        return  expert_inputs["x_t"] + dt * v_t
+
+    def _sample_noise(self, batch_size):
+        return np.random.randn(
+                batch_size, self._chunk_size, self._max_action_dim,
+            ).astype(np.float32)
+
+    def _embed_inputs(self, inputs):
         paligemma_inputs = dict(inputs)
         images = paligemma_inputs.pop("images")
         image_masks = paligemma_inputs.pop("image_masks")
@@ -230,50 +279,11 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         att_4d = att_2d[:, np.newaxis, :, :]  # (B, 1, seq, seq)
         prefix_att_2d_masks_4d = np.where(att_4d, 0.0, MASK_VALUE).astype(np.float32)
         prefix_position_ids = (np.cumsum(prefix_pad_masks.astype(np.int64), axis=1) - 1)
-
-        # --- Stage 3: Prefix LM → KV cache ---
-        prefix_result = self._prefix_lm_compiled({
+        return {
             "prefix_embs": prefix_embs,
             "prefix_att_2d_masks_4d": prefix_att_2d_masks_4d,
             "prefix_position_ids": prefix_position_ids,
-        })
-        cache_keys = prefix_result[0]
-        cache_values = prefix_result[1]
-
-        # --- Stage 4: Iterative denoising ---
-        if noise is not None:
-            x_t = noise
-        else:
-            x_t = np.random.randn(
-                batch_size, self._chunk_size, self._max_action_dim,
-            ).astype(np.float32)
-        dt = -1.0 / self._num_inference_steps
-
-        for step in range(self._num_inference_steps):
-            time = 1.0 + step * dt
-            time_tensor = np.full((batch_size,), time, dtype=np.float32)
-
-            expert_inputs = {
-                "x_t": x_t,
-                "timestep": time_tensor,
-                "cache_keys": cache_keys,
-                "cache_values": cache_values,
-                "prefix_pad_masks": prefix_pad_masks,
-            }
-            expert_result = self._expert_compiled(expert_inputs)
-            suffix_out = expert_result[0]
-
-            # Stage 5: Action projection
-            head_result = self._head_compiled({"suffix_out": suffix_out})
-            v_t = head_result[0]
-
-            x_t = x_t + dt * v_t
-
-        # Trim padded action dimension to actual action size
-        if self._action_dim is not None:
-            x_t = x_t[:, :, :self._action_dim]
-
-        return {"action": x_t}
+        }, prefix_pad_masks, batch_size
 
     def default_device(self) -> str:  # noqa: PLR6301
         """Get default OpenVINO device.

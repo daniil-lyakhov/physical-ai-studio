@@ -1,3 +1,4 @@
+import random
 import shutil
 from pathlib import Path
 
@@ -5,12 +6,18 @@ import nncf
 import numpy as np
 import openvino
 import torch
+from nncf.quantization.advanced_parameters import AdvancedCompressionParameters, GroupSizeFallbackMode
 
 from physicalai.benchmark import LiberoBenchmark
 from physicalai.data import Observation
+from physicalai.data.lerobot import LeRobotDataModule
 from physicalai.inference import InferenceModel
+from physicalai.inference.adapters.openvino_partitioned import PartitionedOpenVINOAdapter
 from physicalai.inference.runners import ActionChunking, SinglePass
-from physicalai.policies.pi05 import Pi05
+
+# LIBERO dataset on HuggingFace, compatible with physicalai data format.
+_CALIBRATION_REPO_ID = "HuggingFaceVLA/libero"
+_CALIBRATION_SAMPLES = 128
 
 
 class InferenceModelPolicyWrapper:
@@ -28,14 +35,131 @@ class InferenceModelPolicyWrapper:
         self._inf_model.reset()
 
 
+def _collect_preprocessed_samples(
+    inf_model: InferenceModel,
+    repo_id: str,
+    n_samples: int,
+) -> list[dict[str, np.ndarray]]:
+    """Load a dataset and run it through the InferenceModel preprocessors.
+
+    Returns a list of dicts with numpy arrays matching the partitioned
+    OV model's input format (images, tokenized_prompt, state, etc.).
+    """
+    datamodule = LeRobotDataModule(
+        repo_id=repo_id,
+        train_batch_size=1,
+        num_workers=0,
+        data_format="physicalai",
+        episodes=[0, 1],
+    )
+    datamodule.setup("test")
+    dataloader = datamodule.train_dataloader()
+
+    samples: list[dict[str, np.ndarray]] = []
+    for batch in dataloader:
+        np_obs = batch.to_numpy().to_dict(flatten=False)
+        inputs = {k: v for k, v in np_obs.items() if v is not None}
+        for preprocessor in inf_model.preprocessors:
+            inputs = preprocessor(inputs)
+        samples.append(inputs)
+        if len(samples) >= n_samples:
+            break
+
+    random.seed(42)
+    random.shuffle(samples)
+
+    print(f"Collected {len(samples)} preprocessed samples from {repo_id}")
+    return samples
+
+
+def _embed_all_samples(
+    adapter: PartitionedOpenVINOAdapter,
+    preprocessed_samples: list[dict[str, np.ndarray]],
+) -> list[tuple[dict[str, np.ndarray], np.ndarray, int]]:
+    """Run image_embedder + language embedding on all samples once.
+
+    Returns a list of (prefix_lm_input_dict, prefix_pad_masks, batch_size)
+    tuples, reusing PartitionedOpenVINOAdapter._embed_inputs.
+    """
+    embedded = []
+    for sample in preprocessed_samples:
+        lm_inputs, pad_masks, batch_size = adapter._embed_inputs(sample)
+        embedded.append((lm_inputs, pad_masks, batch_size))
+    print(f"Embedded {len(embedded)} samples via adapter")
+    return embedded
+
+
+def _build_expert_decoder_calibration(
+    adapter: PartitionedOpenVINOAdapter,
+    embedded_samples: list[tuple[dict[str, np.ndarray], np.ndarray, int]],
+    num_inference_steps: int,
+    compressed_prefix_lm_path: str | Path,
+    device: str = "CPU",
+) -> nncf.Dataset:
+    """Build calibration dataset for gemma_expert_decoder.
+
+    Runs prefix_lm on pre-computed embeddings, then collects
+    expert_decoder inputs at every denoising step.
+
+    Args:
+        adapter: Loaded partitioned adapter (used for expert advancement).
+        embedded_samples: Pre-computed (plm_input, pad_masks, batch_size) tuples.
+        num_inference_steps: Number of denoising steps.
+        compressed_prefix_lm_path: Path to the compressed prefix_lm IR.
+            This ensures calibration data reflects the already-compressed prefix_lm.
+        device: OpenVINO device for running the compressed prefix_lm.
+    """
+    core = openvino.Core()
+    prefix_lm_compiled = core.compile_model(
+        core.read_model(str(compressed_prefix_lm_path)), device_name=device,
+    )
+
+    dt = -1.0 / num_inference_steps
+    expert_inputs: list[dict[str, np.ndarray]] = []
+
+    for plm_input, prefix_pad_masks, batch_size in embedded_samples:
+        # Run prefix_lm -> KV cache
+        prefix_result = prefix_lm_compiled(plm_input)
+        cache_keys = prefix_result[0]
+        cache_values = prefix_result[1]
+
+        # Denoising loop — collect expert inputs at each step
+        x_t = adapter._sample_noise(batch_size)
+
+        for step in range(num_inference_steps):
+            t = 1.0 + step * dt
+            time_tensor = np.full((batch_size,), t, dtype=np.float32)
+
+            expert_input = {
+                "x_t": x_t.copy(),
+                "timestep": time_tensor,
+                "cache_keys": np.array(cache_keys),
+                "cache_values": np.array(cache_values),
+                "prefix_pad_masks": prefix_pad_masks.astype(bool),
+            }
+            expert_inputs.append(expert_input)
+
+            # Advance denoising so next step has realistic x_t
+            x_t = adapter._apply_expert(expert_input, dt)
+
+    print(f"Built {len(expert_inputs)} calibration samples for gemma_expert_decoder")
+    return nncf.Dataset(expert_inputs)
+
+
 def compress_partitioned_model(
     source_dir: str | Path,
     output_dir: str | Path,
-    mode: nncf.CompressWeightsMode = nncf.CompressWeightsMode.INT8_SYM,
+    device: str = "CPU",
 ) -> Path:
-    """Compress prefix_lm and gemma_expert_decoder with INT8 weight compression.
+    """Compress prefix_lm and gemma_expert_decoder with INT4 data-aware compression.
 
-    Copies image_embedder and action_output_head unchanged.
+    Uses real calibration data from the LIBERO dataset to enable AWQ and
+    scale estimation for better INT4 accuracy.
+
+    Args:
+        source_dir: Directory with FP32 partitioned models.
+        output_dir: Directory for compressed output.
+        device: OpenVINO device for calibration inference.
     """
     source_dir = Path(source_dir)
     output_dir = Path(output_dir)
@@ -43,23 +167,72 @@ def compress_partitioned_model(
 
     core = openvino.Core()
 
-    models_to_compress = {"prefix_lm", "gemma_expert_decoder"}
-    model_names = ["image_embedder", "prefix_lm", "gemma_expert_decoder", "action_output_head"]
+    # Load InferenceModel (adapter + preprocessors) from FP32 export
+    inf_model = InferenceModel(source_dir, device=device)
+    adapter = inf_model.adapter
 
-    for name in model_names:
-        xml_path = source_dir / f"{name}.xml"
-        ov_model = core.read_model(str(xml_path))
+    # Collect calibration data and embed once
+    calibration_samples = _collect_preprocessed_samples(
+        inf_model, _CALIBRATION_REPO_ID, _CALIBRATION_SAMPLES,
+    )
+    embedded_samples = _embed_all_samples(adapter, calibration_samples)
+    num_inference_steps = adapter._num_inference_steps
 
-        if name in models_to_compress:
-            print(f"Compressing {name} with {mode.name}...")
-            compressed = nncf.compress_weights(ov_model, mode=mode)
-        else:
-            print(f"Skipping compression for {name}")
-            compressed = ov_model
+    # --- image_embedder: copy unchanged (small model) ---
+    print("Skipping compression for image_embedder")
+    ov_model = core.read_model(str(source_dir / "image_embedder.xml"))
+    openvino.save_model(ov_model, str(output_dir / "image_embedder.xml"))
 
-        openvino.save_model(compressed, str(output_dir / f"{name}.xml"))
+    # --- prefix_lm: INT4 with AWQ + scale estimation ---
+    print("Compressing prefix_lm with INT4_SYM (data-aware)...")
+    ov_model = core.read_model(str(source_dir / "prefix_lm.xml"))
+    prefix_lm_inputs = [plm_input for plm_input, _, _ in embedded_samples]
+    print(f"Built {len(prefix_lm_inputs)} calibration samples for prefix_lm")
+    compressed = nncf.compress_weights(
+        ov_model,
+        mode=nncf.CompressWeightsMode.INT4_SYM,
+        group_size=128,
+        dataset=nncf.Dataset(prefix_lm_inputs),
+        awq=True,
+        scale_estimation=True,
+        subset_size=_CALIBRATION_SAMPLES,
+        advanced_parameters=AdvancedCompressionParameters(
+            calibration_device=device,
+            group_size_fallback_mode=GroupSizeFallbackMode.ADJUST,
+        ),
+    )
+    openvino.save_model(compressed, str(output_dir / "prefix_lm.xml"))
 
-    # Copy non-model artifacts (manifest, preprocessor config, tokenizer, etc.)
+    # --- gemma_expert_decoder: INT4 with AWQ + scale estimation ---
+    print("Compressing gemma_expert_decoder with INT4_SYM (data-aware)...")
+    ov_model = core.read_model(str(source_dir / "gemma_expert_decoder.xml"))
+    expert_dataset = _build_expert_decoder_calibration(
+        adapter, embedded_samples,
+        num_inference_steps=num_inference_steps,
+        compressed_prefix_lm_path=output_dir / "prefix_lm.xml",
+        device=device,
+    )
+    compressed = nncf.compress_weights(
+        ov_model,
+        mode=nncf.CompressWeightsMode.INT4_SYM,
+        group_size=128,
+        dataset=expert_dataset,
+        awq=True,
+        scale_estimation=True,
+        subset_size=_CALIBRATION_SAMPLES * 5,
+        advanced_parameters=AdvancedCompressionParameters(
+            calibration_device=device,
+            group_size_fallback_mode=GroupSizeFallbackMode.ADJUST,
+        ),
+    )
+    openvino.save_model(compressed, str(output_dir / "gemma_expert_decoder.xml"))
+
+    # --- action_output_head: copy unchanged (small model) ---
+    print("Skipping compression for action_output_head")
+    ov_model = core.read_model(str(source_dir / "action_output_head.xml"))
+    openvino.save_model(ov_model, str(output_dir / "action_output_head.xml"))
+
+    # Copy non-model artifacts
     for item in source_dir.iterdir():
         dest = output_dir / item.name
         if item.suffix in (".xml", ".bin") or dest.exists():
@@ -71,20 +244,22 @@ def compress_partitioned_model(
 
     # Report size reduction
     fp32_size = sum(f.stat().st_size for f in source_dir.glob("*.bin"))
-    int8_size = sum(f.stat().st_size for f in output_dir.glob("*.bin"))
+    int4_size = sum(f.stat().st_size for f in output_dir.glob("*.bin"))
     print(f"Original size: {fp32_size / 1e6:.1f} MB")
-    print(f"Compressed size: {int8_size / 1e6:.1f} MB")
-    print(f"Compression ratio: {fp32_size / int8_size:.2f}x")
+    print(f"Compressed size: {int4_size / 1e6:.1f} MB")
+    print(f"Compression ratio: {fp32_size / int4_size:.2f}x")
 
     return output_dir
 
 
 if __name__ == "__main__":
     FP32_EXPORT_DIR = "pi05_libero_finetuned_hf_ov"
-    INT8_EXPORT_DIR = "pi05_libero_finetuned_hf_ov_int8"
+    INT4_EXPORT_DIR = "pi05_libero_finetuned_hf_ov_int4"
 
-    # Step 0: Export partitioned FP32 model (if needed)
+    # Step 1: Export partitioned FP32 model (if needed)
     if not Path(FP32_EXPORT_DIR).exists():
+        from physicalai.policies.pi05 import Pi05
+
         policy = Pi05(
             pretrained_name_or_path="lerobot/pi05_libero_finetuned",
             n_action_steps=10,
@@ -92,15 +267,18 @@ if __name__ == "__main__":
             dtype="bfloat16",
         )
         policy.to_openvino_partitioned(FP32_EXPORT_DIR)
+        del policy
 
-    # Step 1: Compress prefix_lm and gemma_expert_decoder to INT8
+    DEVICE = "CPU"
+
+    # Step 2: Compress with INT4 data-aware algorithms
     compress_partitioned_model(
         source_dir=FP32_EXPORT_DIR,
-        output_dir=INT8_EXPORT_DIR,
-        mode=nncf.CompressWeightsMode.INT8_SYM,
+        output_dir=INT4_EXPORT_DIR,
+        device=DEVICE,
     )
 
-    # Step 2: Evaluate compressed model on LIBERO
+    # Step 3: Evaluate compressed model on LIBERO
     benchmark = LiberoBenchmark(
         task_suite="libero_10",
         task_ids=[6],
@@ -108,7 +286,7 @@ if __name__ == "__main__":
         max_steps=10,
     )
 
-    ov_model = InferenceModel(INT8_EXPORT_DIR, device="CPU", runner=ActionChunking(SinglePass()))
+    ov_model = InferenceModel(INT4_EXPORT_DIR, device=DEVICE, runner=ActionChunking(SinglePass()))
     ov_policy = InferenceModelPolicyWrapper(ov_model)
     ov_results = benchmark.evaluate(ov_policy)
     print(ov_results.summary())
