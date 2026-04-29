@@ -272,6 +272,7 @@ if __name__ == "__main__":
     DEVICE = "CPU"
 
     # Step 2: Compress with INT4 data-aware algorithms
+    #if not Path(INT4_EXPORT_DIR).exists():
     compress_partitioned_model(
         source_dir=FP32_EXPORT_DIR,
         output_dir=INT4_EXPORT_DIR,

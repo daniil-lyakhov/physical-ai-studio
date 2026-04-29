@@ -1,8 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pytest tests for partitioned Pi0.5 OpenVINO export.
-"""
+"""Pytest tests for partitioned Pi0.5 OpenVINO export."""
 
 from __future__ import annotations
 
@@ -95,6 +94,7 @@ def export_dir(request):
     else:
         if out.exists():
             import shutil
+
             shutil.rmtree(out)
 
         pi05_model = request.getfixturevalue("pi05_model")
@@ -109,7 +109,8 @@ _REFERENCE_INPUT_SEED = 123
 
 
 def _make_reference_inputs(
-    batch_size: int = 2, n_cameras: int = 2,
+    batch_size: int = 2,
+    n_cameras: int = 2,
 ) -> dict[str, np.ndarray]:
     """Create deterministic model inputs."""
     np.random.seed(_REFERENCE_INPUT_SEED)
@@ -139,8 +140,11 @@ def pi05_reference(request):
         batch_size = inputs["images"].shape[1]
         n_cameras = inputs["images"].shape[0]
         noise = torch.zeros(
-            batch_size, _CHUNK_SIZE, _MAX_ACTION_DIM,
-            dtype=torch.float32, device=_DEVICE,
+            batch_size,
+            _CHUNK_SIZE,
+            _MAX_ACTION_DIM,
+            dtype=torch.float32,
+            device=_DEVICE,
         )
         with torch.no_grad():
             pytorch_actions = pi05_model.sample_actions(
@@ -207,7 +211,9 @@ def _run_partitioned_wrappers(pi05_model, images, img_masks, tokens, masks, nois
     prefix_embs = torch.cat(embs, dim=1)
     prefix_pad_masks = torch.cat(pad_masks, dim=1)
     prefix_att_masks = torch.tensor(
-        att_masks_list, dtype=torch.bool, device=device,
+        att_masks_list,
+        dtype=torch.bool,
+        device=device,
     )
     prefix_att_masks = prefix_att_masks[None, :].expand(batch_size, len(att_masks_list))
 
@@ -218,12 +224,16 @@ def _run_partitioned_wrappers(pi05_model, images, img_masks, tokens, masks, nois
     prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
     prefix_att_2d_masks_4d = prefix_att_2d_masks[:, None, :, :]
     prefix_att_2d_masks_4d = torch.where(
-        prefix_att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE,
+        prefix_att_2d_masks_4d,
+        0.0,
+        OPENPI_ATTENTION_MASK_VALUE,
     )
 
     # Prefix LM → KV cache
     cache_keys, cache_values = prefix_lm(
-        prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids,
+        prefix_embs,
+        prefix_att_2d_masks_4d,
+        prefix_position_ids,
     )
 
     x_t = torch.zeros_like(noise)
@@ -254,13 +264,17 @@ class TestPytorchWrappers:
         img_masks = [torch.ones(batch_size, dtype=torch.bool, device=device) for _ in range(n_cameras)]
         tokens = torch.randint(0, 1000, (batch_size, 200), device=device)
         masks = torch.ones(batch_size, 200, dtype=torch.bool, device=device)
-        noise = torch.zeros(batch_size, _CHUNK_SIZE, _MAX_ACTION_DIM,
-                            dtype=torch.float32, device=device)
+        noise = torch.zeros(batch_size, _CHUNK_SIZE, _MAX_ACTION_DIM, dtype=torch.float32, device=device)
 
         with torch.no_grad():
             original = pi05_model.sample_actions(images, img_masks, tokens, masks, noise=noise)
             wrapper_result = _run_partitioned_wrappers(
-                pi05_model, images, img_masks, tokens, masks, noise,
+                pi05_model,
+                images,
+                img_masks,
+                tokens,
+                masks,
+                noise,
             )
 
         max_diff = torch.max(torch.abs(original - wrapper_result)).item()
@@ -374,7 +388,7 @@ def policy_reference(request):
                 "top": torch.randn(batch_size, 3, 224, 224, device=device),
                 "wrist": torch.randn(batch_size, 3, 224, 224, device=device),
             },
-            task=["pick up the object","pick up the object",]
+            task=["pick up the object", "pick up the object"],
         )
 
         with torch.no_grad():
@@ -420,11 +434,14 @@ class TestInferenceModelVsPolicy:
             runner=SinglePass(),
         )
 
-        # Patch np.random.randn → zeros to match Pi05's use_random_input_noise=False
-        def _zeros_like_randn(*shape):
-            return np.zeros(shape, dtype=np.float32)
+        # Patch _sample_noise -> zeros to match Pi05's use_random_input_noise=False
+        def _zeros_noise(self, batch_size):
+            return np.zeros((batch_size, self._chunk_size, self._max_action_dim), dtype=np.float32)
 
-        with patch("physicalai.inference.adapters.openvino_partitioned.np.random.randn", _zeros_like_randn):
+        with patch(
+            "physicalai.inference.adapters.openvino_partitioned.PartitionedOpenVINOAdapter._sample_noise",
+            _zeros_noise,
+        ):
             ov_outputs = inf_model(np_inputs)
 
         ov_actions = ov_outputs[ACTION]
@@ -444,6 +461,7 @@ class TestInferenceModelVsPolicy:
 class TestQuantizedPartitionedModel:
     """Test 4: Weight-compressed (INT8) partitioned OV model vs PyTorch."""
 
+    @pytest.mark.skip(reason="NNCF is not integrated yet")
     def test_nncf_weight_compression_matches_pytorch(self, pi05_reference, export_dir):
         """Compress each partition to INT8 via NNCF and compare with PyTorch."""
         import shutil
@@ -513,9 +531,7 @@ class TestQuantizedPartitionedModel:
         # TODO(dlyakhov): check if it is correct
         fp32_size = sum(f.stat().st_size for f in export_dir.glob("*.bin"))
         int8_size = sum(f.stat().st_size for f in compressed_dir.glob("*.bin"))
-        assert int8_size < fp32_size, (
-            f"Compressed size ({int8_size}) should be smaller than original ({fp32_size})"
-        )
+        assert int8_size < fp32_size, f"Compressed size ({int8_size}) should be smaller than original ({fp32_size})"
         print(f"File compression ratio: {fp32_size / int8_size}")
 
 
@@ -535,6 +551,7 @@ def monolithic_export_dir(request):
     else:
         if out.exists():
             import shutil
+
             shutil.rmtree(out)
 
         pi05_policy = request.getfixturevalue("pi05_policy")
@@ -543,7 +560,6 @@ def monolithic_export_dir(request):
         print("Done pi0.5 monolithic openvino export")
         marker_file.touch()
         yield out
-
 
 
 @pytest.mark.skip(reason="FP16 monolitic vs FP32 partitial export")
@@ -560,15 +576,18 @@ class TestPartitionedVsMonolithic:
 
         np_inputs = policy_reference["np_inputs"]
 
-        def _zeros_like_randn(*shape):
-            return np.zeros(shape, dtype=np.float32)
+        def _zeros_noise(self, batch_size):
+            return np.zeros((batch_size, self._chunk_size, self._max_action_dim), dtype=np.float32)
 
         # Run partitioned adapter
         partitioned_model = InferenceModel(
             export_dir=export_dir,
             runner=SinglePass(),
         )
-        with patch("physicalai.inference.adapters.openvino_partitioned.np.random.randn", _zeros_like_randn):
+        with patch(
+            "physicalai.inference.adapters.openvino_partitioned.PartitionedOpenVINOAdapter._sample_noise",
+            _zeros_noise,
+        ):
             partitioned_outputs = partitioned_model(np_inputs)
         partitioned_actions = partitioned_outputs[ACTION]
 

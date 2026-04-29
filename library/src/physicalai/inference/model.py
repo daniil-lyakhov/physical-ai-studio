@@ -22,7 +22,6 @@ from physicalai.inference.runners import get_runner
 if TYPE_CHECKING:
     import numpy as np
 
-    from physicalai.inference.adapters.base import RuntimeAdapter
     from physicalai.inference.callbacks.base import Callback
     from physicalai.inference.postprocessors.base import Postprocessor
     from physicalai.inference.preprocessors.base import Preprocessor

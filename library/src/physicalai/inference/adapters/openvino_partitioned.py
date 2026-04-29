@@ -15,6 +15,7 @@ the same exported model works for any number of cameras.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -22,8 +23,6 @@ import numpy as np
 from physicalai.inference.adapters.base import RuntimeAdapter
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     import openvino
 
 
@@ -31,7 +30,7 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
     """OpenVINO adapter for partitioned Pi0.5 models.
 
     Loads 4 separately exported IR models and runs the full denoising
-    inference pipeline (embedder × N cameras → prefix LM → N×expert → head)
+    inference pipeline (embedder x N cameras -> prefix LM -> Nxexpert -> head)
     in a single ``predict()`` call, returning the action chunk.
 
     The denoising loop runs inside ``predict()`` so that from the
@@ -106,9 +105,7 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             msg = "OpenVINO is not installed. Install with: uv pip install openvino"
             raise ImportError(msg) from e
 
-        from pathlib import Path as _Path
-
-        model_dir = _Path(model_path)
+        model_dir = Path(model_path)
         if model_dir.is_file():
             model_dir = model_dir.parent
 
@@ -125,16 +122,24 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
 
         core = ov.Core()
         self._embedder_compiled = core.compile_model(
-            core.read_model(str(embedder_path)), device_name=self.device, config=self.config,
+            core.read_model(str(embedder_path)),
+            device_name=self.device,
+            config=self.config,
         )
         self._prefix_lm_compiled = core.compile_model(
-            core.read_model(str(prefix_lm_path)), device_name=self.device, config=self.config,
+            core.read_model(str(prefix_lm_path)),
+            device_name=self.device,
+            config=self.config,
         )
         self._expert_compiled = core.compile_model(
-            core.read_model(str(expert_path)), device_name=self.device, config=self.config,
+            core.read_model(str(expert_path)),
+            device_name=self.device,
+            config=self.config,
         )
         self._head_compiled = core.compile_model(
-            core.read_model(str(head_path)), device_name=self.device, config=self.config,
+            core.read_model(str(head_path)),
+            device_name=self.device,
+            config=self.config,
         )
         self._lang_weight = np.load(str(lang_embed_path))
 
@@ -152,10 +157,10 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         """Run the full denoising inference pipeline.
 
         Executes:
-        1. Image embedder × N cameras → image embeddings
+        1. Image embedder x N cameras -> image embeddings
         2. Language embedding via NumPy lookup
-        3. Prefix LM: concatenated embeddings → KV cache
-        4. Expert decoder × num_inference_steps: denoising loop
+        3. Prefix LM: concatenated embeddings -> KV cache
+        4. Expert decoder x num_inference_steps: denoising loop
         5. Action head: final action projection
 
         Args:
@@ -179,8 +184,8 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         # --- Parse inputs ---
         lm_inputs, prefix_pad_masks, batch_size = self._embed_inputs(inputs)
 
-        # --- Stage 3: Prefix LM → KV cache ---
-        prefix_result = self._prefix_lm_compiled(lm_inputs)
+        # --- Stage 3: Prefix LM -> KV cache ---
+        prefix_result = self._prefix_lm_compiled(lm_inputs)  # type: ignore[misc]
         cache_keys = prefix_result[0]
         cache_values = prefix_result[1]
 
@@ -188,7 +193,7 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         x_t = noise
         if noise is None:
             x_t = self._sample_noise(batch_size)
-            
+
         dt = -1.0 / self._num_inference_steps
 
         for step in range(self._num_inference_steps):
@@ -207,25 +212,29 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
 
         # Trim padded action dimension to actual action size
         if self._action_dim is not None:
-            x_t = x_t[:, :, :self._action_dim]
+            x_t = x_t[:, :, : self._action_dim]  # type: ignore[index]
 
         return {"action": x_t}
 
-    def _apply_expert(self, expert_inputs, dt):
-        expert_result = self._expert_compiled(expert_inputs)
+    def _apply_expert(self, expert_inputs: dict[str, np.ndarray], dt: float) -> np.ndarray:
+        expert_result = self._expert_compiled(expert_inputs)  # type: ignore[misc]
         suffix_out = expert_result[0]
 
         # Stage 5: Action projection
-        head_result = self._head_compiled({"suffix_out": suffix_out})
+        head_result = self._head_compiled({"suffix_out": suffix_out})  # type: ignore[misc]
         v_t = head_result[0]
-        return  expert_inputs["x_t"] + dt * v_t
+        return expert_inputs["x_t"] + dt * v_t
 
-    def _sample_noise(self, batch_size):
-        return np.random.randn(
-                batch_size, self._chunk_size, self._max_action_dim,
-            ).astype(np.float32)
+    def _sample_noise(self, batch_size: int) -> np.ndarray:
+        rng = np.random.default_rng()
+        return rng.standard_normal(
+            (batch_size, self._chunk_size, self._max_action_dim),
+        ).astype(np.float32)
 
-    def _embed_inputs(self, inputs):
+    def _embed_inputs(  # noqa: PLR0914
+        self,
+        inputs: dict[str, np.ndarray],
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, int]:
         paligemma_inputs = dict(inputs)
         images = paligemma_inputs.pop("images")
         image_masks = paligemma_inputs.pop("image_masks")
@@ -245,7 +254,7 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         att_masks_list: list[int] = []
 
         for cam_idx in range(n_cameras):
-            result = self._embedder_compiled({"image": images[cam_idx]})
+            result = self._embedder_compiled({"image": images[cam_idx]})  # type: ignore[misc]
             img_emb = result[0]  # (batch, num_patches, hidden)
             num_patches = img_emb.shape[1]
 
@@ -256,7 +265,7 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
             att_masks_list.extend([0] * num_patches)
 
         # --- Stage 2: Language embedding (NumPy lookup) ---
-        lang_emb = self._lang_weight[tokens]  # (batch, token_len, hidden)
+        lang_emb = self._lang_weight[tokens]  # type: ignore[index]
         embs.append(lang_emb)
         pad_masks.append(token_masks)
         att_masks_list.extend([0] * tokens.shape[1])
@@ -273,17 +282,21 @@ class PartitionedOpenVINOAdapter(RuntimeAdapter):
         # (these ops were moved out of the exported PrefixLM IR).
         MASK_VALUE = -2.3819763e38  # OPENPI_ATTENTION_MASK_VALUE  # noqa: N806
         cumsum = np.cumsum(prefix_att_masks.astype(np.int64), axis=1)
-        att_2d = (cumsum[:, np.newaxis, :] <= cumsum[:, :, np.newaxis])  # (B, seq, seq)
-        pad_2d = (prefix_pad_masks[:, np.newaxis, :] & prefix_pad_masks[:, :, np.newaxis])
-        att_2d = att_2d & pad_2d
+        att_2d = cumsum[:, np.newaxis, :] <= cumsum[:, :, np.newaxis]  # (B, seq, seq)
+        pad_2d = prefix_pad_masks[:, np.newaxis, :] & prefix_pad_masks[:, :, np.newaxis]
+        att_2d &= pad_2d
         att_4d = att_2d[:, np.newaxis, :, :]  # (B, 1, seq, seq)
         prefix_att_2d_masks_4d = np.where(att_4d, 0.0, MASK_VALUE).astype(np.float32)
-        prefix_position_ids = (np.cumsum(prefix_pad_masks.astype(np.int64), axis=1) - 1)
-        return {
-            "prefix_embs": prefix_embs,
-            "prefix_att_2d_masks_4d": prefix_att_2d_masks_4d,
-            "prefix_position_ids": prefix_position_ids,
-        }, prefix_pad_masks, batch_size
+        prefix_position_ids = np.cumsum(prefix_pad_masks.astype(np.int64), axis=1) - 1
+        return (
+            {
+                "prefix_embs": prefix_embs,
+                "prefix_att_2d_masks_4d": prefix_att_2d_masks_4d,
+                "prefix_position_ids": prefix_position_ids,
+            },
+            prefix_pad_masks,
+            batch_size,
+        )
 
     def default_device(self) -> str:  # noqa: PLR6301
         """Get default OpenVINO device.

@@ -652,12 +652,13 @@ class Pi05(ExportablePolicyMixin, Policy):
     def to_openvino_partitioned(
         self,
         output_path: str | Path,
+        *,
         compress_to_fp16: bool = True,
     ) -> dict[str, str]:
         """Export the Pi0.5 model as 3 separate OpenVINO IR models.
 
         Splits the model into:
-        - paligemma_encoder: vision + language prefix encoding → KV cache
+        - paligemma_encoder: vision + language prefix encoding -> KV cache
         - gemma_expert_decoder: denoising step (suffix embed + expert forward)
         - action_output_head: final action projection
 
@@ -669,8 +670,11 @@ class Pi05(ExportablePolicyMixin, Policy):
 
         Returns:
             Dict mapping part names ('paligemma', 'expert', 'head') to .xml paths.
+
+        Raises:
+            RuntimeError: If the model is not initialized.
         """
-        from .partitioned_export import export_partitioned_openvino
+        from .partitioned_export import export_partitioned_openvino  # noqa: PLC0415
 
         if self.model is None:
             msg = "Model is not initialized. Call setup() or load from checkpoint first."

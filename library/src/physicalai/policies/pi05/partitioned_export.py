@@ -18,15 +18,18 @@ supports a variable number of cameras without re-export.
 
 from __future__ import annotations
 
-from physicalai.export.mixin_policy import _postprocess_openvino_model
-
 import logging
+import math
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from transformers.cache_utils import DynamicCache
+
+from physicalai.export.mixin_policy import _postprocess_openvino_model  # noqa: PLC2701
 
 from .model import (
     OPENPI_ATTENTION_MASK_VALUE,
@@ -158,7 +161,7 @@ class PaliGemmaEncoder(nn.Module):
         self.prefix_lm = PrefixLM(pi05_model)
         self._pi05_model = pi05_model
 
-    def forward(
+    def forward(  # noqa: PLR0914
         self,
         images: Tensor,
         img_masks: Tensor,
@@ -176,8 +179,6 @@ class PaliGemmaEncoder(nn.Module):
         Returns:
             Tuple of (cache_keys, cache_values, prefix_pad_masks).
         """
-        import math  # noqa: PLC0415
-
         embs = []
         pad_masks = []
         att_masks: list[int] = []
@@ -192,7 +193,7 @@ class PaliGemmaEncoder(nn.Module):
         # Language embedding
         lang_emb = self._pi05_model.paligemma_with_expert.embed_language_tokens(tokens)
         lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        lang_emb *= math.sqrt(lang_emb_dim)
         embs.append(lang_emb)
         pad_masks.append(masks)
         att_masks += [0] * lang_emb.shape[1]
@@ -200,7 +201,9 @@ class PaliGemmaEncoder(nn.Module):
         prefix_embs = torch.cat(embs, dim=1)
         prefix_pad_masks = torch.cat(pad_masks, dim=1)
         prefix_att_masks = torch.tensor(
-            att_masks, dtype=torch.bool, device=prefix_pad_masks.device,
+            att_masks,
+            dtype=torch.bool,
+            device=prefix_pad_masks.device,
         )
         bsize = prefix_pad_masks.shape[0]
         prefix_att_masks = prefix_att_masks[None, :].expand(bsize, len(att_masks))
@@ -211,11 +214,15 @@ class PaliGemmaEncoder(nn.Module):
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = prefix_att_2d_masks[:, None, :, :]
         prefix_att_2d_masks_4d = torch.where(
-            prefix_att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE,
+            prefix_att_2d_masks_4d,
+            0.0,
+            OPENPI_ATTENTION_MASK_VALUE,
         )
 
         cache_keys, cache_values = self.prefix_lm(
-            prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids,
+            prefix_embs,
+            prefix_att_2d_masks_4d,
+            prefix_position_ids,
         )
         return cache_keys, cache_values, prefix_pad_masks
 
@@ -234,11 +241,11 @@ class GemmaExpertDecoder(nn.Module):
         self.action_in_proj = pi05_model.action_in_proj
         self.time_mlp_in = pi05_model.time_mlp_in
         self.time_mlp_out = pi05_model.time_mlp_out
-        self._chunk_size = pi05_model._chunk_size
-        self._min_period = pi05_model._min_period
-        self._max_period = pi05_model._max_period
+        self._chunk_size = pi05_model._chunk_size  # noqa: SLF001
+        self._min_period = pi05_model._min_period  # noqa: SLF001
+        self._max_period = pi05_model._max_period  # noqa: SLF001
 
-    def forward(
+    def forward(  # noqa: PLR0914
         self,
         x_t: Tensor,
         timestep: Tensor,
@@ -289,17 +296,20 @@ class GemmaExpertDecoder(nn.Module):
             adarms_cond=[None, adarms_cond],
         )
 
-        suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self._chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        return suffix_out
+        suffix_out = outputs_embeds[1]  # type: ignore[index]
+        suffix_out = suffix_out[:, -self._chunk_size :]  # type: ignore[index]
+        return suffix_out.to(dtype=torch.float32)
 
     def _embed_suffix(
         self,
         noisy_actions: Tensor,
         timestep: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Embed noisy actions and timestep for the expert."""
+        """Embed noisy actions and timestep for the expert.
+
+        Returns:
+            Tuple of (action_time_emb, action_time_mask, att_masks, adarms_cond).
+        """
         time_emb = _create_sinusoidal_pos_embedding(
             timestep,
             self.action_in_proj.out_features,
@@ -328,7 +338,8 @@ class GemmaExpertDecoder(nn.Module):
 
         return action_time_emb, action_time_mask, att_masks, adarms_cond
 
-    def _prepare_attention_masks_4d(self, att_2d_masks: Tensor) -> Tensor:
+    @staticmethod
+    def _prepare_attention_masks_4d(att_2d_masks: Tensor) -> Tensor:
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
@@ -356,148 +367,18 @@ class ActionOutputHead(nn.Module):
         return self.action_out_proj(suffix_out)
 
 
-class Pi05PartitionedOVModel(nn.Module):
-    """Inference module that runs 3 OpenVINO IR models underneath.
-
-    Replaces the monolithic Pi05Model for inference by running the
-    PaliGemmaEncoder, GemmaExpertDecoder, and ActionOutputHead
-    as separate OpenVINO compiled models.
-    """
-
-    def __init__(
-        self,
-        paligemma_model_path: str,
-        expert_model_path: str,
-        head_model_path: str,
-        num_inference_steps: int = 10,
-        chunk_size: int = 50,
-        max_action_dim: int = 32,
-    ) -> None:
-        """Initialize with paths to the 3 OpenVINO IR models.
-
-        Args:
-            paligemma_model_path: Path to paligemma encoder .xml file.
-            expert_model_path: Path to gemma expert decoder .xml file.
-            head_model_path: Path to action output head .xml file.
-            num_inference_steps: Number of denoising steps.
-            chunk_size: Action chunk size.
-            max_action_dim: Maximum action dimension.
-        """
-        super().__init__()
-        import openvino
-
-        self._num_inference_steps = num_inference_steps
-        self._chunk_size = chunk_size
-        self._max_action_dim = max_action_dim
-
-        core = openvino.Core()
-        self._paligemma_compiled = core.compile_model(
-            core.read_model(paligemma_model_path), "CPU"
-        )
-        self._expert_compiled = core.compile_model(
-            core.read_model(expert_model_path), "CPU"
-        )
-        self._head_compiled = core.compile_model(
-            core.read_model(head_model_path), "CPU"
-        )
-
-    def forward(self, batch: dict[str, Any]) -> Tensor:
-        """Run full inference using the 3 partitioned IR models.
-
-        Args:
-            batch: Preprocessed batch dict containing IMAGES, IMAGE_MASKS,
-                TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK.
-
-        Returns:
-            Denoised action tensor.
-        """
-        import numpy as np
-
-        from physicalai.data.constants import IMAGE_MASKS, TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
-        from physicalai.data.observation import IMAGES
-
-        images = batch[IMAGES]
-        img_masks = batch[IMAGE_MASKS]
-        tokens = batch[TOKENIZED_PROMPT]
-        masks = batch[TOKENIZED_PROMPT_MASK]
-
-        # Stage 1: Prefix encoding via PaliGemma IR (single camera)
-        paligemma_inputs = {
-            "images": images[0].numpy(),
-            "image_masks": img_masks[0].numpy(),
-            "tokenized_prompt": tokens.numpy(),
-            "tokenized_prompt_mask": masks.numpy(),
-        }
-
-        paligemma_result = self._paligemma_compiled(paligemma_inputs)
-        cache_keys = torch.from_numpy(paligemma_result[0])
-        cache_values = torch.from_numpy(paligemma_result[1])
-        prefix_pad_masks = torch.from_numpy(paligemma_result[2])
-
-        # Stage 2: Iterative denoising via Expert IR
-        bsize = tokens.shape[0]
-        x_t = torch.zeros(bsize, self._chunk_size, self._max_action_dim, dtype=torch.float32)
-        dt = -1.0 / self._num_inference_steps
-
-        for step in range(self._num_inference_steps):
-            time = 1.0 + step * dt
-            time_tensor = torch.full((bsize,), time, dtype=torch.float32)
-
-            expert_inputs = {
-                "x_t": x_t.numpy(),
-                "timestep": time_tensor.numpy(),
-                "cache_keys": cache_keys.numpy(),
-                "cache_values": cache_values.numpy(),
-                "prefix_pad_masks": prefix_pad_masks.numpy(),
-            }
-            expert_result = self._expert_compiled(expert_inputs)
-            suffix_out = torch.from_numpy(expert_result[0])
-
-            # Stage 3: Action projection via Head IR
-            head_result = self._head_compiled({"suffix_out": suffix_out.numpy()})
-            v_t = torch.from_numpy(head_result[0])
-
-            x_t = x_t + dt * v_t
-
-        return x_t
-
-    def select_action(self, observation: dict[str, Any]) -> "np.ndarray":
-        """Select action for given observation (PolicyLike interface).
-
-        Runs the full partitioned inference pipeline and returns
-        the action chunk as a numpy array.
-
-        Args:
-            observation: Preprocessed observation dict with keys matching
-                the batch format (IMAGES, IMAGE_MASKS, TOKENIZED_PROMPT, etc.)
-
-        Returns:
-            Action array of shape (batch, chunk_size, max_action_dim).
-        """
-        import numpy as np
-
-        action_tensor = self.forward(observation)
-        return action_tensor.numpy()
-
-    def reset(self) -> None:
-        """Reset policy state for a new episode (PolicyLike interface).
-
-        No internal state to reset for this model.
-        """
-
-
-def export_partitioned_openvino(
+def export_partitioned_openvino(  # noqa: PLR0914, PLR0915
     pi05_model: Pi05Model,
     output_dir: str,
+    *,
     compress_to_fp16: bool = True,
-    tokenizer: Any | None = None,
+    tokenizer: object | None = None,
 ) -> dict[str, str]:
     """Export Pi05Model as 3 separate OpenVINO IR models.
 
     Args:
         pi05_model: The Pi05Model instance (in eval mode).
         output_dir: Directory where the 3 IR models will be saved.
-        input_sample: Optional sample input for tracing. If None, uses model's sample_input.
         compress_to_fp16: Whether to compress weights to FP16.
         tokenizer: Optional pre-loaded tokenizer instance. If None, will attempt
             to load from HuggingFace.
@@ -505,9 +386,7 @@ def export_partitioned_openvino(
     Returns:
         Dict mapping part names to their .xml file paths.
     """
-    from pathlib import Path
-
-    import openvino
+    import openvino  # noqa: PLC0415
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -531,8 +410,8 @@ def export_partitioned_openvino(
     # Tracing with batch=1 causes internal reshape/view ops to hardcode
     # the value ``1``, breaking inference with larger batches.
     batch_size = 2
-    chunk_size = pi05_model._chunk_size
-    max_action_dim = pi05_model._max_action_dim
+    chunk_size = pi05_model._chunk_size  # noqa: SLF001
+    max_action_dim = pi05_model._max_action_dim  # noqa: SLF001
     expert_width = pi05_model.action_in_proj.out_features
 
     # --- Export Image Embedder ---
@@ -549,7 +428,6 @@ def export_partitioned_openvino(
     with torch.no_grad():
         sample_img_emb = image_embedder(sample_image)
     num_patches = sample_img_emb.shape[1]
-    hidden_dim = sample_img_emb.shape[2]
 
     embedder_onnx_path = output_path / "image_embedder.onnx"
     torch.onnx.export(
@@ -572,15 +450,14 @@ def export_partitioned_openvino(
 
     # --- Save language embedding weights ---
     logger.info("Saving language embedding weights...")
-    import math  # noqa: PLC0415
 
     # Get the raw weight matrix and scale factor
     lang_weight = pi05_model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight
     lang_scale = math.sqrt(lang_weight.shape[1])  # sqrt(hidden_dim)
     lang_weight_np = (lang_weight.detach().cpu().float().numpy() * lang_scale).astype("float32")
     lang_embed_path = output_path / "language_embedding.npy"
-    import numpy as _np  # noqa: PLC0415
-    _np.save(str(lang_embed_path), lang_weight_np)
+
+    np.save(str(lang_embed_path), lang_weight_np)
     logger.info("Language embedding weights saved to %s (scale=%.1f)", lang_embed_path, lang_scale)
 
     # --- Export Prefix LM ---
@@ -603,12 +480,16 @@ def export_partitioned_openvino(
     sample_position_ids = torch.cumsum(sample_pad_masks, dim=1) - 1
     sample_att_2d_masks_4d = sample_att_2d_masks[:, None, :, :]
     sample_att_2d_masks_4d = torch.where(
-        sample_att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE,
+        sample_att_2d_masks_4d,
+        0.0,
+        OPENPI_ATTENTION_MASK_VALUE,
     )
 
     with torch.no_grad():
         cache_keys, cache_values = prefix_lm(
-            sample_prefix_embs, sample_att_2d_masks_4d, sample_position_ids,
+            sample_prefix_embs,
+            sample_att_2d_masks_4d,
+            sample_position_ids,
         )
     # Keep prefix_pad_masks for the expert decoder export below
     prefix_pad_masks = sample_pad_masks
@@ -694,16 +575,16 @@ def export_partitioned_openvino(
     # --- Write manifest.json so InferenceModel.load() works ---
     # Derive actual action dimension from dataset stats
     action_dim = None
-    if pi05_model._dataset_stats and "action" in pi05_model._dataset_stats:
-        action_dim = pi05_model._dataset_stats["action"]["shape"][0]
+    if pi05_model._dataset_stats and "action" in pi05_model._dataset_stats:  # noqa: SLF001
+        action_dim = int(pi05_model._dataset_stats["action"]["shape"][0])  # noqa: SLF001
 
     _write_partitioned_manifest(
         output_path,
         chunk_size=chunk_size,
         max_action_dim=max_action_dim,
-        num_inference_steps=pi05_model._num_inference_steps,
+        num_inference_steps=pi05_model._num_inference_steps,  # noqa: SLF001
         action_dim=action_dim,
-        dataset_stats=pi05_model._dataset_stats,
+        dataset_stats=pi05_model._dataset_stats,  # noqa: SLF001
         image_resolution=image_shape[1:] if image_shape is not None else (224, 224),
     )
     logger.info("Manifest written to %s", output_path / "manifest.json")
@@ -716,7 +597,7 @@ def export_partitioned_openvino(
     }
 
 
-def _save_preprocessor_config(pi05_model: Pi05Model, output_dir: Any) -> None:
+def _save_preprocessor_config(pi05_model: Pi05Model, output_dir: str | Path) -> None:
     """Save preprocessor configuration for inference-time observation preprocessing.
 
     Writes ``preprocessor_config.json`` containing dataset stats, tokenizer name,
@@ -727,18 +608,19 @@ def _save_preprocessor_config(pi05_model: Pi05Model, output_dir: Any) -> None:
         output_dir: Export directory.
     """
     import json  # noqa: PLC0415
-    from pathlib import Path  # noqa: PLC0415
 
     from physicalai.data.observation import ACTION, STATE  # noqa: PLC0415
 
-    stats = pi05_model._dataset_stats
+    stats = pi05_model._dataset_stats  # noqa: SLF001
     config: dict[str, Any] = {
         "tokenizer_name": "google/paligemma-3b-pt-224",
         "max_token_len": 200,
-        "image_resolution": list(pi05_model.paligemma_with_expert.paligemma.config.vision_config.image_size
-                                  if hasattr(pi05_model.paligemma_with_expert.paligemma.config.vision_config, 'image_size')
-                                  and not isinstance(pi05_model.paligemma_with_expert.paligemma.config.vision_config.image_size, int)
-                                  else [pi05_model.paligemma_with_expert.paligemma.config.vision_config.image_size] * 2),
+        "image_resolution": list(
+            pi05_model.paligemma_with_expert.paligemma.config.vision_config.image_size
+            if hasattr(pi05_model.paligemma_with_expert.paligemma.config.vision_config, "image_size")
+            and not isinstance(pi05_model.paligemma_with_expert.paligemma.config.vision_config.image_size, int)
+            else [pi05_model.paligemma_with_expert.paligemma.config.vision_config.image_size] * 2,
+        ),
         "empty_cameras": 0,
     }
 
@@ -757,20 +639,20 @@ def _save_preprocessor_config(pi05_model: Pi05Model, output_dir: Any) -> None:
             }
 
     config_path = Path(output_dir) / "preprocessor_config.json"
-    with open(config_path, "w") as f:
+    with config_path.open("w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
 
-def _save_tokenizer(pi05_model: Pi05Model, output_dir: Any, tokenizer: Any | None = None) -> None:
+def _save_tokenizer(_pi05_model: Pi05Model, output_dir: str | Path, tokenizer: object | None = None) -> None:
     """Save the PaliGemma tokenizer from the model to the export directory.
 
     Uses the provided tokenizer if available, otherwise falls back to loading
     from HuggingFace. If loading fails (e.g. gated repo without access),
-    the tokenizer is skipped — the inference preprocessor will load it at
+    the tokenizer is skipped -- the inference preprocessor will load it at
     runtime from HuggingFace cache or the local ``tokenizer/`` directory.
 
     Args:
-        pi05_model: The Pi05Model (unused when tokenizer is provided).
+        _pi05_model: The Pi05Model (unused when tokenizer is provided).
         output_dir: Export directory.
         tokenizer: Optional pre-loaded tokenizer instance.
     """
@@ -793,11 +675,11 @@ def _save_tokenizer(pi05_model: Pi05Model, output_dir: Any, tokenizer: Any | Non
             logger.warning(
                 "Could not load tokenizer (gated repo or not cached). "
                 "Skipping tokenizer save. The inference preprocessor will "
-                "need to load it at runtime."
+                "need to load it at runtime.",
             )
             return
 
-    tokenizer.save_pretrained(str(tokenizer_dir))
+    tokenizer.save_pretrained(str(tokenizer_dir))  # type: ignore[union-attr]
     logger.info("Tokenizer saved to %s", tokenizer_dir)
 
 
@@ -822,7 +704,7 @@ def _stats_to_serializable(stats_dict: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_partitioned_manifest(
-    output_dir: Any,
+    output_dir: str | Path,
     chunk_size: int,
     max_action_dim: int,
     num_inference_steps: int,
@@ -845,6 +727,7 @@ def _write_partitioned_manifest(
         chunk_size: Action chunk size.
         max_action_dim: Maximum action dimension.
         num_inference_steps: Number of denoising steps.
+        action_dim: Actual action dimension (may differ from max_action_dim).
         dataset_stats: Dataset statistics dict for normalization.
         image_resolution: Target image resolution (H, W).
         normalization_mode: Normalization mode ('mean_std', 'min_max', etc.).
@@ -929,4 +812,4 @@ def _write_partitioned_manifest(
             postprocessors=postprocessor_specs,
         ),
     )
-    manifest.save(output_dir / "manifest.json")
+    manifest.save(Path(output_dir) / "manifest.json")
