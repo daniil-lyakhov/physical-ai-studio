@@ -6,18 +6,20 @@ import nncf
 import numpy as np
 import openvino
 import torch
+from tqdm import tqdm
 from nncf.quantization.advanced_parameters import AdvancedCompressionParameters, GroupSizeFallbackMode
 
 from physicalai.benchmark import LiberoBenchmark
 from physicalai.data import Observation
-from physicalai.data.lerobot import LeRobotDataModule
+from physicalai.gyms import LiberoGym
 from physicalai.inference import InferenceModel
 from physicalai.inference.adapters.openvino_partitioned import PartitionedOpenVINOAdapter
 from physicalai.inference.runners import ActionChunking, SinglePass
 
-# LIBERO dataset on HuggingFace, compatible with physicalai data format.
-_CALIBRATION_REPO_ID = "HuggingFaceVLA/libero"
-_CALIBRATION_SAMPLES = 128
+_CALIBRATION_TASK_SUITE = "libero_10"
+_CALIBRATION_SAMPLES_PER_TASK = 32
+_CALIBRATION_NUM_TASKS = 10
+_CALIBRATION_SAMPLES = _CALIBRATION_SAMPLES_PER_TASK * _CALIBRATION_NUM_TASKS
 
 
 class InferenceModelPolicyWrapper:
@@ -35,41 +37,66 @@ class InferenceModelPolicyWrapper:
         self._inf_model.reset()
 
 
-def _collect_preprocessed_samples(
+def _collect_gym_observations(
     inf_model: InferenceModel,
-    repo_id: str,
-    n_samples: int,
+    task_suite: str,
+    num_tasks: int,
+    samples_per_task: int,
 ) -> list[dict[str, np.ndarray]]:
-    """Load a dataset and run it through the InferenceModel preprocessors.
+    """Run the FP32 model on LIBERO gym tasks and collect observations.
 
-    Returns a list of dicts with numpy arrays matching the partitioned
-    OV model's input format (images, tokenized_prompt, state, etc.).
+    Runs 1 episode per task in closed-loop, then randomly samples
+    observations from each task's rollout.
+
+    Returns a list of preprocessed dicts matching the partitioned
+    OV model's input format.
     """
-    datamodule = LeRobotDataModule(
-        repo_id=repo_id,
-        train_batch_size=1,
-        num_workers=0,
-        data_format="physicalai",
-        episodes=[0, 1],
+    all_samples: list[dict[str, np.ndarray]] = []
+
+    max_steps = 520  # libero_10 suite max episode length
+
+    for task_id in tqdm(range(num_tasks), desc="Collecting gym observations"):
+        gym = LiberoGym(task_suite=task_suite, task_id=task_id)
+        obs, _ = gym.reset()
+        inf_model.reset()
+
+        task_observations: list[dict[str, np.ndarray]] = []
+
+        for _ in range(max_steps):
+            np_obs = obs.to_numpy().to_dict(flatten=False)
+            inputs = {k: v for k, v in np_obs.items() if v is not None}
+            task_observations.append(inputs)
+
+            # Use a copy for inference since preprocessors mutate the dict
+            action = inf_model.select_action(inputs.copy())
+            obs, _, terminated, truncated, _ = gym.step(action.squeeze(0))
+            if terminated or truncated:
+                break
+
+        gym.close()
+        print(f"Task {task_id}: collected {len(task_observations)} observations")
+
+        # Uniformly sample: first, last, and evenly spaced in between
+        n = len(task_observations)
+        k = min(samples_per_task, n)
+        indices = np.linspace(0, n - 1, k, dtype=int)
+        task_samples = [task_observations[i] for i in indices]
+
+        # Run through preprocessors
+        for raw_obs in task_samples:
+            processed = raw_obs
+            for preprocessor in inf_model.preprocessors:
+                processed = preprocessor(processed)
+            all_samples.append(processed)
+
+    #random.seed(42)
+    #random.shuffle(all_samples)
+
+    print(
+        f"Collected {len(all_samples)} preprocessed samples "
+        f"from {num_tasks} tasks ({samples_per_task} per task)"
     )
-    datamodule.setup("test")
-    dataloader = datamodule.train_dataloader()
-
-    samples: list[dict[str, np.ndarray]] = []
-    for batch in dataloader:
-        np_obs = batch.to_numpy().to_dict(flatten=False)
-        inputs = {k: v for k, v in np_obs.items() if v is not None}
-        for preprocessor in inf_model.preprocessors:
-            inputs = preprocessor(inputs)
-        samples.append(inputs)
-        if len(samples) >= n_samples:
-            break
-
-    random.seed(42)
-    random.shuffle(samples)
-
-    print(f"Collected {len(samples)} preprocessed samples from {repo_id}")
-    return samples
+    return all_samples
 
 
 def _embed_all_samples(
@@ -123,8 +150,11 @@ def _build_expert_decoder_calibration(
         cache_keys = prefix_result[0]
         cache_values = prefix_result[1]
 
-        # Denoising loop — collect expert inputs at each step
+        # Denoising loop — collect expert inputs at a random subset of steps
         x_t = adapter._sample_noise(batch_size)
+        collect_steps = set(random.sample(range(num_inference_steps - 1), k=min(2, num_inference_steps)))
+        collect_steps.add(0)
+        collect_steps.add(num_inference_steps -1)
 
         for step in range(num_inference_steps):
             t = 1.0 + step * dt
@@ -137,7 +167,9 @@ def _build_expert_decoder_calibration(
                 "cache_values": np.array(cache_values),
                 "prefix_pad_masks": prefix_pad_masks.astype(bool),
             }
-            expert_inputs.append(expert_input)
+
+            if step in collect_steps:
+                expert_inputs.append(expert_input)
 
             # Advance denoising so next step has realistic x_t
             x_t = adapter._apply_expert(expert_input, dt)
@@ -171,9 +203,12 @@ def compress_partitioned_model(
     inf_model = InferenceModel(source_dir, device=device)
     adapter = inf_model.adapter
 
-    # Collect calibration data and embed once
-    calibration_samples = _collect_preprocessed_samples(
-        inf_model, _CALIBRATION_REPO_ID, _CALIBRATION_SAMPLES,
+    # Collect calibration data from gym rollouts and embed once
+    calibration_samples = _collect_gym_observations(
+        inf_model,
+        task_suite=_CALIBRATION_TASK_SUITE,
+        num_tasks=_CALIBRATION_NUM_TASKS,
+        samples_per_task=_CALIBRATION_SAMPLES_PER_TASK,
     )
     embedded_samples = _embed_all_samples(adapter, calibration_samples)
     num_inference_steps = adapter._num_inference_steps
@@ -219,7 +254,7 @@ def compress_partitioned_model(
         dataset=expert_dataset,
         awq=True,
         scale_estimation=True,
-        subset_size=_CALIBRATION_SAMPLES * 5,
+        subset_size=_CALIBRATION_SAMPLES * 4,
         advanced_parameters=AdvancedCompressionParameters(
             calibration_device=device,
             group_size_fallback_mode=GroupSizeFallbackMode.ADJUST,
