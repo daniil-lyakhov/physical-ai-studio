@@ -315,14 +315,16 @@ if __name__ == "__main__":
     )
 
     # Step 3: Evaluate compressed model on LIBERO
-    benchmark = LiberoBenchmark(
-        task_suite="libero_10",
-        task_ids=[6],
-        num_episodes=1,
-        max_steps=10,
-    )
 
-    ov_model = InferenceModel(INT4_EXPORT_DIR, device=DEVICE, runner=ActionChunking(SinglePass()))
-    ov_policy = InferenceModelPolicyWrapper(ov_model)
-    ov_results = benchmark.evaluate(ov_policy)
-    print(ov_results.summary())
+    for suite in ["libero_spatial", "libero_object" , "libero_goal" , "libero_10" , "libero_90"]:
+        benchmark = LiberoBenchmark(
+            task_suite=suite,
+            #task_ids=[6],
+            num_episodes=20,
+            #max_steps=10,
+        )
+
+        ov_model = InferenceModel(INT4_EXPORT_DIR, device=DEVICE, runner=ActionChunking(SinglePass()))
+        ov_policy = InferenceModelPolicyWrapper(ov_model)
+        ov_results = benchmark.evaluate(ov_policy)
+        print(ov_results.summary())
