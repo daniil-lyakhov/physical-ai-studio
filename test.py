@@ -75,8 +75,6 @@ def _collect_gym_observations(
                 break
 
         gym.close()
-        del gym
-        gc.collect()
         print(f"Task {task_id}: collected {len(task_observations)} observations")
 
         # Uniformly sample: first, last, and evenly spaced in between
@@ -84,7 +82,6 @@ def _collect_gym_observations(
         k = min(samples_per_task, n)
         indices = np.linspace(0, n - 1, k, dtype=int)
         task_samples = [task_observations[i] for i in indices]
-        del task_observations
 
         # Run through preprocessors
         for raw_obs in task_samples:
@@ -92,7 +89,6 @@ def _collect_gym_observations(
             for preprocessor in inf_model.preprocessors:
                 processed = preprocessor(processed)
             all_samples.append(processed)
-        del task_samples
 
     #random.seed(42)
     #random.shuffle(all_samples)
@@ -157,6 +153,7 @@ def _build_expert_decoder_calibration(
 
         # Denoising loop — collect expert inputs at a random subset of steps
         x_t = adapter._sample_noise(batch_size)
+        random.seed(42)
         collect_steps = set(random.sample(range(num_inference_steps - 1), k=min(2, num_inference_steps)))
         collect_steps.add(0)
         collect_steps.add(num_inference_steps -1)
@@ -295,6 +292,7 @@ def compress_partitioned_model(
 if __name__ == "__main__":
     FP32_EXPORT_DIR = "pi05_libero_finetuned_hf_ov"
     INT4_EXPORT_DIR = "pi05_libero_finetuned_hf_ov_int4"
+    current_export_dir = INT4_EXPORT_DIR
 
     # Step 1: Export partitioned FP32 model (if needed)
     if not Path(FP32_EXPORT_DIR).exists():
@@ -307,17 +305,16 @@ if __name__ == "__main__":
             dtype="bfloat16",
         )
         policy.to_openvino_partitioned(FP32_EXPORT_DIR)
-        del policy
 
     DEVICE = "CPU"
 
     # Step 2: Compress with INT4 data-aware algorithms
-    #if not Path(INT4_EXPORT_DIR).exists():
-    compress_partitioned_model(
-        source_dir=FP32_EXPORT_DIR,
-        output_dir=INT4_EXPORT_DIR,
-        device=DEVICE,
-    )
+    if not Path(current_export_dir).exists():
+        compress_partitioned_model(
+            source_dir=FP32_EXPORT_DIR,
+            output_dir=current_export_dir,
+            device=DEVICE,
+        )
 
     # Step 3: Evaluate compressed model on LIBERO
 
@@ -329,7 +326,7 @@ if __name__ == "__main__":
             #max_steps=10,
         )
 
-        ov_model = InferenceModel(INT4_EXPORT_DIR, device=DEVICE, runner=ActionChunking(SinglePass()))
+        ov_model = InferenceModel(current_export_dir, device=DEVICE, runner=ActionChunking(SinglePass()))
         ov_policy = InferenceModelPolicyWrapper(ov_model)
         ov_results = benchmark.evaluate(ov_policy)
         print(ov_results.summary())
