@@ -1,3 +1,4 @@
+import gc
 import random
 import shutil
 from pathlib import Path
@@ -74,6 +75,8 @@ def _collect_gym_observations(
                 break
 
         gym.close()
+        del gym
+        gc.collect()
         print(f"Task {task_id}: collected {len(task_observations)} observations")
 
         # Uniformly sample: first, last, and evenly spaced in between
@@ -81,6 +84,7 @@ def _collect_gym_observations(
         k = min(samples_per_task, n)
         indices = np.linspace(0, n - 1, k, dtype=int)
         task_samples = [task_observations[i] for i in indices]
+        del task_observations
 
         # Run through preprocessors
         for raw_obs in task_samples:
@@ -88,6 +92,7 @@ def _collect_gym_observations(
             for preprocessor in inf_model.preprocessors:
                 processed = preprocessor(processed)
             all_samples.append(processed)
+        del task_samples
 
     #random.seed(42)
     #random.shuffle(all_samples)
@@ -328,3 +333,9 @@ if __name__ == "__main__":
         ov_policy = InferenceModelPolicyWrapper(ov_model)
         ov_results = benchmark.evaluate(ov_policy)
         print(ov_results.summary())
+
+        # Close all gym environments to release MuJoCo/rendering resources
+        for gym in benchmark.gyms:
+            gym.close()
+        del ov_results, ov_policy, ov_model, benchmark
+        gc.collect()
