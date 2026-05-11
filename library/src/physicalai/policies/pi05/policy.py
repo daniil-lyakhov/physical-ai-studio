@@ -648,6 +648,44 @@ class Pi05(ExportablePolicyMixin, Policy):
                 gradient_clip_algorithm=gradient_clip_algorithm or "norm",
             )
 
+    @torch.no_grad()
+    def to_openvino_partitioned(
+        self,
+        output_path: str | Path,
+        *,
+        compress_to_fp16: bool = True,
+    ) -> dict[str, str]:
+        """Export the Pi0.5 model as 3 separate OpenVINO IR models.
+
+        Splits the model into:
+        - paligemma_encoder: vision + language prefix encoding -> KV cache
+        - gemma_expert_decoder: denoising step (suffix embed + expert forward)
+        - action_output_head: final action projection
+
+        This enables per-submodule quantization with different strategies.
+
+        Args:
+            output_path: Directory where the 3 IR models will be saved.
+            compress_to_fp16: Whether to compress weights to FP16.
+
+        Returns:
+            Dict mapping part names ('paligemma', 'expert', 'head') to .xml paths.
+
+        Raises:
+            RuntimeError: If the model is not initialized.
+        """
+        from .partitioned_export import export_partitioned_openvino  # noqa: PLC0415
+
+        if self.model is None:
+            msg = "Model is not initialized. Call setup() or load from checkpoint first."
+            raise RuntimeError(msg)
+
+        return export_partitioned_openvino(
+            self.model,
+            output_dir=str(output_path),
+            compress_to_fp16=compress_to_fp16,
+        )
+
     @staticmethod
     def get_supported_export_backends() -> list[str | ExportBackend]:
         """Get a list of export backends supported by policy.
@@ -678,14 +716,14 @@ class Pi05(ExportablePolicyMixin, Policy):
 
         base_preproc_specs = [
             ComponentSpec(
-                type="pi05",
-                image_resolution=self.config.image_resolution,
-                empty_cameras=self.config.empty_cameras,
-            ),
-            ComponentSpec(
                 type="normalize",
                 stats={STATE: self._dataset_stats[f"observation.{STATE}"]},
                 mode=self.config.normalization_mode.lower(),
+            ),
+            ComponentSpec(
+                type="pi05",
+                image_resolution=self.config.image_resolution,
+                empty_cameras=self.config.empty_cameras,
             ),
         ]
         postproc_specs = [

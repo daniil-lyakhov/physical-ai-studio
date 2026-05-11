@@ -220,6 +220,8 @@ class ComponentSpec(BaseModel):
         for name, param in sig.parameters.items():
             if name == "self":
                 continue
+            if param.kind in {param.VAR_POSITIONAL, param.VAR_KEYWORD}:
+                continue
             if name in overrides:
                 value = overrides[name]
             elif param.default is not param.empty:
@@ -265,6 +267,7 @@ class ModelSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
     n_obs_steps: int = 1
     runner: ComponentSpec | None = None
+    adapter: ComponentSpec | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)
     preprocessors: list[ComponentSpec] = Field(default_factory=list)
     postprocessors: list[ComponentSpec] = Field(default_factory=list)
