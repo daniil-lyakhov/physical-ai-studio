@@ -15,6 +15,7 @@ This is the GoF Decorator pattern: ``ActionChunking`` *is* an
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -72,6 +73,7 @@ class ActionChunking(InferenceRunner):
         self.chunk_size = chunk_size
         self.action_key = action_key
         self._action_queue: deque[np.ndarray] = deque()
+        self.elapsed_times = []
 
     def run(
         self,
@@ -91,7 +93,10 @@ class ActionChunking(InferenceRunner):
         if len(self._action_queue) > 0:
             return {self.action_key: self._action_queue.popleft()}
 
+        t0 = time.perf_counter()
         outputs = self.runner.run(adapter, inputs)
+        elapsed = time.perf_counter() - t0
+        self.elapsed_times.append(elapsed)
         actions = outputs[self.action_key]
 
         batch_actions = np.transpose(actions, (1, 0, 2))
