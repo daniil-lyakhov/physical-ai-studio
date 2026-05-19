@@ -5,7 +5,7 @@
 
 import inspect
 import tempfile
-from collections.abc import Generator
+from collections.abc import Generator, Callable
 from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
@@ -519,7 +519,9 @@ class ExportablePolicyMixin:
                 - ``"openvino"``: OpenVINO delegation — requires ``nncf`` for export and a
                   custom-built ExecuTorch runtime with OpenVINO backend for inference.
             delegate_config: Optional delegate-specific configuration. For ``"openvino"``,
-                supports ``{"device": "CPU"}`` (or other supported target device).
+                supports ``{"device": "CPU"}`` (or other supported target device) and
+                ``{"compress_weights": "int8_sym"}`` to apply INT8 symmetric weight
+                compression (requires ``nncf``) before lowering.
             **export_kwargs: Additional keyword arguments passed to ``torch.export.export``.
 
         Returns:
@@ -614,6 +616,11 @@ class ExportablePolicyMixin:
             msg = f"ExecuTorch delegate dependencies are required for delegate={delegate!r}."
             raise ImportError(msg) from e
 
+        if delegate == "openvino" and (delegate_config or {}).get("compress_weights") == "int8_sym":
+            from .hooks import compress_weights_executorch_openvino_int8_sym  # noqa: PLC0415
+
+            aten_dialect = compress_weights_executorch_openvino_int8_sym(aten_dialect, (input_sample,))
+
         if partitioner is not None:
             edge_program = to_edge_transform_and_lower(aten_dialect, partitioner=[partitioner])
         else:
@@ -644,6 +651,7 @@ class ExportablePolicyMixin:
         output_path: PathLike | str,
         backend: ExportBackend | str,
         input_sample: dict[str, torch.Tensor] | None = None,
+        post_export_hooks: list[Callable[[str], None]] | None = None,
         **export_kwargs: dict,
     ) -> None:
         """Export the model to the specified backend format.
@@ -660,6 +668,9 @@ class ExportablePolicyMixin:
                 input tensor dictionary for model tracing.
                 If None, attempts to use the policy's `sample_input` property.
                 Defaults to None.
+            post_export_hooks: Optional list of callables to run after export completes.
+                Each hook receives the exported model file path (str) and can perform
+                post-processing such as quantization or compression.
             **export_kwargs (dict): Additional keyword arguments to pass to the
                 backend-specific export method.
 
@@ -679,6 +690,11 @@ class ExportablePolicyMixin:
         else:
             msg = f"Unsupported export backend: {backend}"
             raise ValueError(msg)
+
+        if post_export_hooks:
+            model_path = self._prepare_export_path(output_path, backend.extension)
+            for hook in post_export_hooks:
+                hook(str(model_path))
 
     def _onnx_core_export_step(
         self,
