@@ -5,7 +5,7 @@
 
 import inspect
 import tempfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
