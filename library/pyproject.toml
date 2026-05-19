@@ -106,11 +106,14 @@ smolvla = [
     "safetensors>=0.4.3,<1.0.0",
 ]
 
+# Neural Network Compression Framework (optional, for post-export quantization hooks)
+nncf = ["nncf>=2.7.0"]
+
 # ExecuTorch runtime for edge/mobile deployment
 executorch = ["executorch>=1.1.0"]
 
 # ExecuTorch with OpenVINO delegate (requires nncf for export)
-executorch-openvino = ["executorch>=1.1.0", "nncf>=3.0.0"]
+executorch-openvino = ["executorch>=1.1.0", "physicalai-train[nncf]"]
 
 # All optional dependencies
 all = [
