@@ -9,6 +9,12 @@ from .config import XR0Config
 from .model import XR0FlowModel
 from .policy import XR0
 from .preprocessor import XR0Postprocessor, XR0Preprocessor, make_xr0_preprocessors
+from .pretrained_utils import (
+    extract_xr0_dataset_stats,
+    load_xr0_pretrained_weights,
+    remap_xr0_state_dict,
+    resolve_pretrained_path,
+)
 from .vla import XR0Model
 from .vlm import XR0Qwen3VL
 
@@ -20,5 +26,9 @@ __all__ = [
     "XR0Postprocessor",
     "XR0Preprocessor",
     "XR0Qwen3VL",
+    "extract_xr0_dataset_stats",
+    "load_xr0_pretrained_weights",
     "make_xr0_preprocessors",
+    "remap_xr0_state_dict",
+    "resolve_pretrained_path",
 ]

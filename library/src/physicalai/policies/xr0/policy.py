@@ -21,6 +21,7 @@ helpers, and action normalization) lives in
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -32,6 +33,7 @@ from physicalai.train.utils import reformat_dataset_to_match_policy
 
 from .config import XR0Config
 from .preprocessor import make_xr0_preprocessors
+from .pretrained_utils import extract_xr0_dataset_stats, load_xr0_pretrained_weights, resolve_pretrained_path
 from .vla import XR0Model
 
 if TYPE_CHECKING:
@@ -50,6 +52,10 @@ class XR0(Policy):
     Lightning wrapper for training and inference with :class:`XR0Model`.
 
     Args:
+        pretrained_name_or_path: Optional local path or HuggingFace repo id of a
+            pretrained XR0 checkpoint (e.g.
+            ``"XiaomiRobotics/Xiaomi-Robotics-0-LIBERO"``). When given, the
+            weights are loaded into the model once it is built.
         vlm_model_id: HuggingFace id of the Qwen3-VL backbone.
         vlm_attn_implementation: Attention backend for the VLM.
         dtype: Model precision (``"bfloat16"`` or ``"float32"``).
@@ -95,10 +101,16 @@ class XR0(Policy):
         >>> policy = XR0(optimizer_lr=2.5e-5)
         >>> trainer = physicalai.train.Trainer(max_epochs=100)
         >>> trainer.fit(policy, datamodule)
+
+        Fine-tuning from the pretrained LIBERO checkpoint:
+
+        >>> policy = XR0(pretrained_name_or_path="XiaomiRobotics/Xiaomi-Robotics-0-LIBERO")
+        >>> trainer.fit(policy, datamodule)
     """
 
     def __init__(  # noqa: PLR0913
         self,
+        pretrained_name_or_path: str | Path | None = None,
         vlm_model_id: str = "Qwen/Qwen3-VL-4B-Instruct",
         vlm_attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "flash_attention_2",
         dtype: Literal["bfloat16", "float32"] = "bfloat16",
@@ -180,13 +192,26 @@ class XR0(Policy):
             scheduler_decay_lr=scheduler_decay_lr,
         )
 
-        self.save_hyperparameters(ignore=["config", "compile_model"])
+        self.save_hyperparameters(ignore=["config", "compile_model", "pretrained_name_or_path"])
         self._set_hparam_keys()
 
         self.model: XR0Model | None = None
         self._preprocessor: XR0Preprocessor | None = None
         self._postprocessor: XR0Postprocessor | None = None
         self._dataset_stats = dataset_stats
+
+        # Resolve (download) the pretrained checkpoint now; load it into the
+        # model once it is built (eager path here, or lazily in ``setup``).
+        self._pretrained_path: Path | None = (
+            resolve_pretrained_path(pretrained_name_or_path) if pretrained_name_or_path is not None else None
+        )
+
+        # When a pretrained checkpoint is given without explicit dataset stats,
+        # recover the action-normalization stats from the checkpoint so the
+        # policy is usable for standalone inference (no training dataset).
+        if dataset_stats is None and pretrained_name_or_path is not None:
+            dataset_stats = extract_xr0_dataset_stats(pretrained_name_or_path)
+            self._dataset_stats = dataset_stats
 
         if dataset_stats is not None:
             self._initialize_model(dataset_stats)
@@ -221,6 +246,9 @@ class XR0(Policy):
             dtype=_DTYPES[cfg.dtype],
         )
 
+        if self._pretrained_path is not None:
+            self._load_pretrained_weights(self._pretrained_path)
+
         self._preprocessor, self._postprocessor = make_xr0_preprocessors(
             camera_views=cfg.camera_views,
             max_state_dim=cfg.max_state_dim,
@@ -229,6 +257,31 @@ class XR0(Policy):
             processor_name=cfg.vlm_model_id,
         )
         self._dataset_stats = dataset_stats
+
+    def _load_pretrained_weights(self, pretrained_path: Path) -> None:
+        """Load remapped pretrained weights into ``self.model`` (non-strict).
+
+        Raises:
+            ValueError: If the model has not been built yet.
+        """
+        if self.model is None:
+            msg = "Cannot load pretrained weights before the model is initialized"
+            raise ValueError(msg)
+
+        state_dict = load_xr0_pretrained_weights(pretrained_path)
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False, assign=True)
+        self.model.to(_DTYPES[self.config.dtype])
+
+        if missing:
+            msg = f"Missing keys when loading pretrained XR0 weights: {len(missing)} keys"
+            logger.warning(msg)
+            for key in missing[:10]:
+                logger.warning("  - %s", key)
+        if unexpected:
+            msg = f"Unexpected keys when loading pretrained XR0 weights: {len(unexpected)} keys"
+            logger.warning(msg)
+            for key in unexpected[:10]:
+                logger.warning("  - %s", key)
 
     def setup(self, stage: str) -> None:
         """Build the model from the datamodule statistics (lazy path).
