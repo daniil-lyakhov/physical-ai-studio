@@ -299,12 +299,12 @@ class XR0Model(Model):
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """VLM encode -> MRoPE continuation -> rectified-flow train / inference."""
         prefix_length = batch.pop("prefix_length", 0)
-        action, action_mask, state = self.get_action_input(batch)
 
         # VLM forward with KV-cache; the shim also surfaces the 3D position ids.
         vlm_outputs = self.vlm(**batch, use_cache=True)
         past_key_values = [(layer.keys, layer.values) for layer in vlm_outputs.past_key_values.layers]
 
+        action, action_mask, state = self.get_action_input(batch)
         action_bs, action_length, _ = action.shape
         _, state_length, _ = state.shape
         q_len = action_length + state_length + 1  # +1 sink token

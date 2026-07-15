@@ -5,10 +5,6 @@
 
 This module provides the dataclass configuration for the XR0 flow-matching
 vision-language-action model (Qwen3-VL-4B backbone + DiT action expert).
-
-Example (API):
-    >>> from physicalai.policies.xr0 import XR0Config
-    >>> config = XR0Config()
 """
 
 from __future__ import annotations

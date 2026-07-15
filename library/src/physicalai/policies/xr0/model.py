@@ -5,8 +5,7 @@
 
 """Rectified-flow action model for the XR0 Vision-Language-Action policy.
 
-Vendored from the source repository ``xr0/mibot/models/VLA/XR0.py`` (Xiaomi
-``Xiaomi-Robotics-0``). This module owns the DiT action expert (the DiT decoder
+This module owns the DiT action expert (the DiT decoder
 stack plus its projectors, timestep embedder, and sink token) and the
 rectified-flow orchestration that drives it:
 
@@ -19,9 +18,7 @@ rectified-flow orchestration that drives it:
 It is deliberately **VLM-independent**: the Qwen3-VL backbone outputs
 (``state_embed``, ``past_key_values``, ``position_embeds``, ``attn_mask``) are
 passed in as arguments rather than computed here, so this unit can be proven in
-isolation. It mirrors the ``build_headless_xr0`` object used to generate the
-golden fixtures, and its flow math / ``dit_forward`` are proven numerically
-bit-exact against goldens ``G20``, ``G21``, ``G30``, and ``G31``.
+isolation.
 
 The full policy model (with the Qwen3-VL backbone, loss computation, and the
 framework ``Model`` interface) is assembled on top of this core.
