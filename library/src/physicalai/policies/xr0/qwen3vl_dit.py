@@ -5,19 +5,10 @@
 
 """DiT action head for the XR0 Vision-Language-Action model.
 
-Vendored from the source repository ``xr0/mibot/models/VLA/XR0.py`` (Xiaomi
-``Xiaomi-Robotics-0``). This module contains only the *self-contained* DiT head
+This module contains only the *self-contained* DiT head
 -- the tensor helpers (``modulate``, ``repeat_kv``, ``apply_rotary_pos_emb``),
 the projectors/embedders (``MLPProjector``, ``TimestepEmbedder``), and the DiT
 decoder stack (``DiTAttention``, ``DiTMLP``, ``DecoderLayer``, ``DiT``).
-
-The Qwen3-VL backbone is stock HuggingFace ``transformers`` and is loaded
-separately (not vendored). The rectified-flow orchestration that wires this head
-to the VLM KV-cache lives in the model assembly. These units are proven
-numerically bit-exact against the golden fixtures ``G10``-``G15``.
-
-The ``mibot`` registry / ``auto_cast`` decorators from the source are dropped --
-they are not part of the DiT head and carry heavyweight framework dependencies.
 """
 
 from __future__ import annotations
