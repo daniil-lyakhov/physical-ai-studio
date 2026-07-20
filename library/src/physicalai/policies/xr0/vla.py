@@ -5,13 +5,6 @@
 
 """Assembled XR0 Vision-Language-Action model on the framework ``Model`` base.
 
-This wires the two golden-proven cores into a single policy model:
-
-* :class:`~physicalai.policies.xr0.vlm.XR0Qwen3VL` -- the Qwen3-VL backbone shim
-  that surfaces the 3D MRoPE ``position_ids`` on its output.
-* :class:`~physicalai.policies.xr0.model.XR0FlowModel` -- the DiT action expert
-  and rectified-flow orchestration (timestep sampling, interpolation, Euler
-  integration, ``dit_forward``).
 
 ``XR0Model`` owns the glue between them (faithfully ported from the source
 ``xr0/mibot/models/VLA/XR0.py`` ``XR0.forward``): it continues the VLM's MRoPE
@@ -383,18 +376,6 @@ class XR0Model(Model):
 
         position_embeds = self.rotary_emb(action, position_ids)
         noise = self._sample_noise(action, seed)
-
-        # [DEBUG] dump the initial noise for cross-implementation comparison
-        #torch.save(
-        #    {
-        #        "seed": int(seed.flatten()[0].item()) if isinstance(seed, torch.Tensor) else (int(seed) if seed is not None else None),
-        #        "noise": noise.detach().cpu(),
-        #        "shape": tuple(noise.shape),
-        #        "dtype": str(noise.dtype),
-        #        "device": str(action.device),
-        #    },
-        #    "/home/dlyakhov/Projects/Xiaomi-Robotics-0/noise_physical_ai.pt",
-        #)
 
         if self.training:
             pred, target, action_mask, weight = self._training_step(
