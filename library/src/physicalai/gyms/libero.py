@@ -369,8 +369,12 @@ class LiberoGym(Gym):
         if self.init_states and self._init_states is not None:
             raw_obs = self.env.set_init_state(self._init_states[self._init_state_id])
 
-        # After reset, objects may be unstable (slightly floating, intersecting, etc.).
-        # Step the simulator with a no-op action for a few frames so everything settles.
+        if self.init_states and self._init_states is not None:
+            raw_obs = self.env.set_init_state(self._init_states[self._init_state_id])
+
+        # After setting the init state, objects may still need a few steps to settle.
+        # Step the simulator with a no-op action for a few frames so everything stabilizes.
+        # Xiaomi/LIBERO protocol waits exactly num_steps_wait (default 10) steps.
         dummy_action = self._get_dummy_action()
         for _ in range(self.num_steps_wait):
             raw_obs, _, _, _ = self.env.step(dummy_action)
