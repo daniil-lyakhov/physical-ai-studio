@@ -192,28 +192,34 @@ class XR0Model(Model):
     # ------------------------------------------------------------------ #
 
     def _local_causal_mask(
-        self, state_length: int, action_length: int, device: torch.device | None = None
+        self, state_length: int, action_length: int, device: torch.device | None = None, *, local: bool = True
     ) -> torch.Tensor:
-        """Build the 2D local causal mask over ``[sink, state, action]`` tokens."""
+        """Build the 2D local causal mask over ``[sink, state, action]`` tokens.
+
+        When ``local`` is False the action-action block is a plain (full) causal
+        ``tril`` -- the deployed inference checkpoint (modeling_mibot.py) does not
+        apply the banded ``local_window``; only training (XR0.py) does.
+        """
         s_len = state_length + 1
         a_len = action_length
         mask_ss = torch.tril(torch.ones(s_len, s_len, device=device))
         mask_sa = torch.zeros(s_len, a_len, device=device)
         mask_as = torch.ones(a_len, s_len, device=device)
         mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
-        mask_aa = mask_aa * torch.triu(torch.ones(a_len, a_len, device=device), diagonal=-self.local_window)
+        if local:
+            mask_aa = mask_aa * torch.triu(torch.ones(a_len, a_len, device=device), diagonal=-self.local_window)
         top = torch.cat([mask_ss, mask_sa], dim=1)
         bottom = torch.cat([mask_as, mask_aa], dim=1)
         return torch.cat([top, bottom], dim=0)
 
     def _make_local_causal_mask(
-        self, batch_size: int, state_length: int, action_length: int, device: torch.device
+        self, batch_size: int, state_length: int, action_length: int, device: torch.device, *, local: bool = True
     ) -> torch.Tensor:
         """Batched local causal mask, reusing the cached buffer for default shapes."""
-        if state_length == self.state_shape[-2] and action_length == self.action_shape[-2]:
+        if local and state_length == self.state_shape[-2] and action_length == self.action_shape[-2]:
             return self.saved_causal_mask.expand(batch_size, -1, -1)
-        mask = self._local_causal_mask(state_length, action_length, device)
-        return mask.unsqueeze(0).expand(batch_size, -1, -1)
+        mask = self._local_causal_mask(state_length, action_length, device, local=local)
+        return mask.unsqueeze(0).int().expand(batch_size, -1, -1)
 
     def _random_mask_prefix(
         self, causal_mask: torch.Tensor, prefix_length: int, state_length: int
@@ -290,6 +296,30 @@ class XR0Model(Model):
             state = torch.zeros((1, *self.state_shape), device=device, dtype=self._dtype)
         return action, action_mask, state
 
+    def _sample_noise(self, action: torch.Tensor, seed: Any) -> torch.Tensor:
+        """Draw the rectified-flow starting noise.
+
+        When ``seed`` is provided (inference only), the draw is made
+        deterministic per observation by seeding the RNG and restoring the
+        previous global state afterwards -- byte-compatible with the source
+        model's ``torch.manual_seed(seed)`` around a single ``randn_like``.
+
+        Returns:
+            Gaussian noise tensor shaped like ``action``.
+        """
+        if seed is None or self.training:
+            return torch.randn_like(action)
+
+        seed_val = int(seed.flatten()[0].item()) if isinstance(seed, torch.Tensor) else int(seed)
+        cpu_rng_state = torch.get_rng_state()
+        gpu_rng_state = torch.cuda.get_rng_state(action.device) if action.is_cuda else None
+        torch.manual_seed(seed_val)
+        noise = torch.randn_like(action)
+        torch.set_rng_state(cpu_rng_state)
+        if gpu_rng_state is not None:
+            torch.cuda.set_rng_state(gpu_rng_state, action.device)
+        return noise
+
     # ------------------------------------------------------------------ #
     # Core orchestration                                                 #
     # ------------------------------------------------------------------ #
@@ -299,6 +329,7 @@ class XR0Model(Model):
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """VLM encode -> MRoPE continuation -> rectified-flow train / inference."""
         prefix_length = batch.pop("prefix_length", 0)
+        seed = batch.pop("seed", None)
 
         # VLM forward with KV-cache; the shim also surfaces the 3D position ids.
         vlm_outputs = self.vlm(**batch, use_cache=True)
@@ -322,12 +353,19 @@ class XR0Model(Model):
             + vlm_outputs.position_ids.max(dim=-1)[0][..., None]
             + 1
         )
-        if action_length > prefix_length:
+        # The published inference checkpoint (modeling_mibot.py) does NOT offset the
+        # action tokens; only the training path (XR0.py) applies +10 to open a gap
+        # between prefix and noisy tokens. Gate the offset to training for parity.
+        if self.training and action_length > prefix_length:
             position_ids[:, :, -(action_length - prefix_length) :] += _ACTION_POSITION_OFFSET
 
         # Joint attention mask: [VLM-cache | local-causal DiT block].
         cache_mask = batch["attention_mask"][:, None, :].expand(-1, q_len, -1)
-        causal_mask = self._make_local_causal_mask(action_bs, state_length, action_length, action.device)
+        # Deployed inference uses a full causal DiT mask; the banded local window
+        # (local_window) is a training-only attention scheme (see XR0.py).
+        causal_mask = self._make_local_causal_mask(
+            action_bs, state_length, action_length, action.device, local=self.training
+        )
         if self.training and prefix_length > _PREFIX_KEEP_LAST_K:
             causal_mask = self._random_mask_prefix(causal_mask, prefix_length, state_length)
         attn_mask = torch.cat([cache_mask, causal_mask], dim=-1)[:, None].bool()
@@ -344,7 +382,19 @@ class XR0Model(Model):
             past_key_values = self._repeat_past_key_values(past_key_values)
 
         position_embeds = self.rotary_emb(action, position_ids)
-        noise = torch.randn_like(action)
+        noise = self._sample_noise(action, seed)
+
+        # [DEBUG] dump the initial noise for cross-implementation comparison
+        #torch.save(
+        #    {
+        #        "seed": int(seed.flatten()[0].item()) if isinstance(seed, torch.Tensor) else (int(seed) if seed is not None else None),
+        #        "noise": noise.detach().cpu(),
+        #        "shape": tuple(noise.shape),
+        #        "dtype": str(noise.dtype),
+        #        "device": str(action.device),
+        #    },
+        #    "/home/dlyakhov/Projects/Xiaomi-Robotics-0/noise_physical_ai.pt",
+        #)
 
         if self.training:
             pred, target, action_mask, weight = self._training_step(

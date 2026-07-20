@@ -200,6 +200,25 @@ class XR0FlowModel(nn.Module):
             Predicted velocity (training) or action (inference) of shape
             ``(B, action_len, action_dim)``.
         """
+        # [DEBUG] dump dit_forward inputs on the first Euler step (t == 0) for cross-impl comparison
+        #if bool(torch.as_tensor(t).eq(0).all()):
+        #    _pkv = [
+        #        (past_key_values[i][0].detach().cpu(), past_key_values[i][1].detach().cpu())
+        #        for i in range(len(past_key_values))
+        #    ]
+        #    torch.save(
+        #        {
+        #            "noisy_action": noisy_action.detach().cpu(),
+        #            "t": t.detach().cpu(),
+        #            "action_mask": action_mask.detach().cpu(),
+        #            "state_embed": state_embed.detach().cpu(),
+        #            "position_embeds": (position_embeds[0].detach().cpu(), position_embeds[1].detach().cpu()),
+        #            "attn_mask": attn_mask.detach().cpu(),
+        #            "past_key_values": _pkv,
+        #        },
+        #        "/home/dlyakhov/Projects/Xiaomi-Robotics-0/dit_inputs_physical_ai.pt",
+        #    )
+
         # Timestep conditioning: embed t -> 6 modulation parameters per layer.
         t_embeds = self.t_embedder(t[:, 0, 0] * 1000)
         t_embeds = self.t_projector(t_embeds).view(t_embeds.shape[0], 6, -1)
