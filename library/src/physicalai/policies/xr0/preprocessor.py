@@ -45,15 +45,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MULTI_VIEW_HEADER = "The following observations are captured from multiple views.\n"
-_TASK_TEMPLATE = "Generate robot actions for the task:\n{instruction}"
-_ASSISTANT_PRIMER = "<bot></bot>"
+_TASK_TEMPLATE = "Generate robot actions for the task:\n{instruction} /no_cot"
+_ASSISTANT_PRIMER = "<cot></cot>"
 _TEMPORAL_STATE_NDIM = 3
 _TEMPORAL_IMAGE_NDIM = 5
 
+# View titles the model was trained with (Xiaomi reference server prompt in
+# deploy/server.py), e.g. "wrist_left" -> "Left-Wrist" so the prompt reads
+# "# Left-Wrist View". A plain capitalize would wrongly yield "Wrist Left".
+_VIEW_TITLES = {
+    "base": "Base",
+    "wrist_left": "Left-Wrist",
+    "wrist_right": "Right-Wrist",
+}
+
 
 def _view_title(view: str) -> str:
-    """Human-readable view title, e.g. ``"wrist_left"`` -> ``"Wrist Left"``."""
-    return " ".join(word.capitalize() for word in view.replace("-", "_").split("_"))
+    """Human-readable view title matching the reference prompt.
+
+    Known views use the reference eval's exact titles (e.g. ``"wrist_left"`` ->
+    ``"Left-Wrist"``); unknown views fall back to a capitalized join.
+    """
+    key = view.replace("-", "_")
+    if key in _VIEW_TITLES:
+        return _VIEW_TITLES[key]
+    return " ".join(word.capitalize() for word in key.split("_"))
 
 
 def _to_pil(image: torch.Tensor) -> Image.Image:
