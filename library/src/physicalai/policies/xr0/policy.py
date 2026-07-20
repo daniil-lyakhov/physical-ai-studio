@@ -3,19 +3,8 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""XR0 Policy - Lightning wrapper for training and inference.
-
-Wraps :class:`~physicalai.policies.xr0.vla.XR0Model` (Qwen3-VL-4B backbone + DiT
-action expert) in the framework ``Policy`` contract, following the same
-dual-path initialization as Pi0.5:
-
-* **Lazy path**: ``XR0()`` + ``trainer.fit()`` -- the model and preprocessors are
-  built in ``setup()`` from the training dataset statistics.
-* **Eager path**: ``XR0(dataset_stats=...)`` -- built immediately.
-
-Input/output adaptation (the Qwen3-VL multi-view prompt, ``io`` state/action
-helpers, and action normalization) lives in
-:mod:`~physicalai.policies.xr0.preprocessor`, mirroring the source repository.
+"""
+XR0 Policy - Lightning wrapper for training and inference.
 """
 
 from __future__ import annotations

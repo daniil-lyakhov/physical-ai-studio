@@ -5,14 +5,11 @@
 
 """Preprocessor / postprocessor for the XR0 model.
 
-This mirrors the input/output pipeline of the source repository
-(``Xiaomi-Robotics-0``) rather than the PaliGemma path used by Pi0.5:
-
 * **Prompt & vision** -- a Qwen3-VL multi-view chat prompt is assembled (one
   ``<|vision_start|><|image_pad|><|vision_end|>`` block per configured camera
   view) and tokenized with the stock ``Qwen3VLProcessor`` (via
-  ``AutoProcessor``), exactly like ``mibot/server/runtime/client.py``. Images
-  are resized with :func:`~physicalai.policies.xr0.io.resize_image` and passed
+  ``AutoProcessor``) Images are resized with 
+  :func:`~physicalai.policies.xr0.io.resize_image` and passed
   to the processor with ``do_resize=False``.
 * **State** -- padded into the 32-dim bimanual layout and shaped ``(B, 1, D)``,
   matching the source ``state.view(1, 1, -1)``.
@@ -255,8 +252,7 @@ class XR0Preprocessor(torch.nn.Module):
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
-            padding=True,
-            images_kwargs={"do_resize": False},
+            processor_kwargs={"padding": True, "images_kwargs": {"do_resize": False}},
         )
 
         out: dict[str, torch.Tensor] = {

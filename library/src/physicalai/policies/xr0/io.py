@@ -5,12 +5,9 @@
 
 """Pure numpy/PIL adapters for the XR0 bimanual state/action space.
 
-Vendored verbatim from the source repository ``xr0/mibot/utils/io.py`` (Xiaomi
-``Xiaomi-Robotics-0``). These are the parity-critical, dependency-free helpers that
+These are the dependency-free helpers that
 compose/split the 32-dim bimanual state and action layout, convert delta actions to
 absolute targets, normalize/denormalize actions, do axis-angle <-> rotation-matrix
-math, and resize images for the VLM. They carry no ``mibot`` dependencies and are
-proven numerically bit-exact against the golden fixtures ``G00``-``G08``.
 """
 
 from __future__ import annotations
