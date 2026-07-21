@@ -60,17 +60,28 @@ class XR0FlowModel(nn.Module):
         self.beta = Beta(1.5, 1.0)
 
         # DiT policy head.
-        self.dit = DiT(hidden_size=dit_hidden_size, kv_heads=dit_kv_heads, layer_num=dit_num_layers, head_dim=dit_head_dim)
+        self.dit = DiT(
+            hidden_size=dit_hidden_size,
+            kv_heads=dit_kv_heads,
+            layer_num=dit_num_layers,
+            head_dim=dit_head_dim,
+        )
 
         # State / action projectors.
         self.state_projector = MLPProjector(
-            input_dim=state_shape[-1], output_dim=dit_hidden_size, num_layers=2
+            input_dim=state_shape[-1],
+            output_dim=dit_hidden_size,
+            num_layers=2,
         )
         self.action_projector = MLPProjector(
-            input_dim=action_shape[-1], output_dim=dit_hidden_size, num_layers=2
+            input_dim=action_shape[-1],
+            output_dim=dit_hidden_size,
+            num_layers=2,
         )
         self.action_output_layer = MLPProjector(
-            input_dim=dit_hidden_size, output_dim=action_shape[-1], num_layers=2
+            input_dim=dit_hidden_size,
+            output_dim=action_shape[-1],
+            num_layers=2,
         )
 
         # Timestep embedding for the diffusion t.
@@ -88,7 +99,10 @@ class XR0FlowModel(nn.Module):
 
     @torch.no_grad()
     def _sample_timestep(
-        self, batch_size: int, dtype: torch.dtype = torch.bfloat16, device: str = "cpu"
+        self,
+        batch_size: int,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str = "cpu",
     ) -> torch.Tensor:
         """Sample random timesteps for rectified flow training.
 

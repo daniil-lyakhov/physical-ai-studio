@@ -7,7 +7,7 @@ transformers 4.57.1) and the **framework** XR0 (`physicalai`, transformers
 The two implementations pin incompatible `transformers` versions, so each runs
 in its own repository `env` **as a subprocess**. Both consume an identical batch
 of synthetic samples, load the same LIBERO checkpoint, inject the same pinned
-per-sample rectified-flow noise, and emit the raw predicted action chunks *plus*
+per-sample rectified-flow noise, and emit the raw predicted action chunks _plus_
 the VLM key/value cache the DiT cross-attends to.
 
 Everything runs in **float32**. At this precision the two Qwen3-VL ports are
@@ -28,13 +28,13 @@ Two test suites live here:
 
 ## Files
 
-| File | Purpose |
-| --- | --- |
-| `build_inputs.py` | Builds one shared `inputs.pt` (deterministic synthetic VLM inputs + state + pinned noise; plus `action_target` / `timestep` for the training step) consumed unchanged by both runners. |
-| `runner.py` | Inference: runs a single implementation (`--impl source\|framework`) and saves `{action, vlm_keys, vlm_values}`. |
-| `test_source_parity.py` | Orchestrates both inference runners and asserts the parity thresholds. |
-| `training_runner.py` | Training: runs one forward+backward step for a single implementation and saves `{loss*, pred, target, grad_stats, flow_grads}`. |
-| `test_training_parity.py` | Orchestrates both training runners and asserts loss / velocity / gradient parity. |
+| File                      | Purpose                                                                                                                                                                                |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `build_inputs.py`         | Builds one shared `inputs.pt` (deterministic synthetic VLM inputs + state + pinned noise; plus `action_target` / `timestep` for the training step) consumed unchanged by both runners. |
+| `runner.py`               | Inference: runs a single implementation (`--impl source\|framework`) and saves `{action, vlm_keys, vlm_values}`.                                                                       |
+| `test_source_parity.py`   | Orchestrates both inference runners and asserts the parity thresholds.                                                                                                                 |
+| `training_runner.py`      | Training: runs one forward+backward step for a single implementation and saves `{loss*, pred, target, grad_stats, flow_grads}`.                                                        |
+| `test_training_parity.py` | Orchestrates both training runners and asserts loss / velocity / gradient parity.                                                                                                      |
 
 ## Running the pytest
 
@@ -58,12 +58,12 @@ XR0_PARITY=1 HF_HUB_OFFLINE=1 env/bin/python -m pytest \
 
 Useful environment variables:
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `XR0_PARITY` | (unset) | Must be `1` to enable the test. |
-| `XR0_PARITY_SAMPLES` | `8` | Number of synthetic samples. |
-| `XR0_FRAMEWORK_PYTHON` | `env/bin/python` | Framework interpreter (tf 5.3.0). |
-| `XR0_SOURCE_PYTHON` | `../Xiaomi-Robotics-0/xr0/env/bin/python` | Source interpreter (tf 4.57.1). |
+| Variable               | Default                                   | Meaning                           |
+| ---------------------- | ----------------------------------------- | --------------------------------- |
+| `XR0_PARITY`           | (unset)                                   | Must be `1` to enable the test.   |
+| `XR0_PARITY_SAMPLES`   | `8`                                       | Number of synthetic samples.      |
+| `XR0_FRAMEWORK_PYTHON` | `env/bin/python`                          | Framework interpreter (tf 5.3.0). |
+| `XR0_SOURCE_PYTHON`    | `../Xiaomi-Robotics-0/xr0/env/bin/python` | Source interpreter (tf 4.57.1).   |
 
 ## Running the runners manually
 
@@ -134,12 +134,12 @@ Notes:
 
 Expected float32 agreement (8 samples):
 
-| metric | typical value |
-| --- | --- |
-| action per-sample cosine | ~1.000000 |
-| action mean abs diff | ~2e-5 |
-| action max abs diff | ~8e-3 |
-| vlm_keys / vlm_values rel mean | ~0.01–0.02 % |
+| metric                         | typical value |
+| ------------------------------ | ------------- |
+| action per-sample cosine       | ~1.000000     |
+| action mean abs diff           | ~2e-5         |
+| action max abs diff            | ~8e-3         |
+| vlm_keys / vlm_values rel mean | ~0.01–0.02 %  |
 
 The residual VLM KV diff is dominated by large-magnitude "massive-activation"
 channels (worst element ~0.3 % relative) and by cross-version fp32 attention /
@@ -229,13 +229,13 @@ PY
 
 Expected float32 agreement (8 samples):
 
-| metric | typical value |
-| --- | --- |
-| loss / loss_mse rel diff | ~2e-6 |
-| predicted velocity rel mean | ~3e-5 |
-| predicted velocity max abs | ~1e-3 |
+| metric                                | typical value |
+| ------------------------------------- | ------------- |
+| loss / loss_mse rel diff              | ~2e-6         |
+| predicted velocity rel mean           | ~3e-5         |
+| predicted velocity max abs            | ~1e-3         |
 | gradient-norm rel diff (median / p99) | ~1e-4 / ~7e-4 |
-| flow-head grad rel mean (worst) | ~7e-4 |
+| flow-head grad rel mean (worst)       | ~7e-4         |
 
 The loss and predicted velocity match to float32 rounding; gradients are looser
 because each accumulates the forward residual through the whole backward graph

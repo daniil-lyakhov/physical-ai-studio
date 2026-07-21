@@ -13,7 +13,7 @@ absolute targets, normalize/denormalize actions, do axis-angle <-> rotation-matr
 from __future__ import annotations
 
 import math
-from typing import Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -45,7 +45,12 @@ def get_value(data, path):
     return data
 
 
-def resize_image(image: Image.Image, factor: int = 32, min_pixels: int = 32 * 32, max_pixels: int = 90000) -> Image.Image:
+def resize_image(
+    image: Image.Image,
+    factor: int = 32,
+    min_pixels: int = 32 * 32,
+    max_pixels: int = 90000,
+) -> Image.Image:
     """Resize a PIL image so both sides are multiples of ``factor`` and the area stays within
     ``[min_pixels, max_pixels]``, preserving aspect ratio for the VLM vision encoder.
     """
@@ -154,7 +159,9 @@ def build_action_mask(action_length: int, temporal_mask=None) -> np.ndarray:
     """Build the ``(action_length, ACTION_DIM)`` binary mask marking valid bimanual columns,
     broadcast over an optional per-timestep ``temporal_mask`` (all ones if omitted).
     """
-    temporal = np.ones(action_length, dtype=np.int32) if temporal_mask is None else np.asarray(temporal_mask, dtype=np.int32)
+    temporal = (
+        np.ones(action_length, dtype=np.int32) if temporal_mask is None else np.asarray(temporal_mask, dtype=np.int32)
+    )
     mask = np.zeros((action_length, ACTION_DIM), dtype=np.int32)
     for _, slc in ACTION_PARTS:
         mask[:, slc] = temporal[:, None]
@@ -177,7 +184,7 @@ def compose_action(
     """
     values = (left_ee_pos, left_ee_aa, left_gripper, left_joint, right_ee_pos, right_ee_aa, right_gripper, right_joint)
     action = np.zeros((action_length, ACTION_DIM), dtype=np.float32)
-    for (_, slc), value in zip(ACTION_PARTS, values):
+    for (_, slc), value in zip(ACTION_PARTS, values, strict=False):
         action[:, slc] = np.asarray(value, dtype=np.float32)
     return action
 
@@ -229,7 +236,10 @@ def recover_action(action, robot_state: Mapping[str, np.ndarray]) -> dict[str, n
         joint = np.asarray(robot_state[f"{side}_arm_joint"], dtype=np.float32).reshape(6)
 
         targets[f"{side}_ee_pos"] = (pos[None] + parts[f"{side}_ee_pos"] @ rotm.T).astype(np.float32)
-        targets[f"{side}_ee_rotm"] = np.stack([rotm @ aa2rotm(delta) for delta in parts[f"{side}_ee_aa"]], axis=0).astype(np.float32)
+        targets[f"{side}_ee_rotm"] = np.stack(
+            [rotm @ aa2rotm(delta) for delta in parts[f"{side}_ee_aa"]],
+            axis=0,
+        ).astype(np.float32)
         targets[f"{side}_gripper_pos"] = (gripper[None] + parts[f"{side}_gripper"]).astype(np.float32)
         targets[f"{side}_arm_joint"] = (joint[None] + parts[f"{side}_joint"]).astype(np.float32)
 

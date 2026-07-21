@@ -3,9 +3,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-XR0 Policy - Lightning wrapper for training and inference.
-"""
+"""XR0 Policy - Lightning wrapper for training and inference."""
 
 from __future__ import annotations
 
