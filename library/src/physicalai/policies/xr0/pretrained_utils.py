@@ -117,7 +117,6 @@ def remap_xr0_state_dict(state_dict: Mapping[str, torch.Tensor]) -> dict[str, to
     return remapped
 
 
-
 def _unwrap_container(obj: object) -> Mapping[str, torch.Tensor]:
     """Pull the tensor mapping out of a ``torch.load`` result.
 
@@ -360,4 +359,3 @@ def extract_xr0_dataset_stats(
             "std": std.tolist(),
         },
     }
-

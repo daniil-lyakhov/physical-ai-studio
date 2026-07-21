@@ -5,7 +5,6 @@
 
 """Assembled XR0 Vision-Language-Action model on the framework ``Model`` base.
 
-
 ``XR0Model`` owns the glue between them (faithfully ported from the source
 ``xr0/mibot/models/VLA/XR0.py`` ``XR0.forward``): it continues the VLM's MRoPE
 sequence into the DiT tokens, assembles the joint ``[VLM-cache | local-causal]``
@@ -98,7 +97,9 @@ class XR0Model(Model):
         # VLM backbone (surfaces the 3D MRoPE position_ids for the DiT).
         if vlm is None:
             vlm = XR0Qwen3VL.from_pretrained(
-                vlm_model_id, attn_implementation=vlm_attn_implementation, dtype=dtype
+                vlm_model_id,
+                attn_implementation=vlm_attn_implementation,
+                dtype=dtype,
             )
         self.vlm = vlm
 
@@ -185,7 +186,12 @@ class XR0Model(Model):
     # ------------------------------------------------------------------ #
 
     def _local_causal_mask(
-        self, state_length: int, action_length: int, device: torch.device | None = None, *, local: bool = True
+        self,
+        state_length: int,
+        action_length: int,
+        device: torch.device | None = None,
+        *,
+        local: bool = True,
     ) -> torch.Tensor:
         """Build the 2D local causal mask over ``[sink, state, action]`` tokens.
 
@@ -206,7 +212,13 @@ class XR0Model(Model):
         return torch.cat([top, bottom], dim=0)
 
     def _make_local_causal_mask(
-        self, batch_size: int, state_length: int, action_length: int, device: torch.device, *, local: bool = True
+        self,
+        batch_size: int,
+        state_length: int,
+        action_length: int,
+        device: torch.device,
+        *,
+        local: bool = True,
     ) -> torch.Tensor:
         """Batched local causal mask, reusing the cached buffer for default shapes."""
         if local and state_length == self.state_shape[-2] and action_length == self.action_shape[-2]:
@@ -215,7 +227,10 @@ class XR0Model(Model):
         return mask.unsqueeze(0).int().expand(batch_size, -1, -1)
 
     def _random_mask_prefix(
-        self, causal_mask: torch.Tensor, prefix_length: int, state_length: int
+        self,
+        causal_mask: torch.Tensor,
+        prefix_length: int,
+        state_length: int,
     ) -> torch.Tensor:
         """Randomly hide part of the action prefix from the suffix tokens."""
         if prefix_length <= _PREFIX_KEEP_LAST_K:
@@ -244,7 +259,8 @@ class XR0Model(Model):
         return x.repeat_interleave(self.training_repeat, dim=dim)
 
     def _repeat_past_key_values(
-        self, past_key_values: list[tuple[torch.Tensor, torch.Tensor]]
+        self,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Repeat every KV-cache entry to match the repeated batch."""
         if not self.training or self.training_repeat <= 1:
@@ -267,7 +283,8 @@ class XR0Model(Model):
         return max(0, min(prefix_length, action_length))
 
     def get_action_input(
-        self, batch: dict[str, Any]
+        self,
+        batch: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pop ``action`` / ``action_mask`` / ``state`` from the batch.
 
@@ -317,8 +334,11 @@ class XR0Model(Model):
     # Core orchestration                                                 #
     # ------------------------------------------------------------------ #
 
-    def _run(  # noqa: C901, PLR0912, PLR0914, PLR0915
-        self, batch: dict[str, Any], *, return_loss: bool
+    def _run(  # noqa: PLR0914
+        self,
+        batch: dict[str, Any],
+        *,
+        return_loss: bool,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """VLM encode -> MRoPE continuation -> rectified-flow train / inference."""
         prefix_length = batch.pop("prefix_length", 0)
@@ -357,7 +377,11 @@ class XR0Model(Model):
         # Deployed inference uses a full causal DiT mask; the banded local window
         # (local_window) is a training-only attention scheme (see XR0.py).
         causal_mask = self._make_local_causal_mask(
-            action_bs, state_length, action_length, action.device, local=self.training
+            action_bs,
+            state_length,
+            action_length,
+            action.device,
+            local=self.training,
         )
         if self.training and prefix_length > _PREFIX_KEEP_LAST_K:
             causal_mask = self._random_mask_prefix(causal_mask, prefix_length, state_length)
@@ -379,11 +403,26 @@ class XR0Model(Model):
 
         if self.training:
             pred, target, action_mask, weight = self._training_step(
-                action, noise, action_mask, state_embed, position_embeds, past_key_values, attn_mask, prefix, prefix_length
+                action,
+                noise,
+                action_mask,
+                state_embed,
+                position_embeds,
+                past_key_values,
+                attn_mask,
+                prefix,
+                prefix_length,
             )
         else:
             target = action
-            dit_kwargs = self._dit_kwargs(action_mask, state_embed, position_embeds, past_key_values, attn_mask, prefix_length)
+            dit_kwargs = self._dit_kwargs(
+                action_mask,
+                state_embed,
+                position_embeds,
+                past_key_values,
+                attn_mask,
+                prefix_length,
+            )
             pred = self.flow._flow_generate(torch.cat([prefix, noise[:, prefix_length:]], dim=1), dit_kwargs)  # noqa: SLF001
             weight = None
 
@@ -410,7 +449,7 @@ class XR0Model(Model):
             "prefix_length": prefix_length,
         }
 
-    def _training_step(  # noqa: PLR0913
+    def _training_step(
         self,
         action: torch.Tensor,
         noise: torch.Tensor,
@@ -428,16 +467,26 @@ class XR0Model(Model):
         noisy_action = self.flow._flow_interpolate(noise, action, t)  # noqa: SLF001
         target = self.flow._flow_velocity_target(noise, action)  # noqa: SLF001
 
-        dit_kwargs = self._dit_kwargs(action_mask, state_embed, position_embeds, past_key_values, attn_mask, prefix_length)
+        dit_kwargs = self._dit_kwargs(
+            action_mask,
+            state_embed,
+            position_embeds,
+            past_key_values,
+            attn_mask,
+            prefix_length,
+        )
         pred = self.flow.dit_forward(
-            torch.cat([prefix, noisy_action[:, prefix_length:]], dim=1), t, **dit_kwargs
+            torch.cat([prefix, noisy_action[:, prefix_length:]], dim=1),
+            t,
+            **dit_kwargs,
         )[:, prefix_length:]
         target = target[:, prefix_length:]
 
         if prefix_length > 0:
             with torch.no_grad():
                 pred_prefix = self.flow._flow_generate(  # noqa: SLF001
-                    torch.cat([prefix, noise[:, prefix_length:]], dim=1), dit_kwargs
+                    torch.cat([prefix, noise[:, prefix_length:]], dim=1),
+                    dit_kwargs,
                 )
             weight = (pred_prefix[:, prefix_length:] - action[:, prefix_length:]).abs()
         else:
