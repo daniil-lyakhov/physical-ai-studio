@@ -146,7 +146,7 @@ class TimestepEmbedder(nn.Module):
         """
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half,
         )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
@@ -326,7 +326,8 @@ class DecoderLayer(nn.Module):
             Modulated output of shape ``(B, S, D)``.
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.adaln_table[None] + t_embeds).chunk(
-            6, dim=1
+            6,
+            dim=1,
         )
 
         # Attention block with AdaLN
@@ -365,7 +366,7 @@ class DiT(nn.Module):
         super().__init__()
         self.layer_num = layer_num
         self.layers = nn.ModuleList(
-            [DecoderLayer(hidden_size=hidden_size, head_dim=head_dim, kv_heads=kv_heads) for _ in range(layer_num)]
+            [DecoderLayer(hidden_size=hidden_size, head_dim=head_dim, kv_heads=kv_heads) for _ in range(layer_num)],
         )
 
     def forward(
@@ -392,6 +393,10 @@ class DiT(nn.Module):
         start_idx = max(0, len(past_key_values) - self.layer_num)
         for i, layer in enumerate(self.layers):
             hidden_states = layer(
-                hidden_states, past_key_values[start_idx + i], position_embeds, t_embeds, attn_mask=attn_mask
+                hidden_states,
+                past_key_values[start_idx + i],
+                position_embeds,
+                t_embeds,
+                attn_mask=attn_mask,
             )
         return hidden_states

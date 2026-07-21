@@ -41,7 +41,7 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
     video token ids so the MRoPE index can still be built.
     """
 
-    def forward(  # noqa: PLR0913
+    def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: torch.Tensor | None = None,

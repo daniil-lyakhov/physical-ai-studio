@@ -8,7 +8,7 @@
 * **Prompt & vision** -- a Qwen3-VL multi-view chat prompt is assembled (one
   ``<|vision_start|><|image_pad|><|vision_end|>`` block per configured camera
   view) and tokenized with the stock ``Qwen3VLProcessor`` (via
-  ``AutoProcessor``) Images are resized with 
+  ``AutoProcessor``) Images are resized with
   :func:`~physicalai.policies.xr0.io.resize_image` and passed
   to the processor with ``do_resize=False``.
 * **State** -- padded into the 32-dim bimanual layout and shaped ``(B, 1, D)``,
@@ -167,7 +167,7 @@ class XR0Preprocessor(torch.nn.Module):
     def _build_message(self, instruction: str, images: list[Image.Image]) -> list[dict[str, Any]]:
         """Assemble the Qwen3-VL multi-view chat message for one sample."""
         content: list[dict[str, Any]] = [{"type": "text", "text": _MULTI_VIEW_HEADER}]
-        for view, image in zip(self.camera_views, images):
+        for view, image in zip(self.camera_views, images, strict=False):
             content.append({"type": "text", "text": f"# {_view_title(view)} View\n"})
             content.append({"type": "image", "image": image})
             content.append({"type": "text", "text": "\n"})
