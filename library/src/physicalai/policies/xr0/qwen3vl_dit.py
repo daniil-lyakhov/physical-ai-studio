@@ -16,10 +16,14 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm, rotate_half
+
+# A 4D rotary embedding carries a leading MRoPE section axis that is squeezed
+# out before it is applied to the query/key tensors.
+_ROTARY_4D_NDIM = 4
 
 # ============================================================
 # Helper functions
@@ -32,6 +36,9 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
     Returns ``x * (1 + scale) + shift``, following the DiT / AdaLN-Zero
     formulation that lets the network learn whether to skip or amplify
     each sub-layer.
+
+    Returns:
+        The modulated tensor ``x * (1 + scale) + shift``.
     """
     return x * (1 + scale) + shift
 
@@ -46,7 +53,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     Returns:
         Tensor with shape ``(batch, num_q_heads, seq_len, head_dim)``.
     """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    _batch, _num_key_value_heads, _slen, _head_dim = hidden_states.shape
     return hidden_states.repeat_interleave(n_rep, dim=1)
 
 
@@ -55,7 +62,7 @@ def apply_rotary_pos_emb(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    position_ids: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,  # noqa: ARG001
     unsqueeze_dim: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply rotary position embedding to query and key tensors.
@@ -96,19 +103,25 @@ class MLPProjector(nn.Module):
         bias: Whether to include bias in linear layers.
     """
 
-    def __init__(self, input_dim: int, output_dim: int, num_layers: int = 1, bias: bool = False):
+    def __init__(self, input_dim: int, output_dim: int, num_layers: int = 1, *, bias: bool = False) -> None:
+        """Initialize the MLP projector."""
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.bias = bias
         self.num_layers = num_layers
 
-        layers = [nn.Linear(input_dim, output_dim, bias=bias)]
+        layers: list[nn.Module] = [nn.Linear(input_dim, output_dim, bias=bias)]
         for _ in range(1, num_layers):
             layers.extend([nn.GELU(approximate="tanh"), nn.Linear(output_dim, output_dim, bias=bias)])
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project ``x`` through the MLP.
+
+        Returns:
+            The projected tensor.
+        """
         return self.layers(x)
 
 
@@ -123,7 +136,13 @@ class TimestepEmbedder(nn.Module):
         dtype: Data type for the frequency embedding computation.
     """
 
-    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256, dtype: torch.dtype = torch.bfloat16):
+    def __init__(
+        self,
+        hidden_size: int,
+        frequency_embedding_size: int = 256,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Initialize the timestep embedder."""
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=False),
@@ -187,7 +206,8 @@ class DiTAttention(nn.Module):
         dropout: Attention dropout probability (only active during training).
     """
 
-    def __init__(self, hidden_size: int = 768, head_dim: int = 64, kv_heads: int = 2, dropout: float = 0.0):
+    def __init__(self, hidden_size: int = 768, head_dim: int = 64, kv_heads: int = 2, dropout: float = 0.0) -> None:
+        """Initialize the DiT cross-attention layer."""
         super().__init__()
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -233,7 +253,7 @@ class DiTAttention(nn.Module):
 
         # Apply rotary position embedding
         cos, sin = position_embeds
-        if cos.ndim == 4:
+        if cos.ndim == _ROTARY_4D_NDIM:
             cos = cos[0]
             sin = sin[0]
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -264,7 +284,8 @@ class DiTMLP(nn.Module):
         hidden_size: Input and output dimension.  Intermediate size is ``4 * hidden_size``.
     """
 
-    def __init__(self, hidden_size: int = 768):
+    def __init__(self, hidden_size: int = 768) -> None:
+        """Initialize the SwiGLU MLP."""
         super().__init__()
         self.hidden_size = hidden_size
         self.intermediate_size = hidden_size * 4
@@ -274,7 +295,11 @@ class DiTMLP(nn.Module):
         self.act_fn = ACT2FN["silu"]
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        """SwiGLU forward: ``down(gelu(gate(x)) * up(x))``."""
+        """SwiGLU forward: ``down(gelu(gate(x)) * up(x))``.
+
+        Returns:
+            The SwiGLU MLP output.
+        """
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
 
@@ -290,7 +315,8 @@ class DecoderLayer(nn.Module):
         kv_heads: Number of KV heads for GQA.
     """
 
-    def __init__(self, hidden_size: int = 768, head_dim: int = 64, kv_heads: int = 2):
+    def __init__(self, hidden_size: int = 768, head_dim: int = 64, kv_heads: int = 2) -> None:
+        """Initialize the DiT decoder layer."""
         super().__init__()
         self.hidden_size = hidden_size
         self.attn = DiTAttention(hidden_size=hidden_size, head_dim=head_dim, kv_heads=kv_heads)
@@ -344,9 +370,7 @@ class DecoderLayer(nn.Module):
         hidden_states = modulate(hidden_states, shift_mlp, scale_mlp)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + gate_mlp * hidden_states
-        hidden_states = self.final_layernorm(hidden_states)
-
-        return hidden_states
+        return self.final_layernorm(hidden_states)
 
 
 class DiT(nn.Module):
@@ -362,7 +386,8 @@ class DiT(nn.Module):
         kv_heads: Number of KV heads for GQA.
     """
 
-    def __init__(self, hidden_size: int = 768, layer_num: int = 8, head_dim: int = 128, kv_heads: int = 2):
+    def __init__(self, hidden_size: int = 768, layer_num: int = 8, head_dim: int = 128, kv_heads: int = 2) -> None:
+        """Initialize the DiT decoder stack."""
         super().__init__()
         self.layer_num = layer_num
         self.layers = nn.ModuleList(

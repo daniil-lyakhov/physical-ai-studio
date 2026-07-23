@@ -47,6 +47,7 @@ class XR0FlowModel(nn.Module):
         flow_sampling: str = "beta",
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
+        """Build the DiT action expert, projectors, and flow-sampling distributions."""
         super().__init__()
         self.state_shape = state_shape
         self.action_shape = action_shape
@@ -102,7 +103,7 @@ class XR0FlowModel(nn.Module):
         self,
         batch_size: int,
         dtype: torch.dtype = torch.bfloat16,
-        device: str = "cpu",
+        device: str | torch.device = "cpu",
     ) -> torch.Tensor:
         """Sample random timesteps for rectified flow training.
 
@@ -128,8 +129,9 @@ class XR0FlowModel(nn.Module):
             u = torch.rand(size=(batch_size,), device=device)
         return u.to(dtype)
 
+    @staticmethod
     @torch.no_grad()
-    def _flow_interpolate(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def _flow_interpolate(x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Linear interpolation between noise and data: ``z_t = (1-t)*x0 + t*x1``.
 
         Args:
@@ -142,8 +144,9 @@ class XR0FlowModel(nn.Module):
         """
         return (1 - t) * x0 + t * x1
 
+    @staticmethod
     @torch.no_grad()
-    def _flow_velocity_target(self, x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+    def _flow_velocity_target(x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
         """Velocity target for rectified flow: ``v = x1 - x0``.
 
         Args:
@@ -171,7 +174,7 @@ class XR0FlowModel(nn.Module):
         for step in range(self.num_steps):
             t = torch.ones((z.shape[0], 1, 1), device=z.device, dtype=z.dtype) * step / self.num_steps
             v = self.dit_forward(z, t, **dit_kwargs)
-            z = z + v * dt
+            z += v * dt
         return z
 
     # --------------------------------------------------------
@@ -216,7 +219,7 @@ class XR0FlowModel(nn.Module):
         t_embeds = self.t_projector(t_embeds).view(t_embeds.shape[0], 6, -1)
 
         # Project noisy action to DiT hidden dim.
-        noisy_action = noisy_action * action_mask
+        noisy_action *= action_mask
         noisy_action = self.action_projector(noisy_action)
 
         # Concatenate: [sink, state, noisy_action].
