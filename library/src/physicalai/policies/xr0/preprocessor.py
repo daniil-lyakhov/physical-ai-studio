@@ -62,6 +62,9 @@ def _view_title(view: str) -> str:
 
     Known views use the reference eval's exact titles (e.g. ``"wrist_left"`` ->
     ``"Left-Wrist"``); unknown views fall back to a capitalized join.
+
+    Returns:
+        The human-readable view title.
     """
     key = view.replace("-", "_")
     if key in _VIEW_TITLES:
@@ -70,7 +73,11 @@ def _view_title(view: str) -> str:
 
 
 def _to_pil(image: torch.Tensor) -> Image.Image:
-    """Convert a single ``(C, H, W)`` or ``(H, W, C)`` image tensor to a PIL image."""
+    """Convert a single ``(C, H, W)`` or ``(H, W, C)`` image tensor to a PIL image.
+
+    Returns:
+        The image as a PIL ``Image``.
+    """
     array = image.detach().cpu()
     if array.ndim == _TEMPORAL_STATE_NDIM and array.shape[0] in {1, 3}:  # channels-first
         array = array.permute(1, 2, 0)
@@ -103,6 +110,9 @@ class XR0Preprocessor(torch.nn.Module):
         processor_name: HuggingFace id of the Qwen3-VL processor.
     """
 
+    action_mean: torch.Tensor
+    action_std: torch.Tensor
+
     def __init__(
         self,
         camera_views: Sequence[str] = ("base", "wrist_left"),
@@ -128,7 +138,11 @@ class XR0Preprocessor(torch.nn.Module):
         self.register_buffer("action_std", std, persistent=False)
 
     def _action_stats(self, features: dict[str, Feature] | None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build padded ``(max_action_dim,)`` mean/std buffers from action features."""
+        """Build padded ``(max_action_dim,)`` mean/std buffers from action features.
+
+        Returns:
+            A ``(mean, std)`` tuple of ``(max_action_dim,)`` buffers.
+        """
         mean = torch.zeros(self.max_action_dim)
         std = torch.ones(self.max_action_dim)
         if features is None:
@@ -165,12 +179,18 @@ class XR0Preprocessor(torch.nn.Module):
         return self._processor
 
     def _build_message(self, instruction: str, images: list[Image.Image]) -> list[dict[str, Any]]:
-        """Assemble the Qwen3-VL multi-view chat message for one sample."""
+        """Assemble the Qwen3-VL multi-view chat message for one sample.
+
+        Returns:
+            The Qwen3-VL chat message (user + assistant primer) for one sample.
+        """
         content: list[dict[str, Any]] = [{"type": "text", "text": _MULTI_VIEW_HEADER}]
         for view, image in zip(self.camera_views, images, strict=False):
-            content.append({"type": "text", "text": f"# {_view_title(view)} View\n"})
-            content.append({"type": "image", "image": image})
-            content.append({"type": "text", "text": "\n"})
+            content.extend((
+                {"type": "text", "text": f"# {_view_title(view)} View\n"},
+                {"type": "image", "image": image},
+                {"type": "text", "text": "\n"},
+            ))
         content.append({"type": "text", "text": _TASK_TEMPLATE.format(instruction=instruction)})
         return [
             {"role": "user", "content": content},
@@ -178,7 +198,14 @@ class XR0Preprocessor(torch.nn.Module):
         ]
 
     def _extract_view_images(self, batch: dict[str, Any]) -> list[list[Image.Image]]:
-        """Return, per sample, the list of resized PIL images for each camera view."""
+        """Return, per sample, the list of resized PIL images for each camera view.
+
+        Returns:
+            Per sample, the list of resized PIL images (one per camera view).
+
+        Raises:
+            ValueError: If the batch contains no image observation.
+        """
         image_keys = [key for key in Observation.get_flattened_keys(batch, IMAGES) if "is_pad" not in key]
         image_keys = sorted(image_keys)[: len(self.camera_views)]
         if not image_keys:
@@ -203,7 +230,11 @@ class XR0Preprocessor(torch.nn.Module):
         return images
 
     def _prepare_state(self, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
-        """Pad the state into ``(B, 1, max_state_dim)`` (source ``state.view(1, 1, -1)``)."""
+        """Pad the state into ``(B, 1, max_state_dim)`` (source ``state.view(1, 1, -1)``).
+
+        Returns:
+            The padded state tensor of shape ``(B, 1, max_state_dim)``.
+        """
         state = batch[STATE]
         if state.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> last frame
             state = state[:, -1, :]
@@ -212,7 +243,11 @@ class XR0Preprocessor(torch.nn.Module):
         return state.unsqueeze(1).to(device)
 
     def _prepare_action(self, action: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize (source convention) + pad the action, and build its validity mask."""
+        """Normalize (source convention) + pad the action, and build its validity mask.
+
+        Returns:
+            A ``(action, mask)`` tuple of padded action and its validity mask.
+        """
         action = action.to(torch.float32)
         real_dim = min(action.shape[-1], self.max_action_dim)
         action = F.pad(action, (0, max(0, self.max_action_dim - action.shape[-1])))[..., : self.max_action_dim]
@@ -283,6 +318,9 @@ class XR0Postprocessor(torch.nn.Module):
         features: Optional feature map used to recover the action mean/std and
             the original action dimension.
     """
+
+    action_mean: torch.Tensor
+    action_std: torch.Tensor
 
     def __init__(
         self,

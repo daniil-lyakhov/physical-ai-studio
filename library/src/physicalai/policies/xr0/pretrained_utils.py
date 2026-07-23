@@ -12,19 +12,13 @@ top-level ``XR0`` module, whose submodules are::
     vlm.*                 dit.*                 t_embedder.*
     state_projector.*     action_projector.*    t_projector.*
     action_output_layer.* sink.*                rotary_emb.*
-
-The framework :class:`~physicalai.policies.xr0.vla.XR0Model` keeps the same VLM
-backbone under ``vlm.*`` but nests the DiT action-expert submodules under a
-``flow.`` prefix (``flow.dit.*``, ``flow.state_projector.*``, ...). This module
-loads a checkpoint from any of the formats the source ships (a raw ``.pt`` /
-``.safetensors`` file, a DeepSpeed checkpoint directory, a sharded HF snapshot,
-or a HuggingFace repo id) and remaps the keys into the ``XR0Model`` namespace.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import pickle  # noqa: S403  # only referenced for pickle.UnpicklingError in except; never used to deserialize
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -140,6 +134,35 @@ def _unwrap_container(obj: object) -> Mapping[str, torch.Tensor]:
     raise TypeError(msg)
 
 
+def _torch_load_safe(path: Path) -> object:
+    """Load a ``.pt`` / ``.ckpt`` / ``.bin`` checkpoint without executing pickle.
+
+    Uses ``weights_only=True`` so only tensors and a safe allowlist of primitive
+    containers are unpickled -- arbitrary code embedded in a malicious checkpoint
+    is never executed. Legacy checkpoints that store non-tensor Python objects
+    cannot be loaded this way and must be converted to ``.safetensors`` first.
+
+    Args:
+        path: Local checkpoint file to load.
+
+    Returns:
+        The loaded object (typically a state dict or a wrapper dict).
+
+    Raises:
+        ValueError: If the checkpoint cannot be loaded safely because it relies
+            on arbitrary pickle contents; convert it to ``.safetensors`` instead.
+    """
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=True)
+    except (pickle.UnpicklingError, RuntimeError, AttributeError, ImportError, EOFError) as exc:
+        msg = (
+            f"Refusing to load {path} with unsafe pickle deserialization. The checkpoint stores "
+            "non-tensor Python objects and cannot be loaded with weights_only=True. Convert it "
+            "to .safetensors before loading."
+        )
+        raise ValueError(msg) from exc
+
+
 def _load_sharded_safetensors(index_file: Path) -> dict[str, torch.Tensor]:
     """Load a sharded ``*.safetensors`` checkpoint from its index json.
 
@@ -155,11 +178,11 @@ def _load_sharded_safetensors(index_file: Path) -> dict[str, torch.Tensor]:
     return state_dict
 
 
-def _load_raw_state_dict(path: Path) -> Mapping[str, torch.Tensor]:
-    """Load a raw (un-remapped) state dict from a file or checkpoint directory.
+def _load_state_dict_from_dir(path: Path) -> Mapping[str, torch.Tensor]:
+    """Load a raw state dict from a checkpoint *directory*.
 
-    Supports single ``.safetensors`` / ``.pt`` / ``.ckpt`` / ``.bin`` files, a
-    sharded HF snapshot directory, and a DeepSpeed checkpoint directory.
+    Probes the known checkpoint layouts (DeepSpeed, sharded/single safetensors,
+    sharded/single ``.bin``/``.pt``) in priority order.
 
     Returns:
         The raw source state dict.
@@ -167,15 +190,9 @@ def _load_raw_state_dict(path: Path) -> Mapping[str, torch.Tensor]:
     Raises:
         FileNotFoundError: If no recognized weights file is found.
     """
-    if path.is_file():
-        if path.suffix == ".safetensors":
-            return load_file(str(path))
-        return _unwrap_container(torch.load(str(path), map_location="cpu", weights_only=False))
-
-    # Directory: probe known checkpoint layouts in priority order.
     deepspeed = path / "last.ckpt" / "checkpoint" / "mp_rank_00_model_states.pt"
     if deepspeed.is_file():
-        return _unwrap_container(torch.load(str(deepspeed), map_location="cpu", weights_only=False))
+        return _unwrap_container(_torch_load_safe(deepspeed))
 
     safetensors_index = path / "model.safetensors.index.json"
     if safetensors_index.is_file():
@@ -191,16 +208,32 @@ def _load_raw_state_dict(path: Path) -> Mapping[str, torch.Tensor]:
             weight_map: dict[str, str] = json.load(f)["weight_map"]
         state_dict: dict[str, torch.Tensor] = {}
         for shard in sorted(set(weight_map.values())):
-            state_dict.update(_unwrap_container(torch.load(str(path / shard), map_location="cpu", weights_only=False)))
+            state_dict.update(_unwrap_container(_torch_load_safe(path / shard)))
         return state_dict
 
     for candidate in ("pytorch_model.bin", "pytorch_model.pt", "xr0_pretrained.pt"):
         file = path / candidate
         if file.is_file():
-            return _unwrap_container(torch.load(str(file), map_location="cpu", weights_only=False))
+            return _unwrap_container(_torch_load_safe(file))
 
     msg = f"No recognized XR0 weights file found under {path}"
     raise FileNotFoundError(msg)
+
+
+def _load_raw_state_dict(path: Path) -> Mapping[str, torch.Tensor]:
+    """Load a raw (un-remapped) state dict from a file or checkpoint directory.
+
+    Supports single ``.safetensors`` / ``.pt`` / ``.ckpt`` / ``.bin`` files, a
+    sharded HF snapshot directory, and a DeepSpeed checkpoint directory.
+
+    Returns:
+        The raw source state dict.
+    """
+    if path.is_file():
+        if path.suffix == ".safetensors":
+            return load_file(str(path))
+        return _unwrap_container(_torch_load_safe(path))
+    return _load_state_dict_from_dir(path)
 
 
 def resolve_pretrained_path(pretrained_name_or_path: str | Path, **kwargs: object) -> Path:
@@ -225,17 +258,24 @@ def resolve_pretrained_path(pretrained_name_or_path: str | Path, **kwargs: objec
     from huggingface_hub import snapshot_download  # noqa: PLC0415
 
     hub_kwargs = {k: v for k, v in kwargs.items() if k in _HUB_KWARGS}
+    if "revision" not in hub_kwargs:
+        logger.warning(
+            "Downloading '%s' without a pinned 'revision'; resolving to HEAD is not reproducible. "
+            "Pass revision=<commit-sha> for a pinned, reproducible download.",
+            pretrained_name_or_path,
+        )
+    # Only allow safe (non-pickle) formats to be downloaded. ``.bin`` / ``.pt``
+    # checkpoints are supported solely for pre-existing local paths, where the
+    # user already controls the file. See ``_load_raw_state_dict``.
     local = snapshot_download(
         repo_id=str(pretrained_name_or_path),
         allow_patterns=[
             "*.safetensors",
             "*.safetensors.index.json",
-            "*.bin",
-            "*.bin.index.json",
-            "*.pt",
             "config.json",
+            "preprocessor_config.json",
         ],
-        **hub_kwargs,  # type: ignore[arg-type]
+        **hub_kwargs,  # type: ignore[call-overload]
     )  # nosec B615
     return Path(local)
 
@@ -288,8 +328,14 @@ def _load_json_artifact(pretrained_name_or_path: str | Path, filename: str, **kw
     from huggingface_hub.utils import EntryNotFoundError, HFValidationError  # noqa: PLC0415
 
     hub_kwargs = {k: v for k, v in kwargs.items() if k in _HUB_KWARGS}
+    if "revision" not in hub_kwargs:
+        logger.warning(
+            "Downloading '%s' without a pinned 'revision'; resolving to HEAD is not reproducible. "
+            "Pass revision=<commit-sha> for a pinned, reproducible download.",
+            pretrained_name_or_path,
+        )
     try:
-        local = hf_hub_download(str(pretrained_name_or_path), filename, **hub_kwargs)  # type: ignore[arg-type] # nosec B615
+        local = hf_hub_download(str(pretrained_name_or_path), filename, **hub_kwargs)  # type: ignore[call-overload] # nosec B615
     except (EntryNotFoundError, HFValidationError, OSError):
         return None
     with Path(local).open(encoding="utf-8") as f:
@@ -321,6 +367,10 @@ def extract_xr0_dataset_stats(
         A ``dataset_stats`` dict ``{"action": {...}}`` consumable by
         :func:`~physicalai.policies.xr0.preprocessor.make_xr0_preprocessors`,
         or ``None`` if no ``action_config`` is available.
+
+    Raises:
+        KeyError: If ``robot_type`` is not present in the checkpoint's
+            ``action_config``.
     """
     import numpy as np  # noqa: PLC0415
 

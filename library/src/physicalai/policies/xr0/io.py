@@ -14,13 +14,26 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
-from PIL import Image
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 ACTION_DIM = 32
 STATE_DIM = 32
 ACTION_EPS = 1e-6
+
+# Reject images whose aspect ratio exceeds this (matches the source preprocessor).
+_MAX_ASPECT_RATIO = 200
+# Threshold below which an axis component is treated as zero when recovering the
+# rotation axis of a near-180-degree rotation.
+_AXIS_COMPONENT_EPS = 1e-8
+# Minimum axis norm before it is considered degenerate and replaced by a default.
+_MIN_AXIS_NORM = 1e-12
+# Angle tolerance for the near-zero / near-pi rotation special cases.
+_ANGLE_EPS = 1e-6
 
 ACTION_PARTS = (
     ("left_ee_pos", slice(0, 3)),
@@ -34,8 +47,12 @@ ACTION_PARTS = (
 )
 
 
-def get_value(data, path):
-    """Look up a dotted ``path`` in a nested mapping, returning ``None`` if any key is missing."""
+def get_value(data: object, path: str) -> object:
+    """Look up a dotted ``path`` in a nested mapping, returning ``None`` if any key is missing.
+
+    Returns:
+        The value at ``path``, or ``None`` if any intermediate key is missing.
+    """
     for key in path.split("."):
         if not isinstance(data, Mapping):
             return None
@@ -51,13 +68,22 @@ def resize_image(
     min_pixels: int = 32 * 32,
     max_pixels: int = 90000,
 ) -> Image.Image:
-    """Resize a PIL image so both sides are multiples of ``factor`` and the area stays within
+    """Resize a PIL image to patch-aligned dimensions within an area budget.
+
+    Both sides are rounded to multiples of ``factor`` and the area is kept within
     ``[min_pixels, max_pixels]``, preserving aspect ratio for the VLM vision encoder.
+
+    Returns:
+        The resized PIL image.
+
+    Raises:
+        ValueError: If the image aspect ratio exceeds ``_MAX_ASPECT_RATIO``.
     """
     width, height = image.size
     ratio = max(height, width) / min(height, width)
-    if ratio > 200:
-        raise ValueError(f"absolute aspect ratio must be smaller than 200, got {ratio}")
+    if ratio > _MAX_ASPECT_RATIO:
+        msg = f"absolute aspect ratio must be smaller than 200, got {ratio}"
+        raise ValueError(msg)
 
     new_height = max(factor, round(height / factor) * factor)
     new_width = max(factor, round(width / factor) * factor)
@@ -75,43 +101,52 @@ def resize_image(
 
 
 def _axis_from_pi(rotm: np.ndarray) -> np.ndarray:
-    """Recover the unit rotation axis for a near-180-degree rotation, where the standard
-    skew-symmetric formula is degenerate; picks the axis from the largest diagonal term.
+    """Recover the unit rotation axis for a near-180-degree rotation.
+
+    The standard skew-symmetric formula is degenerate at 180 degrees; the axis is
+    instead picked from the largest diagonal term of the rotation matrix.
+
+    Returns:
+        The recovered unit rotation axis of shape ``(3,)``.
     """
     rot00, rot11, rot22 = rotm[0, 0], rotm[1, 1], rotm[2, 2]
 
     if rot00 >= rot11 and rot00 >= rot22:
         axis = np.array([np.sqrt(max((rot00 + 1.0) / 2.0, 0.0)), 0.0, 0.0], dtype=np.float32)
-        if axis[0] > 1e-8:
+        if axis[0] > _AXIS_COMPONENT_EPS:
             axis[1] = rotm[0, 1] / (2.0 * axis[0])
             axis[2] = rotm[0, 2] / (2.0 * axis[0])
     elif rot11 >= rot22:
         axis = np.array([0.0, np.sqrt(max((rot11 + 1.0) / 2.0, 0.0)), 0.0], dtype=np.float32)
-        if axis[1] > 1e-8:
+        if axis[1] > _AXIS_COMPONENT_EPS:
             axis[0] = rotm[0, 1] / (2.0 * axis[1])
             axis[2] = rotm[1, 2] / (2.0 * axis[1])
     else:
         axis = np.array([0.0, 0.0, np.sqrt(max((rot22 + 1.0) / 2.0, 0.0))], dtype=np.float32)
-        if axis[2] > 1e-8:
+        if axis[2] > _AXIS_COMPONENT_EPS:
             axis[0] = rotm[0, 2] / (2.0 * axis[2])
             axis[1] = rotm[1, 2] / (2.0 * axis[2])
 
     norm = np.linalg.norm(axis)
-    if norm < 1e-12:
+    if norm < _MIN_AXIS_NORM:
         return np.array([1.0, 0.0, 0.0], dtype=np.float32)
     return axis / norm
 
 
 def rotm2aa_batch(rotms: np.ndarray) -> np.ndarray:
-    """Convert a batch of ``(N,3,3)`` rotation matrices to ``(N,3)`` axis-angle vectors,
-    handling the near-zero and near-pi angle special cases.
+    """Convert a batch of ``(N,3,3)`` rotation matrices to ``(N,3)`` axis-angle vectors.
+
+    Handles the near-zero and near-pi angle special cases.
+
+    Returns:
+        The ``(N, 3)`` axis-angle vectors.
     """
     rotms = np.asarray(rotms, dtype=np.float32)
     theta = np.arccos(np.clip((np.einsum("nii->n", rotms) - 1.0) / 2.0, -1.0, 1.0))
 
     axis_angle = np.zeros((rotms.shape[0], 3), dtype=np.float32)
-    near_zero = theta <= 1e-6
-    near_pi = np.abs(theta - np.pi) <= 1e-6
+    near_zero = theta <= _ANGLE_EPS
+    near_pi = np.abs(theta - np.pi) <= _ANGLE_EPS
     normal = ~(near_zero | near_pi)
 
     if np.any(normal):
@@ -133,8 +168,12 @@ def rotm2aa_batch(rotms: np.ndarray) -> np.ndarray:
     return axis_angle
 
 
-def aa2rotm(axis_angle) -> np.ndarray:
-    """Convert a single axis-angle vector to a ``(3,3)`` rotation matrix via Rodrigues' formula."""
+def aa2rotm(axis_angle: np.ndarray) -> np.ndarray:
+    """Convert a single axis-angle vector to a ``(3,3)`` rotation matrix via Rodrigues' formula.
+
+    Returns:
+        The ``(3, 3)`` rotation matrix.
+    """
     axis_angle = np.asarray(axis_angle, dtype=np.float32)
     angle = float(np.linalg.norm(axis_angle))
     axis = axis_angle / (angle + 1e-10)
@@ -144,20 +183,38 @@ def aa2rotm(axis_angle) -> np.ndarray:
     return eye + np.sin(angle) * axis_hat + (1.0 - np.cos(angle)) * axis_hat @ axis_hat
 
 
-def validate_stats(mean: Sequence[Sequence[float]], std: Sequence[Sequence[float]], action_length: int):
-    """Coerce ``mean``/``std`` to float32 arrays and assert they match ``(action_length, ACTION_DIM)``."""
-    mean = np.asarray(mean, dtype=np.float32)
-    std = np.asarray(std, dtype=np.float32)
-    if mean.shape != (action_length, ACTION_DIM):
-        raise ValueError(f"mean expected shape {(action_length, ACTION_DIM)}, got {mean.shape}")
-    if std.shape != (action_length, ACTION_DIM):
-        raise ValueError(f"std expected shape {(action_length, ACTION_DIM)}, got {std.shape}")
-    return mean, std
+def validate_stats(
+    mean: Sequence[Sequence[float]],
+    std: Sequence[Sequence[float]],
+    action_length: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Coerce ``mean``/``std`` to float32 arrays and assert they match ``(action_length, ACTION_DIM)``.
+
+    Returns:
+        The ``(mean, std)`` float32 arrays.
+
+    Raises:
+        ValueError: If ``mean`` or ``std`` does not have shape ``(action_length, ACTION_DIM)``.
+    """
+    mean_arr = np.asarray(mean, dtype=np.float32)
+    std_arr = np.asarray(std, dtype=np.float32)
+    if mean_arr.shape != (action_length, ACTION_DIM):
+        msg = f"mean expected shape {(action_length, ACTION_DIM)}, got {mean_arr.shape}"
+        raise ValueError(msg)
+    if std_arr.shape != (action_length, ACTION_DIM):
+        msg = f"std expected shape {(action_length, ACTION_DIM)}, got {std_arr.shape}"
+        raise ValueError(msg)
+    return mean_arr, std_arr
 
 
-def build_action_mask(action_length: int, temporal_mask=None) -> np.ndarray:
-    """Build the ``(action_length, ACTION_DIM)`` binary mask marking valid bimanual columns,
-    broadcast over an optional per-timestep ``temporal_mask`` (all ones if omitted).
+def build_action_mask(action_length: int, temporal_mask: np.ndarray | None = None) -> np.ndarray:
+    """Build the ``(action_length, ACTION_DIM)`` binary mask marking valid bimanual columns.
+
+    The mask is broadcast over an optional per-timestep ``temporal_mask`` (all ones
+    if omitted).
+
+    Returns:
+        The ``(action_length, ACTION_DIM)`` binary column mask.
     """
     temporal = (
         np.ones(action_length, dtype=np.int32) if temporal_mask is None else np.asarray(temporal_mask, dtype=np.int32)
@@ -169,18 +226,23 @@ def build_action_mask(action_length: int, temporal_mask=None) -> np.ndarray:
 
 
 def compose_action(
-    left_ee_pos,
-    left_ee_aa,
-    left_gripper,
-    left_joint,
-    right_ee_pos,
-    right_ee_aa,
-    right_gripper,
-    right_joint,
+    left_ee_pos: np.ndarray,
+    left_ee_aa: np.ndarray,
+    left_gripper: np.ndarray,
+    left_joint: np.ndarray,
+    right_ee_pos: np.ndarray,
+    right_ee_aa: np.ndarray,
+    right_gripper: np.ndarray,
+    right_joint: np.ndarray,
     action_length: int,
 ) -> np.ndarray:
-    """Pack the eight named bimanual parts into a single ``(action_length, ACTION_DIM)`` action
-    array following the fixed column layout; padding columns stay zero.
+    """Pack the eight named bimanual parts into a single action array.
+
+    The parts are placed following the fixed ``(action_length, ACTION_DIM)`` column
+    layout; padding columns stay zero.
+
+    Returns:
+        The packed ``(action_length, ACTION_DIM)`` action array.
     """
     values = (left_ee_pos, left_ee_aa, left_gripper, left_joint, right_ee_pos, right_ee_aa, right_gripper, right_joint)
     action = np.zeros((action_length, ACTION_DIM), dtype=np.float32)
@@ -189,9 +251,19 @@ def compose_action(
     return action
 
 
-def compose_state(left_gripper, left_joint, right_gripper, right_joint) -> np.ndarray:
-    """Assemble a ``(1, STATE_DIM)`` bimanual state vector from the left/right gripper and
-    arm-joint values; all other slots stay zero.
+def compose_state(
+    left_gripper: np.ndarray,
+    left_joint: np.ndarray,
+    right_gripper: np.ndarray,
+    right_joint: np.ndarray,
+) -> np.ndarray:
+    """Assemble a ``(1, STATE_DIM)`` bimanual state vector.
+
+    The left/right gripper and arm-joint values are placed into their fixed slots;
+    all other slots stay zero.
+
+    Returns:
+        The ``(1, STATE_DIM)`` bimanual state vector.
     """
     state = np.zeros((1, STATE_DIM), dtype=np.float32)
     for slc, value in (
@@ -204,27 +276,42 @@ def compose_state(left_gripper, left_joint, right_gripper, right_joint) -> np.nd
     return state
 
 
-def normalize_action(action, mean, std) -> np.ndarray:
-    """Standardize ``action`` to zero-mean/unit-scale using ``(action - mean) / (std + eps)``."""
+def normalize_action(action: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """Standardize ``action`` to zero-mean/unit-scale using ``(action - mean) / (std + eps)``.
+
+    Returns:
+        The normalized action array.
+    """
     return (action - mean) / (std + ACTION_EPS)
 
 
-def denormalize_action(action, mean, std):
-    """Invert :func:`normalize_action`, mapping a normalized action back to raw units."""
+def denormalize_action(action: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """Invert :func:`normalize_action`, mapping a normalized action back to raw units.
+
+    Returns:
+        The denormalized action array.
+    """
     return action * (std + ACTION_EPS) + mean
 
 
-def split_action(action) -> dict[str, np.ndarray]:
-    """Slice an action array into the eight named bimanual parts (inverse of :func:`compose_action`)."""
+def split_action(action: np.ndarray) -> dict[str, np.ndarray]:
+    """Slice an action array into the eight named bimanual parts (inverse of :func:`compose_action`).
+
+    Returns:
+        A mapping of part name to its action slice.
+    """
     action = np.asarray(action, dtype=np.float32)
     return {name: action[..., slc] for name, slc in ACTION_PARTS}
 
 
-def recover_action(action, robot_state: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+def recover_action(action: np.ndarray, robot_state: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Convert per-step delta actions into absolute targets given the current ``robot_state``.
 
     End-effector position deltas are applied in the current EE frame, orientation deltas are
     composed as axis-angle rotations, and gripper/joint deltas add to the current values.
+
+    Returns:
+        A mapping of target name to the recovered absolute target array.
     """
     parts = split_action(action)
     targets = {}

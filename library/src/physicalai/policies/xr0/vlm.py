@@ -22,8 +22,13 @@ VLM numerics are inherited unchanged from stock ``transformers``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
 import torch
 from transformers import Qwen3VLForConditionalGeneration
+
+if TYPE_CHECKING:
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
 
 
 class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
@@ -43,7 +48,7 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values=None,  # noqa: ANN001
@@ -56,17 +61,22 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         mm_token_type_ids: torch.IntTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
-        **kwargs,
-    ):
-        """Run the stock forward and attach the 3D MRoPE ``position_ids``."""
+        **kwargs: object,
+    ) -> Qwen3VLCausalLMOutputWithPast:
+        """Run the stock forward and attach the 3D MRoPE ``position_ids``.
+
+        Returns:
+            The stock Qwen3-VL output with the 3D MRoPE ``position_ids`` attached.
+        """
         if (
             mm_token_type_ids is None
             and input_ids is not None
             and (image_grid_thw is not None or video_grid_thw is not None)
         ):
-            mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[input_ids == self.config.image_token_id] = 1
-            mm_token_type_ids[input_ids == self.config.video_token_id] = 2
+            derived_ids = torch.zeros_like(input_ids)
+            derived_ids[input_ids == self.config.image_token_id] = 1
+            derived_ids[input_ids == self.config.video_token_id] = 2
+            mm_token_type_ids = cast("torch.IntTensor", derived_ids)
 
         if position_ids is None:
             position_ids = self.model.compute_3d_position_ids(

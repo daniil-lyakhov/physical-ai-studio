@@ -44,9 +44,7 @@ DIT_LAYERS = 2
 NUM_STEPS = 3
 
 # Reference first action token of the denoised chunk for the seeded tiny model.
-REFERENCE_ACTION = torch.tensor(
-    [0.41849822, 2.12935758, -1.08118093, 0.15135361, 0.33237639, -0.34592688, 1.10643888, 0.60246569]
-)
+REFERENCE_ACTION = torch.tensor([0.4187, 2.1285, -1.0810, 0.1513, 0.3321, -0.3464, 1.1061, 0.6040])
 
 
 def _config() -> Qwen3VLConfig:

@@ -17,7 +17,7 @@ computes the flow-matching loss. It exposes the framework
 from __future__ import annotations
 
 import random
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -33,10 +33,14 @@ from .vlm import XR0Qwen3VL
 _ACTION_POSITION_OFFSET = 10
 # Number of trailing prefix tokens always kept visible when randomly masking.
 _PREFIX_KEEP_LAST_K = 2
+# Probability of drawing a random action prefix during asynchronous training.
+_ASYNC_PREFIX_PROB = 0.5
 
 
 class XR0Model(Model):
     """Qwen3-VL backbone + DiT rectified-flow action expert as a framework Model."""
+
+    saved_causal_mask: torch.Tensor
 
     def __init__(  # noqa: PLR0913
         self,
@@ -117,7 +121,7 @@ class XR0Model(Model):
         )
 
         # RoPE continuation into the DiT (same config as the VLM text stack).
-        self.rotary_emb = Qwen3VLTextRotaryEmbedding(self.vlm.config.text_config)
+        self.rotary_emb = Qwen3VLTextRotaryEmbedding(cast("Any", self.vlm.config.text_config))
 
         # Local causal mask over [sink + state + action] tokens.
         saved = self._local_causal_mask(state_shape[-2], action_shape[-2]).unsqueeze(0).int()
@@ -143,7 +147,7 @@ class XR0Model(Model):
         Returns:
             Tuple of (loss tensor with grad, dict of float loss components).
         """
-        loss_dict = self._run(batch, return_loss=True)
+        loss_dict = cast("dict[str, torch.Tensor]", self._run(batch, return_loss=True))
         return loss_dict["loss"], {key: float(value.detach()) for key, value in loss_dict.items()}
 
     def predict_action_chunk(self, batch: dict[str, Any]) -> torch.Tensor:
@@ -152,7 +156,7 @@ class XR0Model(Model):
         Returns:
             Predicted action tensor ``(B, action_len, action_dim)``.
         """
-        return self._run(batch, return_loss=False)
+        return cast("torch.Tensor", self._run(batch, return_loss=False))
 
     @property
     def reward_delta_indices(self) -> None:
@@ -198,6 +202,9 @@ class XR0Model(Model):
         When ``local`` is False the action-action block is a plain (full) causal
         ``tril`` -- the deployed inference checkpoint (modeling_mibot.py) does not
         apply the banded ``local_window``; only training (XR0.py) does.
+
+        Returns:
+            The 2D causal mask over the concatenated token sequence.
         """
         s_len = state_length + 1
         a_len = action_length
@@ -206,7 +213,7 @@ class XR0Model(Model):
         mask_as = torch.ones(a_len, s_len, device=device)
         mask_aa = torch.tril(torch.ones(a_len, a_len, device=device))
         if local:
-            mask_aa = mask_aa * torch.triu(torch.ones(a_len, a_len, device=device), diagonal=-self.local_window)
+            mask_aa *= torch.triu(torch.ones(a_len, a_len, device=device), diagonal=-self.local_window)
         top = torch.cat([mask_ss, mask_sa], dim=1)
         bottom = torch.cat([mask_as, mask_aa], dim=1)
         return torch.cat([top, bottom], dim=0)
@@ -220,7 +227,11 @@ class XR0Model(Model):
         *,
         local: bool = True,
     ) -> torch.Tensor:
-        """Batched local causal mask, reusing the cached buffer for default shapes."""
+        """Batched local causal mask, reusing the cached buffer for default shapes.
+
+        Returns:
+            The batched causal mask of shape ``(batch_size, q_len, q_len)``.
+        """
         if local and state_length == self.state_shape[-2] and action_length == self.action_shape[-2]:
             return self.saved_causal_mask.expand(batch_size, -1, -1)
         mask = self._local_causal_mask(state_length, action_length, device, local=local)
@@ -232,7 +243,11 @@ class XR0Model(Model):
         prefix_length: int,
         state_length: int,
     ) -> torch.Tensor:
-        """Randomly hide part of the action prefix from the suffix tokens."""
+        """Randomly hide part of the action prefix from the suffix tokens.
+
+        Returns:
+            The (possibly cloned) causal mask with part of the prefix hidden.
+        """
         if prefix_length <= _PREFIX_KEEP_LAST_K:
             return causal_mask
 
@@ -253,7 +268,11 @@ class XR0Model(Model):
     # ------------------------------------------------------------------ #
 
     def _repeat_tensor(self, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        """Repeat a tensor ``training_repeat`` times along ``dim`` (training only)."""
+        """Repeat a tensor ``training_repeat`` times along ``dim`` (training only).
+
+        Returns:
+            The repeated tensor (or ``x`` unchanged outside training).
+        """
         if not self.training or self.training_repeat <= 1:
             return x
         return x.repeat_interleave(self.training_repeat, dim=dim)
@@ -262,7 +281,11 @@ class XR0Model(Model):
         self,
         past_key_values: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Repeat every KV-cache entry to match the repeated batch."""
+        """Repeat every KV-cache entry to match the repeated batch.
+
+        Returns:
+            The KV-cache with every entry repeated (or unchanged outside training).
+        """
         if not self.training or self.training_repeat <= 1:
             return past_key_values
         return [(self._repeat_tensor(key), self._repeat_tensor(value)) for key, value in past_key_values]
@@ -272,8 +295,12 @@ class XR0Model(Model):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _normalize_prefix_length(prefix_length: Any, action_length: int) -> int:
-        """Coerce a possibly-tensor ``prefix_length`` into a bounded int."""
+    def _normalize_prefix_length(prefix_length: int | torch.Tensor | None, action_length: int) -> int:
+        """Coerce a possibly-tensor ``prefix_length`` into a bounded int.
+
+        Returns:
+            The prefix length clamped to ``[0, action_length]``.
+        """
         if isinstance(prefix_length, torch.Tensor):
             prefix_length = 0 if prefix_length.numel() == 0 else int(prefix_length.flatten()[0].item())
         elif prefix_length is None:
@@ -306,7 +333,7 @@ class XR0Model(Model):
             state = torch.zeros((1, *self.state_shape), device=device, dtype=self._dtype)
         return action, action_mask, state
 
-    def _sample_noise(self, action: torch.Tensor, seed: Any) -> torch.Tensor:
+    def _sample_noise(self, action: torch.Tensor, seed: int | torch.Tensor | None) -> torch.Tensor:
         """Draw the rectified-flow starting noise.
 
         When ``seed`` is provided (inference only), the draw is made
@@ -340,7 +367,11 @@ class XR0Model(Model):
         *,
         return_loss: bool,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """VLM encode -> MRoPE continuation -> rectified-flow train / inference."""
+        """VLM encode -> MRoPE continuation -> rectified-flow train / inference.
+
+        Returns:
+            The predicted actions (inference) or the loss dict (training).
+        """
         prefix_length = batch.pop("prefix_length", 0)
         seed = batch.pop("seed", None)
 
@@ -356,7 +387,7 @@ class XR0Model(Model):
 
         if self.training:
             prefix_length = 0
-            if self.async_train and random.random() < 0.5:  # noqa: S311
+            if self.async_train and random.random() < _ASYNC_PREFIX_PROB:  # noqa: S311
                 prefix_length = random.randint(1, min(6, action_length))  # noqa: S311
         prefix = action[:, :prefix_length]
 
@@ -439,7 +470,11 @@ class XR0Model(Model):
         attn_mask: torch.Tensor,
         prefix_length: int,
     ) -> dict[str, Any]:
-        """Bundle the shared keyword args forwarded to ``dit_forward``."""
+        """Bundle the shared keyword args forwarded to ``dit_forward``.
+
+        Returns:
+            The keyword-argument dict forwarded to ``dit_forward``.
+        """
         return {
             "action_mask": action_mask,
             "state_embed": state_embed,
@@ -461,7 +496,11 @@ class XR0Model(Model):
         prefix: torch.Tensor,
         prefix_length: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """One rectified-flow training prediction (velocity + loss weighting)."""
+        """One rectified-flow training prediction (velocity + loss weighting).
+
+        Returns:
+            Tuple of ``(pred, target, action_mask, weight)`` for the loss.
+        """
         t = self.flow._sample_timestep(action.shape[0], dtype=action.dtype, device=action.device)  # noqa: SLF001
         t = t.unsqueeze(1).unsqueeze(1)
         noisy_action = self.flow._flow_interpolate(noise, action, t)  # noqa: SLF001
@@ -501,7 +540,11 @@ class XR0Model(Model):
         action_mask: torch.Tensor,
         weight: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Masked MSE (+ optional frequency-domain) rectified-flow loss."""
+        """Masked MSE (+ optional frequency-domain) rectified-flow loss.
+
+        Returns:
+            A dict with ``loss``, ``loss_mse`` and ``loss_freq`` entries.
+        """
         pred = pred.float()
         target = target.float()
         action_mask = action_mask.bool()
@@ -515,7 +558,7 @@ class XR0Model(Model):
             masked_weight = weight[action_mask]
             if masked_weight.numel() > 0:
                 weight = weight.clone()
-                weight[action_mask] = weight[action_mask] / masked_weight.mean()
+                weight[action_mask] /= masked_weight.mean()
                 weight = torch.clamp(weight, min=0.5, max=5.0)
 
         loss_mse = (F.mse_loss(pred, target, reduction="none") * weight)[action_mask].mean()
