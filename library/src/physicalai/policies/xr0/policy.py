@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -24,6 +23,8 @@ from .pretrained_utils import extract_xr0_dataset_stats, load_xr0_pretrained_wei
 from .vla import XR0Model
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from physicalai.data import Observation
 
     from .preprocessor import XR0Postprocessor, XR0Preprocessor
@@ -367,7 +368,7 @@ class XR0(Policy):
             eps=self.config.optimizer_eps,
         )
 
-        num_training_steps = self.trainer.estimated_stepping_batches
+        num_training_steps = int(self.trainer.estimated_stepping_batches)
         num_decay_steps = self.config.scheduler_decay_steps
         if num_decay_steps is None:
             num_decay_steps = num_training_steps
