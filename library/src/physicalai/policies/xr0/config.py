@@ -48,7 +48,7 @@ class XR0Config(Config):
         local_window: Local-attention window for the action tokens. Defaults
             to 4.
         training_repeat: Per-sample training repeat factor. Defaults to 4.
-        enable_freq: Add the frequency-domain loss term. Defaults to False.
+        enable_freq: Add the frequency-domain loss term. Defaults to True.
         prefix_mask_prob: Probability of masking a prefix token during training.
             Defaults to 0.5.
         async_train: Randomly condition on an action prefix during training.
@@ -69,18 +69,18 @@ class XR0Config(Config):
             ``"QUANTILES"`` maps data to [-1, 1] using the 1st and 99th
             percentiles; ``"MEAN_STD"`` uses zero-mean unit-variance
             normalization. Defaults to ``"QUANTILES"``.
-        optimizer_lr: Learning rate for the optimizer. Defaults to 2.5e-5.
+        optimizer_lr: Learning rate for the optimizer. Defaults to 1e-4.
         optimizer_betas: Beta coefficients for Adam optimizer. Defaults to
             (0.9, 0.95).
         optimizer_eps: Epsilon for optimizer numerical stability. Defaults to
             1e-8.
-        optimizer_weight_decay: Weight decay coefficient. Defaults to 0.01.
+        optimizer_weight_decay: Weight decay coefficient. Defaults to 0.1.
         optimizer_grad_clip_norm: Maximum gradient norm for clipping. Defaults
             to 1.0.
-        scheduler_warmup_steps: Number of warmup steps. Defaults to 1000.
+        scheduler_warmup_steps: Number of warmup steps. Defaults to 2000.
         scheduler_decay_steps: Number of cosine decay steps. When ``None``,
             automatically set to the total training steps. Defaults to 30000.
-        scheduler_decay_lr: Final learning rate after decay. Defaults to 2.5e-6.
+        scheduler_decay_lr: Final learning rate after decay. Defaults to 5e-7.
     """
 
     vlm_model_id: str = "Qwen/Qwen3-VL-4B-Instruct"
@@ -104,7 +104,7 @@ class XR0Config(Config):
     flow_sampling: Literal["beta", "logit_normal", "uniform"] = "beta"
     local_window: int = 4
     training_repeat: int = 4
-    enable_freq: bool = False
+    enable_freq: bool = True
     prefix_mask_prob: float = 0.5
     async_train: bool = False
 
@@ -120,15 +120,15 @@ class XR0Config(Config):
 
     normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES"
 
-    optimizer_lr: float = 2.5e-5
+    optimizer_lr: float = 1.0e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 0.01
+    optimizer_weight_decay: float = 0.1
     optimizer_grad_clip_norm: float = 1.0
 
-    scheduler_warmup_steps: int = 1_000
+    scheduler_warmup_steps: int = 2_000
     scheduler_decay_steps: int | None = 30_000
-    scheduler_decay_lr: float = 2.5e-6
+    scheduler_decay_lr: float = 5.0e-7
 
     def __post_init__(self) -> None:
         """Validate configuration parameters after initialization.

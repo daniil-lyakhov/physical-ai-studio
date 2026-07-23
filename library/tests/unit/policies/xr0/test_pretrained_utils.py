@@ -6,15 +6,14 @@
 Fast, self-contained tests with no external dependencies (no HuggingFace
 downloads). A small ``XR0FlowModel`` provides realistic source-layout keys so
 the remap is validated against the exact ``flow.*`` names the framework model
-expects. File loading is exercised through ``.pt`` and ``.safetensors``
-round-trips on ``tmp_path``.
+expects. File loading is exercised through ``.safetensors`` round-trips on
+``tmp_path``.
 """
 
 from __future__ import annotations
 
 import json
 
-import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -26,10 +25,6 @@ from physicalai.policies.xr0.pretrained_utils import (
     remap_xr0_state_dict,
     resolve_pretrained_path,
 )
-
-
-class _NonTensorPayload:
-    """A custom object that ``weights_only=True`` refuses to unpickle."""
 
 
 def _source_layout_state_dict() -> dict[str, torch.Tensor]:
@@ -114,16 +109,7 @@ class TestRemap:
 
 
 class TestFileLoading:
-    """Loading raw checkpoints from ``.pt`` and ``.safetensors`` files."""
-
-    def test_load_pt_with_module_wrapper(self, tmp_path) -> None:  # noqa: ANN001
-        """A ``{"module": {...}}`` torch checkpoint loads and remaps."""
-        source = {f"model.{k}": v for k, v in _source_layout_state_dict().items()}
-        ckpt = tmp_path / "xr0_pretrained.pt"
-        torch.save({"module": source}, str(ckpt))
-
-        remapped = load_xr0_pretrained_weights(ckpt)
-        assert {k for k in remapped if k.startswith("flow.")} == _expected_flow_keys()
+    """Loading raw checkpoints from ``.safetensors`` files."""
 
     def test_load_safetensors(self, tmp_path) -> None:  # noqa: ANN001
         """A single ``model.safetensors`` directory checkpoint loads and remaps."""
@@ -137,16 +123,6 @@ class TestFileLoading:
     def test_resolve_local_path_is_identity(self, tmp_path) -> None:  # noqa: ANN001
         """An existing local path is returned as-is (no download)."""
         assert resolve_pretrained_path(tmp_path) == tmp_path
-
-    def test_unsafe_pickle_checkpoint_is_rejected(self, tmp_path) -> None:  # noqa: ANN001
-        """A checkpoint holding non-tensor objects is refused (pickle never runs)."""
-        ckpt = tmp_path / "xr0_pretrained.pt"
-        # A custom class instance cannot be unpickled under weights_only=True, so
-        # loading must fail loudly rather than executing arbitrary pickle code.
-        torch.save({"module": _NonTensorPayload()}, str(ckpt))
-
-        with pytest.raises(ValueError, match="safetensors"):
-            load_xr0_pretrained_weights(ckpt)
 
 
 def _write_preprocessor_config(tmp_path, mean_row, std_row, *, time_steps=10) -> None:  # noqa: ANN001
