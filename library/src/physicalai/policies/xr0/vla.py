@@ -322,11 +322,11 @@ class XR0Model(Model):
         """
         device = batch["input_ids"].device
         if "action" in batch:
-            action = batch.pop("action")
+            action = batch.pop("action").to(self._dtype)
             action_mask = batch.pop("action_mask", None)
             if action_mask is None:
                 action_mask = torch.ones_like(action, dtype=torch.int32)
-            state = batch.pop("state")
+            state = batch.pop("state").to(self._dtype)
         else:
             action = torch.zeros((1, *self.action_shape), device=device, dtype=self._dtype)
             action_mask = torch.ones_like(action, dtype=torch.int32)

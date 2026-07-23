@@ -8,11 +8,16 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
+from physicalai.inference.data import InferenceFeature, InferenceFeatureDtype, InferenceFeatureType
+from physicalai.inference.manifest import ComponentSpec
 
 from physicalai.data.dataset import Dataset
+from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, FeatureType
+from physicalai.export import ExportablePolicyMixin, ExportBackend
+from physicalai.export.backends import ExportParameters, TorchExportParameters
 from physicalai.policies.base import Policy
 from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
@@ -34,7 +39,7 @@ logger = logging.getLogger(__name__)
 _DTYPES: dict[str, torch.dtype] = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 
 
-class XR0(Policy):
+class XR0(ExportablePolicyMixin, Policy):
     """XR0 Policy - Xiaomi's flow-matching VLA model.
 
     Lightning wrapper for training and inference with :class:`XR0Model`.
@@ -117,7 +122,7 @@ class XR0(Policy):
         flow_sampling: Literal["beta", "logit_normal", "uniform"] = "beta",
         local_window: int = 4,
         training_repeat: int = 4,
-        enable_freq: bool = False,
+        enable_freq: bool = True,
         prefix_mask_prob: float = 0.5,
         async_train: bool = False,
         camera_views: tuple[str, ...] = ("base", "wrist_left"),
@@ -128,14 +133,14 @@ class XR0(Policy):
         compile_mode: str = "max-autotune",
         freeze_vision_encoder: bool = False,
         normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES",
-        optimizer_lr: float = 2.5e-5,
+        optimizer_lr: float = 1.0e-4,
         optimizer_betas: tuple[float, float] = (0.9, 0.95),
         optimizer_eps: float = 1e-8,
-        optimizer_weight_decay: float = 0.01,
+        optimizer_weight_decay: float = 0.1,
         optimizer_grad_clip_norm: float = 1.0,
-        scheduler_warmup_steps: int = 1_000,
+        scheduler_warmup_steps: int = 2_000,
         scheduler_decay_steps: int | None = 30_000,
-        scheduler_decay_lr: float = 2.5e-6,
+        scheduler_decay_lr: float = 5.0e-7,
         dataset_stats: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         """Initialize the XR0 policy."""
@@ -400,3 +405,122 @@ class XR0(Policy):
                 gradient_clip_val=clip_val,
                 gradient_clip_algorithm=gradient_clip_algorithm or "norm",
             )
+
+    @staticmethod
+    def get_supported_export_backends() -> list[str | ExportBackend]:
+        """Get the list of export backends supported by the policy.
+
+        XR0 wraps a Qwen3-VL backbone, so only the tracing-free Torch backend is
+        supported; graph-based backends (ONNX/OpenVINO/ExecuTorch) are not.
+
+        Returns:
+            list[str | ExportBackend]: The supported export backends.
+        """
+        return [ExportBackend.TORCH]
+
+    @property
+    def inputs_schema(self) -> list[InferenceFeature] | None:
+        """Describe the policy's expected model inputs for export.
+
+        Returns:
+            A list of feature descriptors covering the robot state, one image
+            feature per camera view, and the language task. Returns ``None`` if
+            the underlying model or dataset stats have not been initialized yet.
+        """
+        if self.model is None or self._dataset_stats is None:
+            return None
+
+        dataset_stats = self._dataset_stats
+
+        num_image_features = sum(
+            1 for feature in dataset_stats.values() if str(FeatureType.VISUAL) in str(feature.get("type", ""))
+        )
+
+        schema: list[InferenceFeature] = []
+        for feature_id, feature in dataset_stats.items():
+            feature_type = str(feature.get("type", ""))
+            if STATE in feature_id:
+                schema.append(
+                    InferenceFeature(
+                        ftype=InferenceFeatureType.STATE,
+                        shape=cast("tuple", feature["shape"]),
+                        name=STATE,
+                        dtype=InferenceFeatureDtype.FLOAT32,
+                    ),
+                )
+            elif str(FeatureType.VISUAL) in feature_type:
+                feature_name = (
+                    str(feature.get("name", feature_id)).removeprefix("observation.").removeprefix(f"{IMAGES}.")
+                )
+                name = IMAGES if num_image_features == 1 else f"{IMAGES}.{feature_name}"
+                schema.append(
+                    InferenceFeature(
+                        ftype=InferenceFeatureType.VISUAL,
+                        shape=cast("tuple", feature["shape"]),
+                        name=name,
+                        dtype=InferenceFeatureDtype.FLOAT32,
+                    ),
+                )
+
+        schema.append(
+            InferenceFeature(
+                ftype=InferenceFeatureType.LANGUAGE,
+                shape=(),
+                name=TASK,
+                dtype=InferenceFeatureDtype.STRING,
+            ),
+        )
+
+        return schema
+
+    @property
+    def outputs_schema(self) -> list[InferenceFeature] | None:
+        """Describe the policy's model output for export.
+
+        Returns:
+            A list with a single ``action`` feature of shape
+            ``(chunk_size, *action_dim)``, where ``action_dim`` is taken from the
+            dataset stats. Returns ``None`` if the underlying model or dataset
+            stats have not been initialized yet.
+        """
+        if self.model is None or self._dataset_stats is None:
+            return None
+
+        action_shape = cast("tuple", self._dataset_stats[ACTION]["shape"])
+
+        return [
+            InferenceFeature(
+                ftype=InferenceFeatureType.ACTION,
+                shape=(self.config.chunk_size, *action_shape),
+                name=ACTION,
+                dtype=InferenceFeatureDtype.FLOAT32,
+            ),
+        ]
+
+    @property
+    def extra_export_args(self) -> dict[str, ExportParameters]:
+        """Additional export arguments for model conversion.
+
+        The reconstructed policy runs its own preprocessor/postprocessor during
+        Torch inference, so only lightweight input casting and optional action
+        trimming are declared here.
+
+        Returns:
+            dict[str, ExportParameters]: A mapping from backend name to its export
+            parameters (Torch only).
+        """
+        torch_postproc_specs: list[ComponentSpec] = []
+        if self.config.chunk_size != self.config.n_action_steps:
+            torch_postproc_specs.append(
+                ComponentSpec(
+                    type="action_chunk_trimmer",
+                    n_action_steps=self.config.n_action_steps,
+                ),
+            )
+
+        return {
+            "torch": TorchExportParameters(
+                preprocessors_specs=[ComponentSpec(type="to_float_tensor")],
+                postprocessors_specs=torch_postproc_specs,
+            ),
+        }
