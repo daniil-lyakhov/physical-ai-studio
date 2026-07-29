@@ -8,14 +8,14 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from physicalai.inference.data import InferenceFeature, InferenceFeatureDtype, InferenceFeatureType
 from physicalai.inference.manifest import ComponentSpec
 
 from physicalai.data.dataset import Dataset
-from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, FeatureType
+from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Feature, FeatureType, NormalizationParameters
 from physicalai.export import ExportablePolicyMixin, ExportBackend
 from physicalai.export.backends import ExportParameters, TorchExportParameters
 from physicalai.policies.base import Policy
@@ -49,6 +49,12 @@ class XR0(ExportablePolicyMixin, Policy):
             pretrained XR0 checkpoint (e.g.
             ``"XiaomiRobotics/Xiaomi-Robotics-0-LIBERO"``). When given, the
             weights are loaded into the model once it is built.
+        input_features: Optional explicit observation feature schema
+            (``list[Feature]``). When omitted, it is traced back from the
+            training dataset in :meth:`setup`. Must be given together with
+            ``output_features``.
+        output_features: Optional explicit action feature schema
+            (``list[Feature]``). Must be given together with ``input_features``.
         vlm_model_id: HuggingFace id of the Qwen3-VL backbone.
         vlm_attn_implementation: Attention backend for the VLM.
         dtype: Model precision (``"bfloat16"`` or ``"float32"``).
@@ -114,6 +120,8 @@ class XR0(ExportablePolicyMixin, Policy):
         max_action_dim: int = 32,
         state_len: int = 1,
         *,
+        input_features: list[Feature] | None = None,
+        output_features: list[Feature] | None = None,
         dit_num_layers: int = 16,
         dit_hidden_size: int = 1024,
         dit_head_dim: int = 128,
@@ -143,8 +151,19 @@ class XR0(ExportablePolicyMixin, Policy):
         scheduler_decay_lr: float = 5.0e-7,
         dataset_stats: dict[str, dict[str, Any]] | None = None,
     ) -> None:
-        """Initialize the XR0 policy."""
+        """Initialize the XR0 policy.
+
+        Raises:
+            ValueError: If only one of ``input_features`` / ``output_features``
+                is provided.
+        """
         super().__init__(n_action_steps=n_action_steps)
+
+        # Input/output features must be provided together (or both omitted and
+        # traced back from the dataset in ``setup``), mirroring MolmoAct2.
+        if bool(input_features) != bool(output_features):
+            msg = f"Need both input and output features: input: {input_features} - output: {output_features}"
+            raise ValueError(msg)
 
         self.config = XR0Config(
             vlm_model_id=vlm_model_id,
@@ -156,6 +175,8 @@ class XR0(ExportablePolicyMixin, Policy):
             max_state_dim=max_state_dim,
             max_action_dim=max_action_dim,
             state_len=state_len,
+            input_features=input_features,
+            output_features=output_features,
             dit_num_layers=dit_num_layers,
             dit_hidden_size=dit_hidden_size,
             dit_head_dim=dit_head_dim,
@@ -192,12 +213,21 @@ class XR0(ExportablePolicyMixin, Policy):
         self._preprocessor: XR0Preprocessor | None = None
         self._postprocessor: XR0Postprocessor | None = None
         self._dataset_stats = dataset_stats
+        self._input_features = input_features
+        self._output_features = output_features
 
         # Resolve (download) the pretrained checkpoint now; load it into the
         # model once it is built (eager path here, or lazily in ``setup``).
         self._pretrained_path: Path | None = (
             resolve_pretrained_path(pretrained_name_or_path) if pretrained_name_or_path is not None else None
         )
+
+        # When explicit input/output features are given without dataset stats,
+        # derive the normalization stats from them so the model can be built
+        # eagerly (no training dataset required).
+        if dataset_stats is None and input_features is not None and output_features is not None:
+            dataset_stats = self._features_to_stats(input_features, output_features)
+            self._dataset_stats = dataset_stats
 
         # When a pretrained checkpoint is given without explicit dataset stats,
         # recover the action-normalization stats from the checkpoint so the
@@ -251,6 +281,12 @@ class XR0(ExportablePolicyMixin, Policy):
         )
         self._dataset_stats = dataset_stats
 
+        # When features were not provided (or traced from a dataset) yet,
+        # reconstruct the typed schema from the stats dict so the export
+        # ``inputs_schema`` / ``outputs_schema`` are feature-driven.
+        if self._input_features is None or self._output_features is None:
+            self._input_features, self._output_features = self._stats_to_features(dataset_stats)
+
     def _load_pretrained_weights(self, pretrained_path: Path) -> None:
         """Load remapped pretrained weights into ``self.model`` (non-strict).
 
@@ -288,6 +324,15 @@ class XR0(ExportablePolicyMixin, Policy):
         if not isinstance(train_dataset, Dataset):
             msg = f"Expected physicalai Dataset, got {type(train_dataset)}"
             raise TypeError(msg)
+
+        # Trace the input/output feature schema back from the dataset when it
+        # was not provided explicitly at construction time.
+        if self._input_features is None or self._output_features is None:
+            input_features, output_features = self._dataset_features(train_dataset)
+            self._input_features = input_features
+            self._output_features = output_features
+            self.hparams["input_features"] = input_features
+            self.hparams["output_features"] = output_features
 
         stats_dict = train_dataset.stats
         if self.model is None:
@@ -418,45 +463,199 @@ class XR0(ExportablePolicyMixin, Policy):
         """
         return [ExportBackend.TORCH]
 
+    @staticmethod
+    def _coerce_dataset_feature(feature: Feature) -> Feature:
+        """Return a defensive copy of a dataset feature for the schema.
+
+        Returns:
+            A new :class:`Feature` with copied normalization data and a concrete
+            integer-tuple shape.
+        """
+        norm = feature.normalization_data
+        copied_norm: NormalizationParameters | None = None
+        if norm is not None:
+            copied_norm = NormalizationParameters(
+                mean=norm.mean,
+                std=norm.std,
+                min=norm.min,
+                max=norm.max,
+                q01=norm.q01,
+                q99=norm.q99,
+            )
+        shape = tuple(int(dim) for dim in feature.shape) if feature.shape is not None else ()
+        return Feature(
+            name=str(feature.name),
+            ftype=FeatureType(feature.ftype) if feature.ftype is not None else None,
+            shape=shape,
+            normalization_data=copied_norm,
+        )
+
+    @staticmethod
+    def _dataset_features(train_dataset: Dataset) -> tuple[list[Feature], list[Feature]]:
+        """Trace the input/output feature schema back from the dataset.
+
+        Returns:
+            A ``(input_features, output_features)`` tuple built from the
+            dataset's observation and action features.
+        """
+        input_features = [XR0._coerce_dataset_feature(f) for f in train_dataset.observation_features.values()]
+        output_features = [XR0._coerce_dataset_feature(f) for f in train_dataset.action_features.values()]
+        return input_features, output_features
+
+    @staticmethod
+    def _feature_stat_entry(feature: Feature) -> dict[str, Any]:
+        """Serialize one feature into a LeRobot-style stats dict entry.
+
+        Returns:
+            The per-feature stats entry (normalization values + metadata).
+        """
+        entry: dict[str, Any] = {}
+        norm = feature.normalization_data
+        if norm is not None:
+            for stat in ("mean", "std", "min", "max", "q01", "q99"):
+                value = getattr(norm, stat, None)
+                if value is not None:
+                    entry[stat] = value
+        entry["type"] = feature.ftype.value if feature.ftype is not None else ""
+        entry["name"] = feature.name if feature.name is not None else ""
+        entry["shape"] = feature.shape if feature.shape is not None else ()
+        return entry
+
+    @staticmethod
+    def _features_to_stats(
+        input_features: list[Feature],
+        output_features: list[Feature],
+    ) -> dict[str, dict[str, Any]]:
+        """Build the stats dict consumed by the preprocessor from typed features.
+
+        Returns:
+            A stats dict keyed like :attr:`Dataset.stats`
+            (``observation.<name>`` for inputs, ``action`` for outputs).
+        """
+        stats: dict[str, dict[str, Any]] = {}
+        for feature in input_features:
+            stats[f"observation.{feature.name}"] = XR0._feature_stat_entry(feature)
+        for feature in output_features:
+            stats[str(feature.name)] = XR0._feature_stat_entry(feature)
+        return stats
+
+    @staticmethod
+    def _stats_to_features(
+        stats: dict[str, dict[str, Any]],
+    ) -> tuple[list[Feature], list[Feature]]:
+        """Reconstruct typed input/output features from a stats dict.
+
+        Used when only a stats dict is available (e.g. a pretrained checkpoint),
+        so :attr:`inputs_schema` / :attr:`outputs_schema` stay feature-driven.
+
+        Returns:
+            A ``(input_features, output_features)`` tuple.
+        """
+        input_features: list[Feature] = []
+        output_features: list[Feature] = []
+        for key, stat in stats.items():
+            ftype_str = str(stat.get("type", ""))
+            if str(FeatureType.ACTION) in ftype_str or ACTION in key:
+                ftype = FeatureType.ACTION
+            elif str(FeatureType.VISUAL) in ftype_str:
+                ftype = FeatureType.VISUAL
+            elif str(FeatureType.STATE) in ftype_str or STATE in key:
+                ftype = FeatureType.STATE
+            else:
+                continue
+            name = str(stat.get("name", key)).removeprefix("observation.")
+            feature = Feature(
+                name=name,
+                ftype=ftype,
+                shape=tuple(stat["shape"]) if stat.get("shape") else (),
+                normalization_data=NormalizationParameters(
+                    mean=stat.get("mean"),
+                    std=stat.get("std"),
+                    min=stat.get("min"),
+                    max=stat.get("max"),
+                    q01=stat.get("q01"),
+                    q99=stat.get("q99"),
+                ),
+            )
+            if ftype == FeatureType.ACTION:
+                output_features.append(feature)
+            else:
+                input_features.append(feature)
+        return input_features, output_features
+
+    @property
+    def input_features(self) -> list[Feature]:
+        """Explicit observation feature schema.
+
+        Returns:
+            The list of input :class:`Feature` descriptors.
+
+        Raises:
+            ValueError: If the features have not been initialized yet.
+        """
+        if self._input_features is None:
+            msg = "Model has not been initialized, no input features exist yet."
+            raise ValueError(msg)
+        return self._input_features
+
+    @property
+    def output_features(self) -> list[Feature]:
+        """Explicit action feature schema.
+
+        Returns:
+            The list of output :class:`Feature` descriptors.
+
+        Raises:
+            ValueError: If the features have not been initialized yet.
+        """
+        if self._output_features is None:
+            msg = "Model has not been initialized, no output features exist yet."
+            raise ValueError(msg)
+        return self._output_features
+
     @property
     def inputs_schema(self) -> list[InferenceFeature] | None:
         """Describe the policy's expected model inputs for export.
 
+        Derived from :attr:`input_features` (traced back from the dataset when
+        not provided explicitly at construction time).
+
         Returns:
             A list of feature descriptors covering the robot state, one image
             feature per camera view, and the language task. Returns ``None`` if
-            the underlying model or dataset stats have not been initialized yet.
+            the model or the input features have not been initialized yet.
+
+        Raises:
+            ValueError: If an input feature is missing a concrete shape.
         """
-        if self.model is None or self._dataset_stats is None:
+        if self.model is None or self._input_features is None:
             return None
 
-        dataset_stats = self._dataset_stats
-
-        num_image_features = sum(
-            1 for feature in dataset_stats.values() if str(FeatureType.VISUAL) in str(feature.get("type", ""))
-        )
+        num_image_features = sum(1 for feature in self._input_features if feature.ftype == FeatureType.VISUAL)
 
         schema: list[InferenceFeature] = []
-        for feature_id, feature in dataset_stats.items():
-            feature_type = str(feature.get("type", ""))
-            if STATE in feature_id:
+        for feature in self._input_features:
+            if feature.ftype not in {FeatureType.STATE, FeatureType.VISUAL}:
+                continue
+            if feature.shape is None:
+                msg = "input feature missing concrete shape for export"
+                raise ValueError(msg)
+            if feature.ftype == FeatureType.STATE:
                 schema.append(
                     InferenceFeature(
                         ftype=InferenceFeatureType.STATE,
-                        shape=cast("tuple", feature["shape"]),
+                        shape=tuple(feature.shape),
                         name=STATE,
                         dtype=InferenceFeatureDtype.FLOAT32,
                     ),
                 )
-            elif str(FeatureType.VISUAL) in feature_type:
-                feature_name = (
-                    str(feature.get("name", feature_id)).removeprefix("observation.").removeprefix(f"{IMAGES}.")
-                )
+            else:
+                feature_name = str(feature.name or "").removeprefix("observation.").removeprefix(f"{IMAGES}.")
                 name = IMAGES if num_image_features == 1 else f"{IMAGES}.{feature_name}"
                 schema.append(
                     InferenceFeature(
                         ftype=InferenceFeatureType.VISUAL,
-                        shape=cast("tuple", feature["shape"]),
+                        shape=tuple(feature.shape),
                         name=name,
                         dtype=InferenceFeatureDtype.FLOAT32,
                     ),
@@ -477,21 +676,34 @@ class XR0(ExportablePolicyMixin, Policy):
     def outputs_schema(self) -> list[InferenceFeature] | None:
         """Describe the policy's model output for export.
 
+        Derived from :attr:`output_features`. Returns ``None`` if the model or
+        the output features have not been initialized yet.
+
         Returns:
             A list with a single ``action`` feature of shape
-            ``(chunk_size, *action_dim)``, where ``action_dim`` is taken from the
-            dataset stats. Returns ``None`` if the underlying model or dataset
-            stats have not been initialized yet.
+            ``(chunk_size, *action_dim)``, where ``action_dim`` comes from the
+            action feature.
+
+        Raises:
+            ValueError: If the action feature is missing a concrete shape.
         """
-        if self.model is None or self._dataset_stats is None:
+        if self.model is None or self._output_features is None:
             return None
 
-        action_shape = cast("tuple", self._dataset_stats[ACTION]["shape"])
+        action_feature = next(
+            (feature for feature in self._output_features if feature.ftype == FeatureType.ACTION),
+            None,
+        )
+        if action_feature is None:
+            return None
+        if action_feature.shape is None:
+            msg = "output feature missing concrete shape for export"
+            raise ValueError(msg)
 
         return [
             InferenceFeature(
                 ftype=InferenceFeatureType.ACTION,
-                shape=(self.config.chunk_size, *action_shape),
+                shape=(self.config.chunk_size, *tuple(action_feature.shape)),
                 name=ACTION,
                 dtype=InferenceFeatureDtype.FLOAT32,
             ),
