@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 import torch
 
-from physicalai.data import Observation
+from physicalai.data import Feature, FeatureType, Observation
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK
 from physicalai.export import ExportBackend
 from physicalai.export.backends import TorchExportParameters
@@ -98,6 +98,39 @@ class TestXR0Policy:
             policy(obs)
 
 
+class TestXR0Features:
+    """Explicit input/output feature schema handling (no model download)."""
+
+    def test_requires_both_features(self) -> None:
+        state = Feature(name="state", ftype=FeatureType.STATE, shape=(8,))
+        with pytest.raises(ValueError, match="both input and output features"):
+            XR0(input_features=[state], output_features=None)
+
+    def test_feature_properties_raise_before_init(self) -> None:
+        policy = XR0()
+        with pytest.raises(ValueError, match="no input features"):
+            _ = policy.input_features
+        with pytest.raises(ValueError, match="no output features"):
+            _ = policy.output_features
+
+    def test_features_stats_roundtrip(self) -> None:
+        inputs = [
+            Feature(name="state", ftype=FeatureType.STATE, shape=(8,)),
+            Feature(name="base", ftype=FeatureType.VISUAL, shape=(3, 256, 256)),
+        ]
+        outputs = [Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(6,))]
+
+        stats = XR0._features_to_stats(inputs, outputs)
+        assert set(stats) == {"observation.state", "observation.base", ACTION}
+
+        recon_inputs, recon_outputs = XR0._stats_to_features(stats)
+        assert {f.name for f in recon_inputs} == {"state", "base"}
+        assert {f.ftype for f in recon_inputs} == {FeatureType.STATE, FeatureType.VISUAL}
+        assert [f.name for f in recon_outputs] == [ACTION]
+        assert recon_outputs[0].ftype is FeatureType.ACTION
+        assert recon_outputs[0].shape == (6,)
+
+
 class TestXR0Factory:
     """Policy factory registration."""
 
@@ -134,10 +167,14 @@ class TestXR0Export:
         untrimmed = XR0(chunk_size=30, n_action_steps=30).extra_export_args["torch"]
         assert all(spec.type != "action_chunk_trimmer" for spec in untrimmed.postprocessors_specs)
 
-    def test_inputs_schema_from_stats(self) -> None:
+    def test_inputs_schema_from_features(self) -> None:
         policy = XR0(chunk_size=30)
         policy.model = object()  # type: ignore[assignment]  # sentinel to bypass lazy-init guard
-        policy._dataset_stats = _minimal_export_stats()
+        # Set the features directly rather than via the constructor: passing
+        # input/output features to ``XR0(...)`` derives dataset stats from them,
+        # which triggers the eager model build (Qwen3-VL-4B download). Here we
+        # mimic that reconstructed schema without the build.
+        policy._input_features, policy._output_features = XR0._stats_to_features(_minimal_export_stats())
 
         schema = policy.inputs_schema
         assert schema is not None
@@ -148,10 +185,12 @@ class TestXR0Export:
         assert by_name[IMAGES].ftype is InferenceFeatureType.VISUAL
         assert by_name[TASK].ftype is InferenceFeatureType.LANGUAGE
 
-    def test_outputs_schema_from_stats(self) -> None:
+    def test_outputs_schema_from_features(self) -> None:
         policy = XR0(chunk_size=30)
         policy.model = object()  # type: ignore[assignment]  # sentinel to bypass lazy-init guard
-        policy._dataset_stats = _minimal_export_stats()
+        # Set features directly: passing them to ``XR0(...)`` would build dataset
+        # stats and trigger the eager model build (Qwen3-VL-4B download).
+        policy._input_features, policy._output_features = XR0._stats_to_features(_minimal_export_stats())
 
         schema = policy.outputs_schema
         assert schema is not None
@@ -159,3 +198,19 @@ class TestXR0Export:
         assert schema[0].name == ACTION
         assert schema[0].ftype is InferenceFeatureType.ACTION
         assert schema[0].shape == (30, 6)
+
+    def test_multi_camera_inputs_schema_names_views(self) -> None:
+        policy = XR0(chunk_size=30)
+        policy.model = object()  # type: ignore[assignment]  # sentinel to bypass lazy-init guard
+        # Set features directly: passing them to ``XR0(...)`` would build dataset
+        # stats and trigger the eager model build (Qwen3-VL-4B download).
+        policy._input_features = [
+            Feature(name="state", ftype=FeatureType.STATE, shape=(8,)),
+            Feature(name="base", ftype=FeatureType.VISUAL, shape=(3, 256, 256)),
+            Feature(name="wrist_left", ftype=FeatureType.VISUAL, shape=(3, 256, 256)),
+        ]
+        policy._output_features = [Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(6,))]
+
+        names = {feature.name for feature in policy.inputs_schema or []}
+        # Two cameras -> per-view names (no single-camera IMAGES collapse).
+        assert names == {STATE, f"{IMAGES}.base", f"{IMAGES}.wrist_left", TASK}

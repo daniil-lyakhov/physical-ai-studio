@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from physicalai.config import Config
+from physicalai.data import Feature  # noqa: TC001 - Needed at runtime for type hint resolution
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,13 @@ class XR0Config(Config):
         scheduler_decay_steps: Number of cosine decay steps. When ``None``,
             automatically set to the total training steps. Defaults to 30000.
         scheduler_decay_lr: Final learning rate after decay. Defaults to 5e-7.
+        input_features: Optional explicit observation feature schema
+            (``list[Feature]``). When ``None`` it is traced back from the
+            training dataset in :meth:`XR0.setup`. Must be provided together
+            with ``output_features``.
+        output_features: Optional explicit action feature schema
+            (``list[Feature]``). Must be provided together with
+            ``input_features``.
     """
 
     vlm_model_id: str = "Qwen/Qwen3-VL-4B-Instruct"
@@ -129,6 +137,9 @@ class XR0Config(Config):
     scheduler_warmup_steps: int = 2_000
     scheduler_decay_steps: int | None = 30_000
     scheduler_decay_lr: float = 5.0e-7
+
+    input_features: list[Feature] | None = None
+    output_features: list[Feature] | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration parameters after initialization.
