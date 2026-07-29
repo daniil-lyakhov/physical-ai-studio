@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from physicalai.data import Feature, FeatureType
 from physicalai.policies.xr0.config import XR0Config
 
 
@@ -25,6 +26,20 @@ def test_dict_roundtrip() -> None:
     cfg = XR0Config(chunk_size=16, n_action_steps=16, camera_views=("base",))
     restored = XR0Config.from_dict(cfg.to_dict())
     assert restored == cfg
+
+
+def test_dict_roundtrip_with_features() -> None:
+    """input_features / output_features survive a to_dict / from_dict round trip."""
+    cfg = XR0Config(
+        input_features=[Feature(name="state", ftype=FeatureType.STATE, shape=(8,))],
+        output_features=[Feature(name="action", ftype=FeatureType.ACTION, shape=(6,))],
+    )
+    restored = XR0Config.from_dict(cfg.to_dict())
+    assert restored == cfg
+    assert restored.input_features is not None
+    assert restored.input_features[0].ftype is FeatureType.STATE
+    assert restored.output_features is not None
+    assert restored.output_features[0].name == "action"
 
 
 def test_n_action_steps_bound() -> None:
