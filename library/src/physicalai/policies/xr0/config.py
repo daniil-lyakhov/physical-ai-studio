@@ -12,8 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from physicalai.config import Config
 from physicalai.data import Feature  # noqa: TC001 - Needed at runtime for type hint resolution
+from physicalai.training_config import Config
 
 
 @dataclass(frozen=True)

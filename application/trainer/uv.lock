@@ -2532,9 +2532,11 @@ requires-dist = [
     { name = "physicalai-train", extras = ["pi05"], marker = "extra == 'all'" },
     { name = "physicalai-train", extras = ["smolvla"], marker = "extra == 'all'" },
     { name = "physicalai-train", extras = ["tests"], marker = "extra == 'all'" },
+    { name = "physicalai-train", extras = ["xr0"], marker = "extra == 'all'" },
     { name = "pillow" },
     { name = "pillow", marker = "extra == 'groot'", specifier = ">=10.0.0,<13.0.0" },
     { name = "pillow", marker = "extra == 'pi0'", specifier = ">=10.0.0,<13.0.0" },
+    { name = "pillow", marker = "extra == 'xr0'", specifier = ">=10.0.0,<13.0.0" },
     { name = "pydantic" },
     { name = "pymunk", specifier = ">=6.6.0,<7.0.0" },
     { name = "pytest", marker = "extra == 'tests'" },
@@ -2544,6 +2546,7 @@ requires-dist = [
     { name = "safetensors", marker = "extra == 'groot'", specifier = ">=0.4.3,<1.0.0" },
     { name = "safetensors", marker = "extra == 'pi0'", specifier = ">=0.4.3,<1.0.0" },
     { name = "safetensors", marker = "extra == 'smolvla'", specifier = ">=0.4.3,<1.0.0" },
+    { name = "safetensors", marker = "extra == 'xr0'", specifier = ">=0.4.3,<1.0.0" },
     { name = "sentencepiece", marker = "extra == 'pi0'", specifier = "<=0.2.1" },
     { name = "timm", marker = "extra == 'groot'", specifier = ">=1.0.0,<1.1.0" },
     { name = "torch", marker = "extra == 'cpu'", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "physicalai-train", extra = "cpu" } },
@@ -2555,8 +2558,9 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'groot'", specifier = ">=5.5.0,<5.6.0" },
     { name = "transformers", marker = "extra == 'pi0'", specifier = ">=5.5.0,<5.6.0" },
     { name = "transformers", marker = "extra == 'smolvla'", specifier = ">=5.5.0,<5.6.0" },
+    { name = "transformers", marker = "extra == 'xr0'", specifier = ">=5.5.0,<5.6.0" },
 ]
-provides-extras = ["cpu", "cu128", "xpu", "tests", "libero", "diffusion", "pi0", "pi05", "groot", "smolvla", "executorch", "executorch-openvino", "all"]
+provides-extras = ["cpu", "cu128", "xpu", "tests", "libero", "diffusion", "pi0", "pi05", "groot", "smolvla", "xr0", "executorch", "executorch-openvino", "all"]
 
 [package.metadata.requires-dev]
 dev = [
