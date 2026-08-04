@@ -279,16 +279,6 @@ class XR0(ExportablePolicyMixin, Policy):
             stats=dataset_stats,
             processor_name=cfg.vlm_model_id,
         )
-        # Let the preprocessor build the 3D MRoPE ``position_ids`` eagerly so the
-        # exported model graph skips the VLM's non-traceable index builder.
-        self._preprocessor.set_position_id_fn(self.model.vlm.build_3d_position_ids)
-        # Likewise, run the vision tower eagerly so the exported graph consumes
-        # precomputed image embeddings instead of the non-traceable vision tower.
-        self._preprocessor.set_vision_encode_fn(self.model.vlm.encode_vision)
-        # Precompute the integer image-token positions so the exported graph
-        # scatters the visual embeddings by index (OpenVINO-friendly ``ScatterND``)
-        # instead of by boolean mask (unconvertible ``Where``).
-        self._preprocessor.set_image_index_fn(self.model.vlm.image_token_positions)
         self._dataset_stats = dataset_stats
 
         # When features were not provided (or traced from a dataset) yet,
@@ -401,6 +391,33 @@ class XR0(ExportablePolicyMixin, Policy):
         processed = self._preprocessor(batch.to(self.device).to_dict())
         actions = self.model.predict_action_chunk(processed)
         return self._postprocessor({ACTION: actions})[ACTION]
+
+    def prepare_ingraph_export(self, processed: dict[str, torch.Tensor]) -> None:
+        """Bake the fixed image geometry into the VLM for a self-contained export.
+
+        Enables in-graph export mode on the Qwen3-VL shim (see
+        :meth:`~physicalai.policies.xr0.vlm.XR0Qwen3VL.prepare_ingraph_export`) so
+        the exported graph runs the vision tower, injects the 3D MRoPE
+        ``position_ids`` and scatters the visual embeddings -- all inside the
+        graph. Call with a representative (right-padded) processed batch from the
+        preprocessor; the graph is then valid for any prompt padded to the same
+        length.
+
+        Args:
+            processed: A preprocessor output dict containing ``input_ids``,
+                ``attention_mask`` and ``image_grid_thw``.
+
+        Raises:
+            ValueError: If the model is not initialized.
+        """
+        if self.model is None:
+            msg = "Model is not initialized"
+            raise ValueError(msg)
+        self.model.vlm.prepare_ingraph_export(
+            processed["input_ids"],
+            processed["attention_mask"],
+            processed["image_grid_thw"],
+        )
 
     def training_step(self, batch: Observation, batch_idx: int) -> torch.Tensor:
         """Lightning training step.
@@ -723,27 +740,68 @@ class XR0(ExportablePolicyMixin, Policy):
     def extra_export_args(self) -> dict[str, ExportParameters]:
         """Additional export arguments for model conversion.
 
-        The reconstructed policy runs its own preprocessor/postprocessor during
-        Torch inference, so only lightweight input casting and optional action
-        trimming are declared here.
+        For the Torch backend the reconstructed policy runs its own
+        preprocessor/postprocessor, so only lightweight input casting and
+        optional action trimming are declared. For the self-contained OpenVINO
+        graph the whole XR0 pipeline is declared instead -- an
+        :class:`~physicalai.policies.xr0.inference.XR0InferencePreprocessor`
+        (Qwen3-VL tokenization + right-padding) and an
+        :class:`~physicalai.policies.xr0.inference.XR0InferencePostprocessor`
+        (action denormalization) -- so the Runtime ``InferenceModel`` can run the
+        exported model natively from ``manifest.json``. The OpenVINO entry is only
+        emitted once the model/postprocessor are initialized (their action
+        normalization stats are required to build the postprocessor spec).
 
         Returns:
             dict[str, ExportParameters]: A mapping from backend name to its export
-            parameters (Torch only).
+            parameters.
         """
-        torch_postproc_specs: list[ComponentSpec] = []
+        chunk_trimmer: ComponentSpec | None = None
         if self.config.chunk_size != self.config.n_action_steps:
-            torch_postproc_specs.append(
-                ComponentSpec(
-                    type="action_chunk_trimmer",
-                    n_action_steps=self.config.n_action_steps,
-                ),
+            chunk_trimmer = ComponentSpec(
+                type="action_chunk_trimmer",
+                n_action_steps=self.config.n_action_steps,
             )
 
-        return {
+        torch_postproc_specs: list[ComponentSpec] = []
+        if chunk_trimmer is not None:
+            torch_postproc_specs.append(chunk_trimmer)
+
+        extra_args: dict[str, ExportParameters] = {
             "torch": TorchExportParameters(
                 preprocessors_specs=[ComponentSpec(type="to_float_tensor")],
                 postprocessors_specs=torch_postproc_specs,
             ),
-            "openvino": OpenVINOExportParameters(via_onnx=True),
         }
+
+        if self.model is not None and self._postprocessor is not None:
+            cfg = self.config
+            ov_preproc = ComponentSpec(
+                class_path="physicalai.policies.xr0.inference.XR0InferencePreprocessor",
+                init_args={
+                    "camera_views": list(cfg.camera_views),
+                    "max_state_dim": cfg.max_state_dim,
+                    "max_action_dim": cfg.max_action_dim,
+                    "seq_len": cfg.tokenizer_max_length,
+                    "processor_name": cfg.vlm_model_id,
+                },
+            )
+            ov_postproc = ComponentSpec(
+                class_path="physicalai.policies.xr0.inference.XR0InferencePostprocessor",
+                init_args={
+                    "action_mean": self._postprocessor.action_mean.tolist(),
+                    "action_std": self._postprocessor.action_std.tolist(),
+                    "action_dim": self._postprocessor.action_dim,
+                },
+            )
+            ov_postproc_specs: list[ComponentSpec] = [ov_postproc]
+            if chunk_trimmer is not None:
+                ov_postproc_specs.append(chunk_trimmer)
+
+            extra_args["openvino"] = OpenVINOExportParameters(
+                via_onnx=True,
+                preprocessors_specs=[ov_preproc],
+                postprocessors_specs=ov_postproc_specs,
+            )
+
+        return extra_args

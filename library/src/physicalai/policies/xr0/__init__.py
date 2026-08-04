@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from .config import XR0Config
+from .inference import XR0InferencePostprocessor, XR0InferencePreprocessor
 from .model import XR0FlowModel
 from .policy import XR0
 from .preprocessor import XR0Postprocessor, XR0Preprocessor, make_xr0_preprocessors
@@ -22,6 +23,8 @@ __all__ = [
     "XR0",
     "XR0Config",
     "XR0FlowModel",
+    "XR0InferencePostprocessor",
+    "XR0InferencePreprocessor",
     "XR0Model",
     "XR0Postprocessor",
     "XR0Preprocessor",
