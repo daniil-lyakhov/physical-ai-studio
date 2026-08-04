@@ -18,15 +18,15 @@ from __future__ import annotations
 
 import json
 import logging
-import pickle  # noqa: S403  # only referenced for pickle.UnpicklingError in except; never used to deserialize
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import torch
 from safetensors.torch import load_file
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -111,58 +111,6 @@ def remap_xr0_state_dict(state_dict: Mapping[str, torch.Tensor]) -> dict[str, to
     return remapped
 
 
-def _unwrap_container(obj: object) -> Mapping[str, torch.Tensor]:
-    """Pull the tensor mapping out of a ``torch.load`` result.
-
-    Handles the DeepSpeed ``{"module": {...}}`` and Lightning
-    ``{"state_dict": {...}}`` wrappers.
-
-    Returns:
-        The underlying ``{name: tensor}`` mapping.
-
-    Raises:
-        TypeError: If a tensor mapping cannot be located.
-    """
-    if isinstance(obj, dict):
-        for wrapper_key in ("module", "state_dict"):
-            inner = obj.get(wrapper_key)
-            if isinstance(inner, dict):
-                return inner
-        if all(isinstance(v, torch.Tensor) for v in obj.values()):
-            return obj
-    msg = "Could not locate a tensor state dict in the checkpoint object"
-    raise TypeError(msg)
-
-
-def _torch_load_safe(path: Path) -> object:
-    """Load a ``.pt`` / ``.ckpt`` / ``.bin`` checkpoint without executing pickle.
-
-    Uses ``weights_only=True`` so only tensors and a safe allowlist of primitive
-    containers are unpickled -- arbitrary code embedded in a malicious checkpoint
-    is never executed. Legacy checkpoints that store non-tensor Python objects
-    cannot be loaded this way and must be converted to ``.safetensors`` first.
-
-    Args:
-        path: Local checkpoint file to load.
-
-    Returns:
-        The loaded object (typically a state dict or a wrapper dict).
-
-    Raises:
-        ValueError: If the checkpoint cannot be loaded safely because it relies
-            on arbitrary pickle contents; convert it to ``.safetensors`` instead.
-    """
-    try:
-        return torch.load(str(path), map_location="cpu", weights_only=True)
-    except (pickle.UnpicklingError, RuntimeError, AttributeError, ImportError, EOFError) as exc:
-        msg = (
-            f"Refusing to load {path} with unsafe pickle deserialization. The checkpoint stores "
-            "non-tensor Python objects and cannot be loaded with weights_only=True. Convert it "
-            "to .safetensors before loading."
-        )
-        raise ValueError(msg) from exc
-
-
 def _load_sharded_safetensors(index_file: Path) -> dict[str, torch.Tensor]:
     """Load a sharded ``*.safetensors`` checkpoint from its index json.
 
@@ -181,19 +129,16 @@ def _load_sharded_safetensors(index_file: Path) -> dict[str, torch.Tensor]:
 def _load_state_dict_from_dir(path: Path) -> Mapping[str, torch.Tensor]:
     """Load a raw state dict from a checkpoint *directory*.
 
-    Probes the known checkpoint layouts (DeepSpeed, sharded/single safetensors,
-    sharded/single ``.bin``/``.pt``) in priority order.
+    Probes the known safetensors layouts (a sharded checkpoint via its index
+    json, then a single ``model.safetensors``) in priority order. Pickle-based
+    checkpoints (DeepSpeed / ``.pt`` / ``.bin``) are not supported.
 
     Returns:
         The raw source state dict.
 
     Raises:
-        FileNotFoundError: If no recognized weights file is found.
+        FileNotFoundError: If no ``.safetensors`` weights file is found.
     """
-    deepspeed = path / "last.ckpt" / "checkpoint" / "mp_rank_00_model_states.pt"
-    if deepspeed.is_file():
-        return _unwrap_container(_torch_load_safe(deepspeed))
-
     safetensors_index = path / "model.safetensors.index.json"
     if safetensors_index.is_file():
         return _load_sharded_safetensors(safetensors_index)
@@ -202,37 +147,37 @@ def _load_state_dict_from_dir(path: Path) -> Mapping[str, torch.Tensor]:
     if single_safetensors.is_file():
         return load_file(str(single_safetensors))
 
-    bin_index = path / "pytorch_model.bin.index.json"
-    if bin_index.is_file():
-        with bin_index.open(encoding="utf-8") as f:
-            weight_map: dict[str, str] = json.load(f)["weight_map"]
-        state_dict: dict[str, torch.Tensor] = {}
-        for shard in sorted(set(weight_map.values())):
-            state_dict.update(_unwrap_container(_torch_load_safe(path / shard)))
-        return state_dict
-
-    for candidate in ("pytorch_model.bin", "pytorch_model.pt", "xr0_pretrained.pt"):
-        file = path / candidate
-        if file.is_file():
-            return _unwrap_container(_torch_load_safe(file))
-
-    msg = f"No recognized XR0 weights file found under {path}"
+    msg = (
+        f"No '.safetensors' XR0 weights file found under {path}. Pickle-based "
+        "('.pt'/'.ckpt'/'.bin') checkpoints are not supported; convert them to '.safetensors' first."
+    )
     raise FileNotFoundError(msg)
 
 
 def _load_raw_state_dict(path: Path) -> Mapping[str, torch.Tensor]:
     """Load a raw (un-remapped) state dict from a file or checkpoint directory.
 
-    Supports single ``.safetensors`` / ``.pt`` / ``.ckpt`` / ``.bin`` files, a
-    sharded HF snapshot directory, and a DeepSpeed checkpoint directory.
+    Supports a single ``.safetensors`` file or a safetensors checkpoint
+    directory (sharded via an index json, or a single ``model.safetensors``).
+    Pickle-based ``.pt`` / ``.ckpt`` / ``.bin`` checkpoints are not supported;
+    convert them to ``.safetensors`` first.
 
     Returns:
         The raw source state dict.
+
+    Raises:
+        ValueError: If a single-file checkpoint is not a ``.safetensors`` file.
     """
     if path.is_file():
-        if path.suffix == ".safetensors":
-            return load_file(str(path))
-        return _unwrap_container(_torch_load_safe(path))
+        if path.suffix != ".safetensors":
+            msg = (
+                f"Unsupported single-file checkpoint '{path}' (suffix '{path.suffix}'). "
+                "Only '.safetensors' files can be loaded directly; convert pickle-based "
+                "'.pt'/'.ckpt'/'.bin' checkpoints to '.safetensors', or pass the checkpoint "
+                "directory instead."
+            )
+            raise ValueError(msg)
+        return load_file(str(path))
     return _load_state_dict_from_dir(path)
 
 
@@ -264,9 +209,8 @@ def resolve_pretrained_path(pretrained_name_or_path: str | Path, **kwargs: objec
             "Pass revision=<commit-sha> for a pinned, reproducible download.",
             pretrained_name_or_path,
         )
-    # Only allow safe (non-pickle) formats to be downloaded. ``.bin`` / ``.pt``
-    # checkpoints are supported solely for pre-existing local paths, where the
-    # user already controls the file. See ``_load_raw_state_dict``.
+    # Only download safe (non-pickle) safetensors weights and json config.
+    # Pickle-based ``.bin`` / ``.pt`` / ``.ckpt`` checkpoints are not supported.
     local = snapshot_download(
         repo_id=str(pretrained_name_or_path),
         allow_patterns=[

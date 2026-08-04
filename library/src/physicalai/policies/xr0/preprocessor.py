@@ -47,6 +47,10 @@ _ASSISTANT_PRIMER = "<cot></cot>"
 _TEMPORAL_STATE_NDIM = 3
 _TEMPORAL_IMAGE_NDIM = 5
 
+# Pinned Qwen3-VL processor revision for reproducible and secure downloads
+# (commit on the "Qwen/Qwen3-VL-4B-Instruct" repo).
+_QWEN3_VL_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+
 # View titles the model was trained with (Xiaomi reference server prompt in
 # deploy/server.py), e.g. "wrist_left" -> "Left-Wrist" so the prompt reads
 # "# Left-Wrist View". A plain capitalize would wrongly yield "Wrist Left".
@@ -174,7 +178,8 @@ class XR0Preprocessor(torch.nn.Module):
             except ImportError as exc:
                 msg = "XR0 preprocessing requires transformers. Install with: uv pip install transformers"
                 raise ImportError(msg) from exc
-            self._processor = AutoProcessor.from_pretrained(self.processor_name)
+            # Revision pinned for reproducibility and security
+            self._processor = AutoProcessor.from_pretrained(self.processor_name, revision=_QWEN3_VL_REVISION)
             self._processor.tokenizer.padding_side = "right"
         return self._processor
 
