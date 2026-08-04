@@ -105,6 +105,14 @@ smolvla = [
     "safetensors>=0.4.3,<1.0.0",
 ]
 
+# Xiaomi-Robotics-0 (XR0) foundation model
+# Requires a Qwen3-VL backbone (transformers>=5.5.0 ships the qwen3_vl models)
+xr0 = [
+    "transformers>=5.5.0,<5.6.0",
+    "safetensors>=0.4.3,<1.0.0",
+    "Pillow>=10.0.0,<13.0.0",
+]
+
 # ExecuTorch runtime for edge/mobile deployment
 executorch = ["executorch>=1.1.0"]
 
@@ -119,6 +127,7 @@ all = [
     "physicalai-train[pi05]",
     "physicalai-train[groot]",
     "physicalai-train[smolvla]",
+    "physicalai-train[xr0]",
 ]
 
 # Contribute Torch and ExecuTorch as inference backends to the registry
@@ -195,7 +204,7 @@ explicit = false
 
 # PyTorch sources configuration
 [tool.uv.sources]
-physicalai = { git = "https://github.com/openvinotoolkit/physicalai.git", rev = "08fcd96389fa9e326946df6affc5c19c4c731633" }
+physicalai = { git = "https://github.com/openvinotoolkit/physicalai.git", rev = "3e163cfebc5f0fe6d97a6e792b4b0a55614d9a44" }
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "cu128" },

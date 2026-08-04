@@ -13,30 +13,28 @@ from .lerobot import get_lerobot_policy
 from .pi0 import Pi0, Pi0Config, Pi0Model
 from .pi05 import Pi05, Pi05Config, Pi05Model
 from .smolvla import SmolVLA, SmolVLAConfig, SmolVLAModel
+from .xr0 import XR0, XR0Config, XR0Model
 
 __all__ = [
-    # ACT
     "ACT",
+    "XR0",
     "ACTConfig",
     "ACTModel",
-    # Groot
     "Groot",
     "GrootConfig",
     "GrootModel",
-    # Pi0
     "Pi0",
     "Pi0Config",
     "Pi0Model",
     "Pi05",
     "Pi05Config",
     "Pi05Model",
-    # Base
     "Policy",
-    # SmolVLA
     "SmolVLA",
     "SmolVLAConfig",
     "SmolVLAModel",
-    # Utils
+    "XR0Config",
+    "XR0Model",
     "get_physicalai_policy_class",
     "get_policy",
     "lerobot",
@@ -51,7 +49,7 @@ def get_policy(policy_name: str, *, source: str = "physicalai", **kwargs) -> Pol
 
     Args:
         policy_name: Name of the policy to create. Supported values depend on source:
-            - physicalai: "act", "dummy", "groot", "pi0", "pi05", "smolvla"
+            - physicalai: "act", "dummy", "groot", "pi0", "pi05", "smolvla", "xr0"
             - lerobot: "act", "diffusion", "smolvla", "pi0", "pi05", "pi0_fast", "groot", "xvla"
         source: Where the policy implementation comes from. Options:
             - "physicalai": First-party implementations (default)
@@ -139,5 +137,7 @@ def get_physicalai_policy_class(policy_name: str) -> type[Policy]:
         return Pi05
     if policy_name == "smolvla":
         return SmolVLA
-    msg = f"Unknown physicalai policy: {policy_name}. Supported policies: act, dummy, groot, pi0, pi05, smolvla"
+    if policy_name == "xr0":
+        return XR0
+    msg = f"Unknown physicalai policy: {policy_name}. Supported policies: act, groot, pi0, pi05, smolvla, xr0"
     raise ValueError(msg)

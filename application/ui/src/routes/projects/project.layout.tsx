@@ -17,23 +17,26 @@ import {
 import { Manifest } from '@geti-ui/ui/icons';
 import { Outlet, useLocation } from 'react-router';
 
+import { featureFlags } from '../../config/feature-flags';
 import { JobStatus } from '../../features/jobs/footer/job-status';
 import { LogsDialog } from '../../features/logs/logs-dialog';
 import { ProjectsListPanel } from '../../features/projects/menu/projects-list-panel.component';
 import { useProjectId } from '../../features/projects/use-project';
 import { paths } from '../../router';
-import { ReactComponent as DatasetIcon } from './../../assets/icons/dataset-icon.svg';
-import { ReactComponent as ModelsIcon } from './../../assets/icons/models-icon.svg';
-import { ReactComponent as RobotIcon } from './../../assets/icons/robot-icon.svg';
+import { ReactComponent as PhysicalAIStudioLogo } from './../../assets/icons/physicalai-studio-logo.svg';
+import { getMainPageInProjectUrl } from './project-navigation';
 
 const Header = ({ project_id }: { project_id: string }) => {
     return (
         <View backgroundColor={'gray-300'} gridArea={'header'}>
             <Flex height='100%' alignItems={'center'} marginX='1rem' gap='size-200'>
-                <Link href='/' isQuiet variant='overBackground'>
-                    <View marginEnd='size-200' maxWidth={'10ch'}>
-                        <span style={{ whiteSpace: 'nowrap' }}>Physical AI</span> <span>Studio</span>
-                    </View>
+                <Link href='/' isQuiet variant='overBackground' marginEnd='size-200'>
+                    <Flex gap='size-200' alignItems={'center'}>
+                        <PhysicalAIStudioLogo />
+                        <span style={{ whiteSpace: 'nowrap', fontWeight: 'bold', textDecoration: 'none' }}>
+                            Physical AI Studio
+                        </span>
+                    </Flex>
                 </Link>
 
                 <TabList
@@ -44,28 +47,38 @@ const Header = ({ project_id }: { project_id: string }) => {
                         '--spectrum-tabs-selection-indicator-color': 'var(--energy-blue)',
                     }}
                 >
-                    <Item
-                        textValue='Robot configuration'
-                        key={'robots'}
-                        href={paths.project.robots.index({ project_id })}
-                    >
-                        <Flex alignItems='center' gap='size-100'>
-                            <RobotIcon />
-                            Robots
-                        </Flex>
-                    </Item>
-                    <Item textValue='Datasets' key={'datasets'} href={paths.project.datasets.index({ project_id })}>
-                        <Flex alignItems='center' gap='size-100'>
-                            <DatasetIcon />
-                            Datasets
-                        </Flex>
-                    </Item>
-                    <Item textValue='Models' key={'models'} href={paths.project.models.index({ project_id })}>
-                        <Flex alignItems='center' gap='size-100'>
-                            <ModelsIcon />
-                            Models
-                        </Flex>
-                    </Item>
+                    {[
+                        <Item
+                            textValue='Robot configuration'
+                            key={'robots'}
+                            href={paths.project.robots.index({ project_id })}
+                        >
+                            <Flex alignItems='center' gap='size-100'>
+                                Robots
+                            </Flex>
+                        </Item>,
+                        <Item textValue='Datasets' key={'datasets'} href={paths.project.datasets.index({ project_id })}>
+                            <Flex alignItems='center' gap='size-100'>
+                                Datasets
+                            </Flex>
+                        </Item>,
+                        <Item textValue='Models' key={'models'} href={paths.project.models.index({ project_id })}>
+                            <Flex alignItems='center' gap='size-100'>
+                                Models
+                            </Flex>
+                        </Item>,
+                        ...(featureFlags.remoteTrainers
+                            ? [
+                                  <Item
+                                      textValue='Remote Trainers'
+                                      key={'remote-servers'}
+                                      href={paths.project.remoteServers.index({ project_id })}
+                                  >
+                                      Remote Trainers
+                                  </Item>,
+                              ]
+                            : []),
+                    ]}
                 </TabList>
                 <Flex alignItems={'center'} height={'100%'} marginStart='auto' gap='size-100'>
                     <ProjectsListPanel />
@@ -75,25 +88,11 @@ const Header = ({ project_id }: { project_id: string }) => {
     );
 };
 
-const getMainPageInProjectUrl = (pathname: string) => {
-    const regexp = /\/projects\/[\w-]*\/([\w-]*)/g;
-    const found = [...pathname.matchAll(regexp)];
-    if (found.length) {
-        const [, main] = found[0];
-        if (main === 'cameras' || main === 'environments') {
-            return 'robots';
-        }
-        return main;
-    } else {
-        return 'datasets';
-    }
-};
-
 const Footer = () => {
     return (
         <View
             gridArea={'footer'}
-            borderTopColor={'gray-75'}
+            borderTopColor={'gray-300'}
             borderTopWidth={'thin'}
             borderBottomColor={'gray-75'}
             borderBottomWidth={'thin'}
@@ -101,7 +100,7 @@ const Footer = () => {
             paddingY='size-25'
         >
             <Flex alignItems={'center'} height='100%' gap='size-100'>
-                <View>
+                <View overflow={'hidden'}>
                     <DialogTrigger type='fullscreen'>
                         <ActionButton
                             isQuiet
@@ -137,7 +136,7 @@ export const ProjectLayout = () => {
                 UNSAFE_style={{
                     gridTemplateRows:
                         // eslint-disable-next-line max-len
-                        'var(--spectrum-global-dimension-size-800, 4rem) min-content auto var(--spectrum-global-dimension-size-400)',
+                        'var(--spectrum-global-dimension-size-800, 4rem) min-content minmax(0, 1fr) var(--spectrum-global-dimension-size-400)',
                 }}
                 minHeight={0}
                 height={'100%'}
