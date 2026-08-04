@@ -17,7 +17,7 @@ from physicalai.inference.manifest import ComponentSpec
 from physicalai.data.dataset import Dataset
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Feature, FeatureType, NormalizationParameters
 from physicalai.export import ExportablePolicyMixin, ExportBackend
-from physicalai.export.backends import ExportParameters, TorchExportParameters
+from physicalai.export.backends import ExportParameters, TorchExportParameters, OpenVINOExportParameters
 from physicalai.policies.base import Policy
 from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
@@ -279,6 +279,16 @@ class XR0(ExportablePolicyMixin, Policy):
             stats=dataset_stats,
             processor_name=cfg.vlm_model_id,
         )
+        # Let the preprocessor build the 3D MRoPE ``position_ids`` eagerly so the
+        # exported model graph skips the VLM's non-traceable index builder.
+        self._preprocessor.set_position_id_fn(self.model.vlm.build_3d_position_ids)
+        # Likewise, run the vision tower eagerly so the exported graph consumes
+        # precomputed image embeddings instead of the non-traceable vision tower.
+        self._preprocessor.set_vision_encode_fn(self.model.vlm.encode_vision)
+        # Precompute the integer image-token positions so the exported graph
+        # scatters the visual embeddings by index (OpenVINO-friendly ``ScatterND``)
+        # instead of by boolean mask (unconvertible ``Where``).
+        self._preprocessor.set_image_index_fn(self.model.vlm.image_token_positions)
         self._dataset_stats = dataset_stats
 
         # When features were not provided (or traced from a dataset) yet,
@@ -735,4 +745,5 @@ class XR0(ExportablePolicyMixin, Policy):
                 preprocessors_specs=[ComponentSpec(type="to_float_tensor")],
                 postprocessors_specs=torch_postproc_specs,
             ),
+            "openvino": OpenVINOExportParameters(via_onnx=True),
         }
