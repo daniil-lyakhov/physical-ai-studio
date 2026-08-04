@@ -83,6 +83,8 @@ class XR0(ExportablePolicyMixin, Policy):
         compile_model: Whether to use torch.compile.
         compile_mode: Torch compile mode.
         freeze_vision_encoder: Freeze the vision encoder.
+        freeze_input_embeddings: Freeze the VLM token-embedding table (matches
+            the original XR0 recipe; saves the embedding grads/optimizer state).
         normalization_mode: Normalization method for state/action features.
         optimizer_lr: Learning rate.
         optimizer_betas: Adam beta coefficients.
@@ -140,6 +142,7 @@ class XR0(ExportablePolicyMixin, Policy):
         compile_model: bool = False,
         compile_mode: str = "max-autotune",
         freeze_vision_encoder: bool = False,
+        freeze_input_embeddings: bool = True,
         normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES",
         optimizer_lr: float = 1.0e-4,
         optimizer_betas: tuple[float, float] = (0.9, 0.95),
@@ -195,6 +198,7 @@ class XR0(ExportablePolicyMixin, Policy):
             compile_model=compile_model,
             compile_mode=compile_mode,
             freeze_vision_encoder=freeze_vision_encoder,
+            freeze_input_embeddings=freeze_input_embeddings,
             normalization_mode=normalization_mode,
             optimizer_lr=optimizer_lr,
             optimizer_betas=optimizer_betas,
@@ -266,6 +270,9 @@ class XR0(ExportablePolicyMixin, Policy):
             enable_freq=cfg.enable_freq,
             prefix_mask_prob=cfg.prefix_mask_prob,
             async_train=cfg.async_train,
+            gradient_checkpointing=cfg.gradient_checkpointing,
+            freeze_vision_encoder=cfg.freeze_vision_encoder,
+            freeze_input_embeddings=cfg.freeze_input_embeddings,
             dtype=_DTYPES[cfg.dtype],
         )
 
@@ -406,14 +413,30 @@ class XR0(ExportablePolicyMixin, Policy):
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure the AdamW optimizer and cosine-decay-with-warmup scheduler.
 
+        Mirrors Xiaomi's XR0 training recipe: weight decay is disabled for bias,
+        normalization, rotary-embedding, and AdaLN parameters, and applied to the
+        rest.
+
         Returns:
             Dict with optimizer and lr_scheduler config.
         """
-        params = [p for p in self.parameters() if p.requires_grad]
+        no_decay = ("bias", "norm", "ln", "rotary_emb", "adaln")
+        decay_params: list[torch.nn.Parameter] = []
+        no_decay_params: list[torch.nn.Parameter] = []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(token in name.lower() for token in no_decay):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
         optimizer = torch.optim.AdamW(
-            params,
+            [
+                {"params": decay_params, "weight_decay": self.config.optimizer_weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
             lr=self.config.optimizer_lr,
-            weight_decay=self.config.optimizer_weight_decay,
             betas=self.config.optimizer_betas,
             eps=self.config.optimizer_eps,
         )
@@ -430,6 +453,7 @@ class XR0(ExportablePolicyMixin, Policy):
             num_warmup_steps=self.config.scheduler_warmup_steps,
             num_decay_steps=num_decay_steps,
             num_training_steps=num_training_steps,
+            decay_from_warmup_end=True,
         )
         return {
             "optimizer": optimizer,
