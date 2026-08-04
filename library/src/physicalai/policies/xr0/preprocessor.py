@@ -37,7 +37,7 @@ from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Observation
 from .io import ACTION_EPS, resize_image
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +132,58 @@ class XR0Preprocessor(torch.nn.Module):
         self.image_max_pixels = image_max_pixels
         self.processor_name = processor_name
         self._processor: Any = None
+        # Optional callable that builds the 3D MRoPE ``position_ids`` eagerly
+        # (see :meth:`set_position_id_fn`). Stored as a plain attribute -- a
+        # bound method, not an ``nn.Module`` -- so it is not registered as a
+        # submodule / moved by ``.to()`` / serialized in ``state_dict``.
+        self._position_id_fn: Callable[..., torch.Tensor] | None = None
+        # Optional callable that runs the VLM vision tower eagerly (see
+        # :meth:`set_vision_encode_fn`). Same rationale for storing a bound method.
+        self._vision_encode_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None
+        # Optional callable that returns the integer image-token positions (see
+        # :meth:`set_image_index_fn`). Same rationale for storing a bound method.
+        self._image_index_fn: Callable[..., torch.Tensor] | None = None
 
         mean, std = self._action_stats(features)
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
+
+    def set_position_id_fn(self, fn: Callable[..., torch.Tensor] | None) -> None:
+        """Register the callable used to precompute the 3D MRoPE ``position_ids``.
+
+        The XR0 VLM computes its MRoPE ``position_ids`` with data-dependent Python
+        control flow that ``torch.export`` cannot trace. Computing them eagerly in
+        the preprocessor (which always runs outside the traced graph) and passing
+        them into the model lets the VLM skip that path during export while
+        staying numerically identical at inference. Pass ``None`` to disable.
+        """
+        self._position_id_fn = fn
+
+    def set_vision_encode_fn(self, fn: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None) -> None:
+        """Register the callable used to precompute the vision-tower embeddings.
+
+        The Qwen3-VL vision tower derives token geometry from ``image_grid_thw``
+        contents, which ``torch.export`` cannot trace. Running it eagerly here and
+        passing ``image_embeds`` / ``deepstack_embeds`` into the model lets the
+        exported graph skip the vision tower while staying numerically identical
+        at inference. When set, ``forward`` emits ``image_embeds`` /
+        ``deepstack_embeds`` instead of ``pixel_values`` / ``image_grid_thw``.
+        Pass ``None`` to disable.
+        """
+        self._vision_encode_fn = fn
+
+    def set_image_index_fn(self, fn: Callable[..., torch.Tensor] | None) -> None:
+        """Register the callable used to precompute the image-token positions.
+
+        The stock Qwen3-VL visual merge / deepstack code scatters embeddings with
+        boolean-mask assignment, which ``torch.export`` lowers to an
+        OpenVINO-hostile ``Where``. The exported graph instead scatters by integer
+        index (``index_copy`` -> ``ScatterND``); those indices are data-dependent
+        (:func:`torch.nonzero`) so they are computed eagerly here and passed into
+        the model as ``image_token_indices``. Only used together with
+        :meth:`set_vision_encode_fn`. Pass ``None`` to disable.
+        """
+        self._image_index_fn = fn
 
     def _action_stats(self, features: dict[str, Feature] | None) -> tuple[torch.Tensor, torch.Tensor]:
         """Build padded ``(max_action_dim,)`` mean/std buffers from action features.
@@ -297,6 +345,34 @@ class XR0Preprocessor(torch.nn.Module):
             "image_grid_thw": encoded["image_grid_thw"].to(device),
             "state": self._prepare_state(batch, device),
         }
+
+        # Precompute the 3D MRoPE ``position_ids`` eagerly so the exported model
+        # graph never has to run the VLM's data-dependent (non-traceable) index
+        # builder. At inference this yields the same ids the VLM would compute.
+        if self._position_id_fn is not None:
+            out["position_ids"] = self._position_id_fn(
+                input_ids=out["input_ids"],
+                attention_mask=out["attention_mask"],
+                image_grid_thw=out["image_grid_thw"],
+            ).to(device)
+
+        # Precompute the vision-tower embeddings eagerly for the same reason and
+        # drop the raw pixel inputs so the exported graph consumes the embeddings
+        # directly instead of the non-traceable vision tower.
+        if self._vision_encode_fn is not None:
+            image_embeds, deepstack_embeds = self._vision_encode_fn(
+                out["pixel_values"],
+                out["image_grid_thw"],
+            )
+            out.pop("pixel_values")
+            out.pop("image_grid_thw")
+            out["image_embeds"] = image_embeds.to(device)
+            out["deepstack_embeds"] = deepstack_embeds.to(device)
+            # Precompute the integer image-token positions so the exported graph
+            # can scatter the visual embeddings by index (OpenVINO-friendly
+            # ``ScatterND``) instead of by boolean mask (unconvertible ``Where``).
+            if self._image_index_fn is not None:
+                out["image_token_indices"] = self._image_index_fn(out["input_ids"]).to(device)
 
         if ACTION in batch and batch[ACTION] is not None:
             action, action_mask = self._prepare_action(batch[ACTION], device)

@@ -54,7 +54,7 @@ conflicts = [[
 ]]
 
 [options]
-exclude-newer = "2026-07-24T12:19:43.313057644Z"
+exclude-newer = "2026-07-24T12:31:48.027331152Z"
 exclude-newer-span = "P7D"
 
 [manifest]
