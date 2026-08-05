@@ -368,6 +368,8 @@ class LiberoGym(Gym):
         # Apply init state if available
         if self.init_states and self._init_states is not None:
             raw_obs = self.env.set_init_state(self._init_states[self._init_state_id])
+            # Advance to the next init state, wrapping around modulo the number of available init states.
+            self._init_state_id = (self._init_state_id + 1) % len(self._init_states)
 
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
         # Step the simulator with a no-op action for a few frames so everything settles.
