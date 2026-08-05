@@ -70,6 +70,27 @@ input_sample = {
     if name != "image_grid_thw" and isinstance(tensor, torch.Tensor)
 }
 
+# The DiT/action-expert stack uses transformers' ``Qwen2RMSNorm``, whose forward
+# reduces with ``hidden_states.pow(2).mean(-1, keepdim=True)``. The OpenVINO
+# PyTorch frontend mis-materializes that *negative* reduction axis into a garbage
+# ReduceMean axis constant, so loading the exported IR fails with
+# "Axis -3221225472 out of the tensor rank range". Patch the norm to reduce over a
+# *positive, static* axis (``ndim - 1`` is a concrete int during tracing) so the
+# frontend emits a valid axis constant. Numerically identical to the original.
+#from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm  # noqa: E402
+#
+#
+#def _rmsnorm_forward_positive_axis(self: Qwen2RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
+#    input_dtype = hidden_states.dtype
+#    hidden_states = hidden_states.to(torch.float32)
+#    axis = hidden_states.dim() - 1  # concrete positive int -> clean ReduceMean axis
+#    variance = hidden_states.pow(2).mean(axis, keepdim=True)
+#    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+#    return self.weight * hidden_states.to(input_dtype)
+#
+#
+#Qwen2RMSNorm.forward = _rmsnorm_forward_positive_axis
+
 policy.to_openvino("xr0_ir", input_sample=input_sample)
 
 # The DiT action head runs in bf16, so the exported ``action`` output is bf16 --

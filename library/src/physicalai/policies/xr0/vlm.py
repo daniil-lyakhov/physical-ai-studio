@@ -32,6 +32,259 @@ if TYPE_CHECKING:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
 
 
+# --------------------------------------------------------------------------- #
+# Export-friendly reimplementations of the stock Qwen3-VL ops.                 #
+#                                                                             #
+# Each of these is numerically identical to a stock ``transformers`` op but   #
+# expressed so ``torch.export`` / OpenVINO can convert it. They are           #
+# module-level (not closures) so each can be unit-tested in isolation against #
+# its stock counterpart; ``XR0Qwen3VL._ensure_export_patch`` installs them.   #
+# --------------------------------------------------------------------------- #
+
+
+def export_rot_pos_emb(visual: torch.nn.Module, grid_thw_list: list[list[int]]) -> torch.Tensor:
+    """Vision rotary position embeddings driven by a *Python* grid list.
+
+    Numerically identical to stock ``Qwen3VLVisionModel.rot_pos_emb``, but it
+    iterates over the Python constant ``grid_thw_list`` instead of
+    ``grid_thw.tolist()``. Under ``torch.export`` the baked ``grid_thw`` buffer is
+    a lifted tensor input, so ``.tolist()`` would yield unbacked symints and the
+    per-image ``arange`` / ``reshape`` shapes could not be resolved; the constant
+    ints keep every shape concrete. For each image it enumerates the (row, col)
+    patch coordinates in ``spatial_merge_size`` blocks, gathers their rotary
+    frequencies from the shared table and flattens them.
+
+    Args:
+        visual: The vision tower (reads ``spatial_merge_size`` and ``rotary_pos_emb``).
+        grid_thw_list: Per-image ``[t, h, w]`` geometry as plain Python ints.
+
+    Returns:
+        The flattened rotary position embeddings for all vision patches.
+    """
+    merge_size = visual.spatial_merge_size
+
+    max_hw = max(max(h, w) for _, h, w in grid_thw_list)
+    freq_table = visual.rotary_pos_emb(max_hw)
+    device = freq_table.device
+
+    total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
+    pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+    offset = 0
+    for num_frames, height, width in grid_thw_list:
+        # Patch coordinates are laid out in spatial_merge_size x spatial_merge_size
+        # blocks (matching how the merger later folds neighbouring patches
+        # together), so build row/col indices as block-offset + intra-block-offset.
+        merged_h, merged_w = height // merge_size, width // merge_size
+        block_rows = torch.arange(merged_h, device=device)
+        block_cols = torch.arange(merged_w, device=device)
+        intra_row = torch.arange(merge_size, device=device)
+        intra_col = torch.arange(merge_size, device=device)
+        row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
+        col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
+        row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+        col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+        coords = torch.stack((row_idx, col_idx), dim=-1)
+        if num_frames > 1:
+            # Temporal frames share the same spatial grid, so repeat it.
+            coords = coords.repeat(num_frames, 1)
+        num_tokens = coords.shape[0]
+        pos_ids[offset : offset + num_tokens] = coords
+        offset += num_tokens
+
+    embeddings = freq_table[pos_ids]
+    return embeddings.flatten(1)
+
+
+def export_fast_pos_embed_interpolate(visual: torch.nn.Module, grid_thw_list: list[list[int]]) -> torch.Tensor:
+    """Bilinearly interpolate the learned position embeddings to the grid.
+
+    Numerically identical to stock ``Qwen3VLVisionModel.fast_pos_embed_interpolate``,
+    but driven by the Python constant ``grid_thw_list`` so the per-image
+    ``torch.linspace(0, num_grid_per_side - 1, h)`` calls take concrete sizes.
+    Under ``torch.export`` those ``linspace`` bounds come from ``grid_thw`` (a
+    lifted tensor input via ``.tolist()``), which triggers a data-dependent guard;
+    the constant ints avoid it. For each image it maps the target ``h x w`` grid
+    onto the learned ``num_grid_per_side`` grid, gathers the four surrounding
+    embeddings and blends them with the fractional ``(dh, dw)`` bilinear weights,
+    then reorders the patches into ``spatial_merge_size`` blocks.
+
+    Args:
+        visual: The vision tower (reads ``num_grid_per_side``, ``pos_embed`` and
+            ``config.spatial_merge_size``).
+        grid_thw_list: Per-image ``[t, h, w]`` geometry as plain Python ints.
+
+    Returns:
+        The interpolated position embeddings for all vision patches.
+    """
+    grid_ts = [row[0] for row in grid_thw_list]
+    grid_hs = [row[1] for row in grid_thw_list]
+    grid_ws = [row[2] for row in grid_thw_list]
+    device = visual.pos_embed.weight.device
+
+    # Four accumulators = the four bilinear corners (floor/ceil x floor/ceil) of
+    # the learned-grid neighbours for every target patch.
+    idx_list: list[list[float]] = [[] for _ in range(4)]
+    weight_list: list[list[float]] = [[] for _ in range(4)]
+
+    for _t, h, w in grid_thw_list:
+        # Sample positions on the learned grid for the target h/w axes.
+        h_idxs = torch.linspace(0, visual.num_grid_per_side - 1, h)
+        w_idxs = torch.linspace(0, visual.num_grid_per_side - 1, w)
+        h_idxs_floor = h_idxs.int()
+        w_idxs_floor = w_idxs.int()
+        h_idxs_ceil = (h_idxs.int() + 1).clip(max=visual.num_grid_per_side - 1)
+        w_idxs_ceil = (w_idxs.int() + 1).clip(max=visual.num_grid_per_side - 1)
+        # Fractional distances -> bilinear interpolation weights.
+        dh = h_idxs - h_idxs_floor
+        dw = w_idxs - w_idxs_floor
+        base_h = h_idxs_floor * visual.num_grid_per_side
+        base_h_ceil = h_idxs_ceil * visual.num_grid_per_side
+        indices = [
+            (base_h[None].T + w_idxs_floor[None]).flatten(),
+            (base_h[None].T + w_idxs_ceil[None]).flatten(),
+            (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+            (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+        ]
+        weights = [
+            ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+            ((1 - dh)[None].T * dw[None]).flatten(),
+            (dh[None].T * (1 - dw)[None]).flatten(),
+            (dh[None].T * dw[None]).flatten(),
+        ]
+        for i in range(4):
+            idx_list[i].extend(indices[i].tolist())
+            weight_list[i].extend(weights[i].tolist())
+
+    idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
+    weight_tensor = torch.tensor(weight_list, dtype=visual.pos_embed.weight.dtype, device=device)
+    # Blend the four gathered corners with their bilinear weights.
+    pos_embeds = visual.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
+    patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+    patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
+
+    # Reorder each image's patches into spatial_merge_size blocks so they line up
+    # with the tower's merged token ordering.
+    patch_pos_embeds_permute = []
+    merge_size = visual.config.spatial_merge_size
+    for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+        pos_embed = pos_embed.repeat(t, 1)
+        pos_embed = (
+            pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
+            .permute(0, 1, 3, 2, 4, 5)
+            .flatten(0, 4)
+        )
+        patch_pos_embeds_permute.append(pos_embed)
+    return torch.cat(patch_pos_embeds_permute)
+
+
+def export_vision_attn_forward(
+    attn: torch.nn.Module,
+    split_sizes: list[int],
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Export-friendly vision attention for one block.
+
+    Numerically identical to stock ``Qwen3VLVisionAttention.forward`` (non-flash
+    path), but it splits the per-image attention windows by the constant Python
+    ``split_sizes`` instead of ``lengths.tolist()`` (derived from ``cu_seqlens``,
+    which yields unbacked symints under ``torch.export``) and calls SDPA directly.
+    The shared attention interface passes ``enable_gqa=True``, which the ONNX
+    exporter rejects unless ``q_heads > kv_heads``; the vision tower has equal
+    q/kv heads, so a plain SDPA is numerically identical.
+
+    Args:
+        attn: The vision attention module (reads ``qkv``, ``proj``, ``num_heads``,
+            ``scaling``).
+        split_sizes: Per-window token counts summing to the sequence length.
+        hidden_states: ``(seq_len, dim)`` input hidden states.
+        position_embeddings: The ``(cos, sin)`` rotary embeddings.
+
+    Returns:
+        The ``(seq_len, dim)`` attention output.
+    """
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
+
+    seq_length = hidden_states.shape[0]
+    query_states, key_states, value_states = (
+        attn.qkv(hidden_states).reshape(seq_length, 3, attn.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+    )
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+    query_states = query_states.transpose(0, 1).unsqueeze(0)
+    key_states = key_states.transpose(0, 1).unsqueeze(0)
+    value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+    splits = [torch.split(tensor, split_sizes, dim=2) for tensor in (query_states, key_states, value_states)]
+    attn_outputs = [
+        torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=attn.scaling,
+        ).transpose(1, 2)
+        for q, k, v in zip(*splits)
+    ]
+    attn_output = torch.cat(attn_outputs, dim=1)
+    attn_output = attn_output.reshape(seq_length, -1).contiguous()
+    return attn.proj(attn_output)
+
+
+def export_scatter_visual_embeds(
+    inputs_embeds: torch.Tensor,
+    image_token_indices: torch.Tensor,
+    image_embeds: torch.Tensor,
+) -> torch.Tensor:
+    """Merge visual embeds into token embeddings by integer index.
+
+    OpenVINO-friendly replacement for the stock image/text merge, which uses
+    ``masked_scatter`` (-> an unconvertible ``Where`` whose operand shapes
+    disagree). The integer-index ``index_copy`` (-> ``ScatterND``) is numerically
+    identical for a single-batch sequence.
+
+    Args:
+        inputs_embeds: ``(1, seq_len, hidden)`` token embeddings.
+        image_token_indices: ``(num_visual,)`` positions of the image tokens.
+        image_embeds: ``(num_visual, hidden)`` visual embeddings.
+
+    Returns:
+        ``(1, seq_len, hidden)`` embeddings with the image slots replaced.
+    """
+    merged = inputs_embeds[0].index_copy(0, image_token_indices, image_embeds)
+    return merged.unsqueeze(0)
+
+
+def export_add_deepstack_embeds(
+    hidden_states: torch.Tensor,
+    image_token_indices: torch.Tensor,
+    visual_embeds: torch.Tensor,
+) -> torch.Tensor:
+    """Add deepstack visual features at the image-token positions by index.
+
+    OpenVINO-friendly replacement for the stock ``_deepstack_process``, which adds
+    ``visual_embeds`` into ``hidden_states`` via boolean-mask assignment (-> an
+    unconvertible ``Where``). The ``index_select`` + ``index_copy`` variant
+    (-> ``Gather`` / ``ScatterND``) is numerically identical for a single-batch
+    sequence.
+
+    Args:
+        hidden_states: ``(1, seq_len, hidden)`` decoder hidden states.
+        image_token_indices: ``(num_visual,)`` positions of the image tokens.
+        visual_embeds: ``(num_visual, hidden)`` deepstack features to add.
+
+    Returns:
+        ``(1, seq_len, hidden)`` hidden states with the features added.
+    """
+    visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+    row = hidden_states[0]
+    updated = row.index_copy(0, image_token_indices, row.index_select(0, image_token_indices) + visual_embeds)
+    return updated.unsqueeze(0)
+
+
 class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
     """Stock Qwen3-VL that also exposes the 3D MRoPE ``position_ids``.
 
@@ -160,23 +413,13 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         return (input_ids[0] == self.config.image_token_id).nonzero(as_tuple=True)[0]
 
     def _ensure_export_patch(self) -> None:
-        """Install export-friendly (integer-index) visual-scatter overrides.
+        """Swap the stock Qwen3-VL ops for their export-friendly equivalents.
 
-        Replaces the two boolean-mask scatters that OpenVINO cannot convert -- the
-        image/text merge in ``Qwen3VLModel.forward`` and the deepstack injection in
-        ``Qwen3VLTextModel._deepstack_process`` -- with numerically-identical
-        ``index_copy`` / ``index_select`` variants that lower to ``ScatterND`` /
-        ``Gather``. Both overrides use the eagerly-precomputed image-token
-        positions stashed on this shim and fall back to the stock implementation
-        when those positions are absent (normal, non-export inference).
-
-        It also rewrites the vision tower's two geometry helpers
-        (``rot_pos_emb`` / ``fast_pos_embed_interpolate``) to read the *Python*
-        constant ``_export_grid_list`` instead of ``grid_thw.tolist()``. Under
-        ``torch.export`` the baked ``grid_thw`` buffer is a lifted tensor input, so
-        ``.tolist()`` yields unbacked symints and ``torch.linspace(0, N, h)`` fails
-        with a data-dependent guard; the constant ints make those shapes concrete.
-        The results are numerically identical to stock.
+        Installs the module-level ``export_*`` reimplementations onto the vision
+        tower and language model (vision attention / rotary / position-embed
+        geometry, and the image-merge / deepstack scatters). Each is numerically
+        identical to stock but OpenVINO-convertible; see those functions for why.
+        Idempotent, and only takes effect once export constants are baked.
         """
         if getattr(self, "_export_patched", False):
             return
@@ -187,148 +430,34 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         orig_model_forward = inner.forward
         orig_deepstack_process = text_model._deepstack_process  # noqa: SLF001
 
-        from transformers.models.qwen3_vl import modeling_qwen3_vl as _mqv
-
         def _make_vision_attn_forward(attn: torch.nn.Module) -> object:
             """Build an export-friendly ``forward`` for one vision attention block.
 
-            Stock ``Qwen3VLVisionAttention.forward`` splits the per-image attention
-            windows with ``lengths.tolist()`` (derived from ``cu_seqlens``), which
-            yields unbacked symints under ``torch.export``. This variant splits by
-            the constant Python window sizes (``_export_vision_seqlens``) and drops
-            the flash-attention branch (XR0 uses SDPA); it is numerically identical.
+            Thin wrapper binding one attention module and the baked per-window
+            token counts to :func:`export_vision_attn_forward`.
             """
 
             def _forward(
                 hidden_states: torch.Tensor,
-                cu_seqlens: torch.Tensor,  # noqa: ARG001
+                cu_seqlens: torch.Tensor | None = None,  # noqa: ARG001
                 rotary_pos_emb: torch.Tensor | None = None,  # noqa: ARG001
                 position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
                 **kwargs: object,
             ) -> torch.Tensor:
-                seq_length = hidden_states.shape[0]
-                query_states, key_states, value_states = (
-                    attn.qkv(hidden_states).reshape(seq_length, 3, attn.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+                return export_vision_attn_forward(
+                    attn,
+                    shim._export_vision_seqlens,  # noqa: SLF001
+                    hidden_states,
+                    position_embeddings,
                 )
-                cos, sin = position_embeddings
-                query_states, key_states = _mqv.apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
-                query_states = query_states.transpose(0, 1).unsqueeze(0)
-                key_states = key_states.transpose(0, 1).unsqueeze(0)
-                value_states = value_states.transpose(0, 1).unsqueeze(0)
-
-                split_sizes = shim._export_vision_seqlens  # noqa: SLF001
-                splits = [
-                    torch.split(tensor, split_sizes, dim=2)
-                    for tensor in (query_states, key_states, value_states)
-                ]
-                # Call SDPA directly (not the shared attention interface): the
-                # vision tower has equal q/kv heads, but the interface passes
-                # ``enable_gqa=True`` which the ONNX exporter rejects unless
-                # q_heads > kv_heads. A plain SDPA is numerically identical here.
-                attn_outputs = [
-                    torch.nn.functional.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        attn_mask=None,
-                        dropout_p=0.0,
-                        is_causal=False,
-                        scale=attn.scaling,
-                    ).transpose(1, 2)
-                    for q, k, v in zip(*splits)
-                ]
-                attn_output = torch.cat(attn_outputs, dim=1)
-                attn_output = attn_output.reshape(seq_length, -1).contiguous()
-                return attn.proj(attn_output)
 
             return _forward
 
-        def _patched_rot_pos_emb(grid_thw: torch.Tensor) -> torch.Tensor:
-            merge_size = visual.spatial_merge_size
-            grid_thw_list = shim._export_grid_list  # noqa: SLF001
+        def _patched_rot_pos_emb(grid_thw: torch.Tensor) -> torch.Tensor:  # noqa: ARG001
+            return export_rot_pos_emb(visual, shim._export_grid_list)  # noqa: SLF001
 
-            max_hw = max(max(h, w) for _, h, w in grid_thw_list)
-            freq_table = visual.rotary_pos_emb(max_hw)
-            device = freq_table.device
-
-            total_tokens = sum(t * h * w for t, h, w in grid_thw_list)
-            pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
-
-            offset = 0
-            for num_frames, height, width in grid_thw_list:
-                merged_h, merged_w = height // merge_size, width // merge_size
-                block_rows = torch.arange(merged_h, device=device)
-                block_cols = torch.arange(merged_w, device=device)
-                intra_row = torch.arange(merge_size, device=device)
-                intra_col = torch.arange(merge_size, device=device)
-                row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
-                col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
-                row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
-                col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
-                coords = torch.stack((row_idx, col_idx), dim=-1)
-                if num_frames > 1:
-                    coords = coords.repeat(num_frames, 1)
-                num_tokens = coords.shape[0]
-                pos_ids[offset : offset + num_tokens] = coords
-                offset += num_tokens
-
-            embeddings = freq_table[pos_ids]
-            return embeddings.flatten(1)
-
-        def _patched_fast_pos_embed_interpolate(grid_thw: torch.Tensor) -> torch.Tensor:
-            grid_thw_list = shim._export_grid_list  # noqa: SLF001
-            grid_ts = [row[0] for row in grid_thw_list]
-            grid_hs = [row[1] for row in grid_thw_list]
-            grid_ws = [row[2] for row in grid_thw_list]
-            device = visual.pos_embed.weight.device
-
-            idx_list: list[list[float]] = [[] for _ in range(4)]
-            weight_list: list[list[float]] = [[] for _ in range(4)]
-
-            for _t, h, w in grid_thw_list:
-                h_idxs = torch.linspace(0, visual.num_grid_per_side - 1, h)
-                w_idxs = torch.linspace(0, visual.num_grid_per_side - 1, w)
-                h_idxs_floor = h_idxs.int()
-                w_idxs_floor = w_idxs.int()
-                h_idxs_ceil = (h_idxs.int() + 1).clip(max=visual.num_grid_per_side - 1)
-                w_idxs_ceil = (w_idxs.int() + 1).clip(max=visual.num_grid_per_side - 1)
-                dh = h_idxs - h_idxs_floor
-                dw = w_idxs - w_idxs_floor
-                base_h = h_idxs_floor * visual.num_grid_per_side
-                base_h_ceil = h_idxs_ceil * visual.num_grid_per_side
-                indices = [
-                    (base_h[None].T + w_idxs_floor[None]).flatten(),
-                    (base_h[None].T + w_idxs_ceil[None]).flatten(),
-                    (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
-                    (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
-                ]
-                weights = [
-                    ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                    ((1 - dh)[None].T * dw[None]).flatten(),
-                    (dh[None].T * (1 - dw)[None]).flatten(),
-                    (dh[None].T * dw[None]).flatten(),
-                ]
-                for i in range(4):
-                    idx_list[i].extend(indices[i].tolist())
-                    weight_list[i].extend(weights[i].tolist())
-
-            idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
-            weight_tensor = torch.tensor(weight_list, dtype=visual.pos_embed.weight.dtype, device=device)
-            pos_embeds = visual.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
-            patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-            patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
-
-            patch_pos_embeds_permute = []
-            merge_size = visual.config.spatial_merge_size
-            for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-                pos_embed = pos_embed.repeat(t, 1)
-                pos_embed = (
-                    pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-                    .permute(0, 1, 3, 2, 4, 5)
-                    .flatten(0, 4)
-                )
-                patch_pos_embeds_permute.append(pos_embed)
-            return torch.cat(patch_pos_embeds_permute)
+        def _patched_fast_pos_embed_interpolate(grid_thw: torch.Tensor) -> torch.Tensor:  # noqa: ARG001
+            return export_fast_pos_embed_interpolate(visual, shim._export_grid_list)  # noqa: SLF001
 
         def _patched_model_forward(
             input_ids: torch.LongTensor | None = None,
@@ -380,8 +509,7 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
             # OpenVINO-friendly merge: integer-index scatter (``index_copy`` ->
             # ``ScatterND``) instead of ``masked_scatter`` (-> unconvertible
             # ``Where``). Numerically identical for a single-batch sequence.
-            merged = inputs_embeds[0].index_copy(0, idx, image_embeds)
-            inputs_embeds = merged.unsqueeze(0)
+            inputs_embeds = export_scatter_visual_embeds(inputs_embeds, idx, image_embeds)
             visual_pos_masks = input_ids == inner.config.image_token_id
             if position_ids is None:
                 position_ids = inner.compute_3d_position_ids(
@@ -410,13 +538,19 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
             visual_pos_masks: torch.Tensor,
             visual_embeds: torch.Tensor,
         ) -> torch.Tensor:
+            """Add the deepstack visual features at the image-token positions.
+
+            Thin wrapper over :func:`export_add_deepstack_embeds` using the baked
+            image-token indices; falls back to stock when they are absent (normal,
+            non-export inference).
+
+            Returns:
+                ``hidden_states`` with the deepstack features added.
+            """
             idx = shim._image_token_indices  # noqa: SLF001
             if idx is None:
                 return orig_deepstack_process(hidden_states, visual_pos_masks, visual_embeds)
-            visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
-            row = hidden_states[0]
-            updated = row.index_copy(0, idx, row.index_select(0, idx) + visual_embeds)
-            return updated.unsqueeze(0)
+            return export_add_deepstack_embeds(hidden_states, idx, visual_embeds)
 
         inner.forward = _patched_model_forward
         text_model._deepstack_process = _patched_deepstack_process  # noqa: SLF001
@@ -448,15 +582,6 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         Normal (eager) inference runs the fully stock path: the vision tower, the
         3D MRoPE ``position_ids`` (:meth:`~transformers.Qwen3VLModel.compute_3d_position_ids`)
         and the boolean-mask visual scatter all run unchanged.
-
-        In-graph export mode (enabled by :meth:`prepare_ingraph_export`) keeps all
-        three inside the traced graph while making them OpenVINO-convertible: the
-        real vision tower runs on ``pixel_values`` with the baked-constant
-        ``image_grid_thw`` (so its ``tensor.tolist()`` geometry folds), the
-        baked-constant ``position_ids`` are injected (skipping the non-traceable
-        rope-index builder), and the merge / deepstack scatters use the
-        baked-constant integer index (``index_copy`` -> ``ScatterND``) instead of
-        ``masked_scatter`` (see :meth:`_ensure_export_patch`).
 
         Returns:
             The stock Qwen3-VL output with the 3D MRoPE ``position_ids`` attached.

@@ -341,17 +341,30 @@ class XR0Model(Model):
         previous global state afterwards -- byte-compatible with the source
         model's ``torch.manual_seed(seed)`` around a single ``randn_like``.
 
+        At inference the noise is drawn in float32 and cast to the action dtype.
+        The model runs in bf16, but the Intel GPU OpenVINO plugin has no layout
+        for a bf16 ``RandomUniform``, so a bf16 draw makes the exported graph
+        fail to compile on GPU; an f32 draw exports to a GPU-compatible
+        ``RandomUniform`` + cast and is numerically equivalent. Training keeps the
+        native ``randn_like`` draw so its RNG stream is unchanged.
+
         Returns:
             Gaussian noise tensor shaped like ``action``.
         """
+
+        def _draw() -> torch.Tensor:
+            if self.training:
+                return torch.randn_like(action)
+            return torch.randn(action.shape, dtype=torch.float32, device=action.device).to(action.dtype)
+
         if seed is None or self.training:
-            return torch.randn_like(action)
+            return _draw()
 
         seed_val = int(seed.flatten()[0].item()) if isinstance(seed, torch.Tensor) else int(seed)
         cpu_rng_state = torch.get_rng_state()
         gpu_rng_state = torch.cuda.get_rng_state(action.device) if action.is_cuda else None
         torch.manual_seed(seed_val)
-        noise = torch.randn_like(action)
+        noise = _draw()
         torch.set_rng_state(cpu_rng_state)
         if gpu_rng_state is not None:
             torch.cuda.set_rng_state(gpu_rng_state, action.device)
