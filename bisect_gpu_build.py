@@ -29,30 +29,42 @@ def is_build_failure(exc: Exception) -> bool:
     return any(m in msg for m in BUILD_FAIL_MARKERS)
 
 
-def build_prefix_model(ordered, k):
+def build_prefix_model(model, ordered, k):
     """Build an ov.Model containing exactly the first k topological ops."""
+    if k >= len(ordered):
+        return model  # full graph: use the original, no reconstruction
+
     prefix = ordered[:k]
     prefix_set = set(id(n) for n in prefix)
 
     parameters = [n for n in prefix if n.get_type_name() == "Parameter"]
 
     results = []
-    seen = set()
+    resulted = set()  # (id(node), out_index) already turned into a Result
+
+    # Keep the original Result nodes that live inside this prefix.
     for node in prefix:
+        if node.get_type_name() == "Result":
+            results.append(node)
+            src = node.input_value(0)
+            resulted.add((id(src.get_node()), src.get_index()))
+
+    # Expose remaining frontier outputs as fresh Results.
+    for node in prefix:
+        if node.get_type_name() in ("Result", "Parameter", "Constant"):
+            continue
         for out in node.outputs():
-            # An output is on the frontier if any consumer is outside the prefix,
-            # or it has no consumers at all (dangling), or it is a graph result.
+            key = (id(node), out.get_index())
+            if key in resulted:
+                continue
             consumers = list(out.get_target_inputs())
             outside = any(id(ti.get_node()) not in prefix_set for ti in consumers)
             frontier = outside or len(consumers) == 0
             if not frontier:
                 continue
-            key = (id(node), out.get_index())
-            if key in seen:
-                continue
-            seen.add(key)
+            resulted.add(key)
             src = out
-            # Normalize non-float outputs to f32 so they are valid GPU model outputs.
+            # Normalize non-float outputs to f32 so they are valid GPU outputs.
             et = str(out.get_element_type())
             if et not in ("f16", "f32", "bf16"):
                 src = ops.convert(out, "f32").output(0)
@@ -63,14 +75,14 @@ def build_prefix_model(ordered, k):
     return ov.Model(results, parameters, f"prefix_{k}")
 
 
-def compile_prefix(core, ordered, k):
+def compile_prefix(core, model, ordered, k):
     """Return (status, detail). status in {'ok','build_fail','other'}."""
     try:
-        model = build_prefix_model(ordered, k)
+        submodel = build_prefix_model(model, ordered, k)
     except Exception as e:  # noqa: BLE001
         return "other", f"assemble error: {e!r}"
     try:
-        core.compile_model(model, "GPU")
+        core.compile_model(submodel, "GPU")
     except Exception as e:  # noqa: BLE001
         if is_build_failure(e):
             return "build_fail", str(e)
@@ -108,7 +120,7 @@ def main() -> int:
 
     # Sanity: full graph must fail, else there is nothing to bisect.
     print("[info] compiling FULL graph (expected to fail) ...")
-    status, detail = compile_prefix(core, ordered, n)
+    status, detail = compile_prefix(core, model, ordered, n)
     print(f"[info] full graph -> {status}")
     if status != "build_fail":
         print("[FATAL] full graph did not reproduce the clBuildProgram failure "
@@ -120,7 +132,7 @@ def main() -> int:
     first_fail = n
     while lo <= hi:
         mid = (lo + hi) // 2
-        status, detail = compile_prefix(core, ordered, mid)
+        status, detail = compile_prefix(core, model, ordered, mid)
         tag = {"ok": "OK", "build_fail": "BUILD-FAIL", "other": "skip"}[status]
         print(f"[bisect] k={mid:6d}  {ordered[mid-1].get_type_name():<18} -> {tag}")
         if status == "build_fail":
