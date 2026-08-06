@@ -472,6 +472,13 @@ class XR0Model(Model):
 
         if return_loss:
             return self._flow_loss(pred, target, action_mask, weight)
+        # The DiT action head runs in bf16, which NumPy cannot represent, so the
+        # Runtime OpenVINO adapter would fail to read a bf16 ``action`` output. In
+        # in-graph export mode, cast the action to f32 so ``to_openvino`` bakes a
+        # single, self-consistent f32-output IR -- no fragile post-hoc re-save of
+        # the multi-GB ``.bin``. Numerically identical at inference.
+        if getattr(self.vlm, "_ingraph_export", False):
+            return pred.float()
         return pred
 
     @staticmethod
