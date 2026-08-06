@@ -1,3 +1,6 @@
+import os
+
+import openvino as ov
 import torch
 
 from physicalai.policies import XR0
@@ -96,3 +99,40 @@ Qwen3VLTextRMSNorm.forward = _rmsnorm_forward_positive_axis
 # self-consistent f32-output IR that the Runtime OpenVINO adapter can read with
 # NumPy directly -- no fragile post-hoc re-save of the multi-GB ``.bin``.
 policy.to_openvino("xr0_ir", input_sample=input_sample)
+
+# GPU-friendliness pass: the Qwen3-VL attention-mask builder lowers to a GatherND
+# on a *boolean* (u8) tensor -- ``attention_mask`` (i64) -> Convert(bool) ->
+# GatherND -> LogicalAnd. The Intel GPU OpenVINO plugin has no u8 GatherND kernel
+# ("No layout format available for gathernd ... data_type: u8"), so it fails to
+# compile (CPU has the kernel and loads fine). Rewrite the gather to run on i32
+# -- which the GPU supports -- and cast the result back to bool, leaving the
+# downstream LogicalAnd untouched. Numerically identical: the mask is only 0/1.
+import openvino.opset13 as _ops  # noqa: E402
+
+_XML = "xr0_ir/xr0.xml"
+_core = ov.Core()
+_ovm = _core.read_model(_XML)
+for _gnd in [op for op in _ovm.get_ops() if op.get_type_name() == "GatherND"]:
+    _data = _gnd.input_value(0)
+    if _data.get_element_type() != ov.Type.boolean:
+        continue
+    _consumers = list(_gnd.output(0).get_target_inputs())
+    _d32 = _ops.convert(_data, destination_type="i32")
+    _gnd.input(0).replace_source_output(_d32.output(0))
+    _gnd.validate_and_infer_types()
+    _back = _ops.convert(_gnd.output(0), destination_type="boolean")
+    for _ti in _consumers:
+        _ti.replace_source_output(_back.output(0))
+_ovm.validate_nodes_and_infer_types()
+
+# ``read_model`` memory-maps the multi-GB ``xr0.bin`` and ``save_model`` streams
+# those weights from the live mapping while writing. Write to a temp path first,
+# drop the mapping (``del``), then atomically replace the originals (the ``.bin``
+# is located by the ``.xml`` basename, so both must be renamed together).
+# ``compress_to_fp16=False`` preserves the exported weight precision as-is.
+_TMP_XML = "xr0_ir/xr0.gpu.xml"
+_TMP_BIN = "xr0_ir/xr0.gpu.bin"
+ov.save_model(_ovm, _TMP_XML, compress_to_fp16=False)
+del _ovm  # release the mmap on the source xr0.bin before overwriting it
+os.replace(_TMP_XML, _XML)
+os.replace(_TMP_BIN, "xr0_ir/xr0.bin")
