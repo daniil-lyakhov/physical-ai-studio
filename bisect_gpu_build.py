@@ -114,6 +114,24 @@ def main() -> int:
         return 2
 
     model = core.read_model(xml_path)
+
+    if "--wrap" in sys.argv:
+        wrapped = 0
+        for tr in [op for op in model.get_ops() if op.get_type_name() == "Transpose"]:
+            tin = tr.input_value(0)
+            if tin.get_element_type() != ov.Type.bf16:
+                continue
+            consumers = list(tr.output(0).get_target_inputs())
+            f32 = ops.convert(tin, destination_type="f32")
+            tr.input(0).replace_source_output(f32.output(0))
+            tr.validate_and_infer_types()
+            back = ops.convert(tr.output(0), destination_type="bf16")
+            for ti in consumers:
+                ti.replace_source_output(back.output(0))
+            wrapped += 1
+        model.validate_nodes_and_infer_types()
+        print(f"[info] --wrap: wrapped {wrapped} bf16 Transpose node(s) before bisect")
+
     ordered = model.get_ordered_ops()
     n = len(ordered)
     print(f"[info] total ops: {n}")
