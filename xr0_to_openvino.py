@@ -1,8 +1,4 @@
-import os
-
-import openvino as ov
 import torch
-from openvino.preprocess import PrePostProcessor
 
 from physicalai.policies import XR0
 from physicalai.export import ExportBackend
@@ -70,17 +66,20 @@ input_sample = {
     if name != "image_grid_thw" and isinstance(tensor, torch.Tensor)
 }
 
-# The DiT/action-expert stack uses transformers' ``Qwen2RMSNorm``, whose forward
-# reduces with ``hidden_states.pow(2).mean(-1, keepdim=True)``. The OpenVINO
-# PyTorch frontend mis-materializes that *negative* reduction axis into a garbage
-# ReduceMean axis constant, so loading the exported IR fails with
-# "Axis -3221225472 out of the tensor rank range". Patch the norm to reduce over a
-# *positive, static* axis (``ndim - 1`` is a concrete int during tracing) so the
-# frontend emits a valid axis constant. Numerically identical to the original.
+# Every RMSNorm in the assembled model reduces with
+# ``hidden_states.pow(2).mean(-1, keepdim=True)``. The OpenVINO PyTorch frontend
+# mis-materializes that *negative* reduction axis into a garbage ReduceMean axis
+# constant, so loading the exported IR fails with
+# "Axis <huge> out of the tensor rank range". Patch every RMSNorm class present
+# to reduce over a *positive, static* axis (``ndim - 1`` is a concrete int during
+# tracing) so the frontend emits a valid axis constant. Numerically identical to
+# the original. Both the DiT action head (``Qwen2RMSNorm``) and the Qwen3-VL text
+# model (``Qwen3VLTextRMSNorm``) use this pattern, so both must be patched.
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm  # noqa: E402
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextRMSNorm  # noqa: E402
 
 
-def _rmsnorm_forward_positive_axis(self: Qwen2RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
+def _rmsnorm_forward_positive_axis(self: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)
     axis = hidden_states.dim() - 1  # concrete positive int -> clean ReduceMean axis
@@ -90,29 +89,10 @@ def _rmsnorm_forward_positive_axis(self: Qwen2RMSNorm, hidden_states: torch.Tens
 
 
 Qwen2RMSNorm.forward = _rmsnorm_forward_positive_axis
+Qwen3VLTextRMSNorm.forward = _rmsnorm_forward_positive_axis
 
+# The DiT action head runs in bf16, but ``XR0Model._run`` casts the ``action``
+# output to f32 while in in-graph export mode, so ``to_openvino`` emits a single,
+# self-consistent f32-output IR that the Runtime OpenVINO adapter can read with
+# NumPy directly -- no fragile post-hoc re-save of the multi-GB ``.bin``.
 policy.to_openvino("xr0_ir", input_sample=input_sample)
-
-# The DiT action head runs in bf16, so the exported ``action`` output is bf16 --
-# which NumPy cannot represent, so the Runtime OpenVINO adapter (``np.array(...)``)
-# would fail. Bake an f32 cast into the saved IR so the native ``InferenceModel``
-# reads the action back as plain f32.
-_EXPORT_XML = "xr0_ir_gpu_friendly/xr0.xml"
-_core = ov.Core()
-_model = _core.read_model(_EXPORT_XML)
-_ppp = PrePostProcessor(_model)
-_ppp.output("action").tensor().set_element_type(ov.Type.f32)
-_model = _ppp.build()
-
-# ``read_model`` memory-maps the 9 GB source ``xr0.bin`` and ``save_model``
-# streams the constant weights from that live mapping *while* it writes. Saving
-# back to the SAME path would overwrite the file the mapping still points at and
-# crash with a bus error (SIGBUS). Write to a temp path first, drop the mapping,
-# then atomically replace the originals (the IR ``.bin`` is located by the
-# ``.xml`` basename, so both must be renamed together).
-_TMP_XML = "xr0_ir/xr0.f32.xml"
-_TMP_BIN = "xr0_ir/xr0.f32.bin"
-ov.save_model(_model, _TMP_XML)
-del _model  # release the mmap on the source xr0.bin before overwriting it
-os.replace(_TMP_XML, _EXPORT_XML)
-os.replace(_TMP_BIN, "xr0_ir/xr0.bin")
