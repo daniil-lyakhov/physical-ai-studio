@@ -65,9 +65,10 @@ EAGER_DTYPE = "float32"
 EAGER_DEVICE = "cpu"
 # OpenVINO device for the exported IR. "GPU" runs the Intel iGPU path.
 OV_DEVICE = "CPU"
-# Intel GPU compute precision (ignored on CPU). "bf16" matches the eager/training
-# precision; "f32" is the safe fallback. Both dodge the f16-only RoPE OpenCL kernel.
-GPU_PRECISION_HINT = "bf16"
+# Explicit OpenVINO compute precision applied on ANY device (None = plugin
+# default). Set "f32" to force full-precision compute -- used to test whether the
+# OV-vs-eager gap is precision (collapses) or a real graph bug (stays large).
+OV_PRECISION_HINT: str | None = "f32"
 
 # Fully deterministic parity: replace the rectified-flow sampler with a single
 # fixed noise draw in BOTH models -- baked as a Constant into the exported IR and
@@ -207,7 +208,7 @@ def build_export(export_dir: str) -> object:
     Returns:
         A Policy-wrapped InferenceModel exposing ``select_action(observation)``.
     """
-    adapter_kwargs = {"INFERENCE_PRECISION_HINT": GPU_PRECISION_HINT} if OV_DEVICE == "GPU" else {}
+    adapter_kwargs = {"INFERENCE_PRECISION_HINT": OV_PRECISION_HINT} if OV_PRECISION_HINT else {}
     inf_model = InferenceModel(export_dir, device=OV_DEVICE, **adapter_kwargs)
     return _wrap_policy(inf_model)
 
@@ -312,7 +313,7 @@ def main() -> None:
         farr = np.asarray(floor_diffs)
         print(f"bf16 floor max abs  : mean {farr.mean():.3e} | max {farr.max():.3e} | min {farr.min():.3e}")
         print("(OV within the bf16 floor => faithful export; the gap is bf16 precision, not a bug.)")
-    print(f"OV device / precision: {OV_DEVICE} / {GPU_PRECISION_HINT if OV_DEVICE == 'GPU' else 'native'}")
+    print(f"OV device / precision: {OV_DEVICE} / {OV_PRECISION_HINT or 'native'}")
 
 
 if __name__ == "__main__":
