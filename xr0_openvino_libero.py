@@ -49,6 +49,10 @@ logger = logging.getLogger("xr0_openvino_libero")
 # --- Configuration (hardcoded, no CLI) --------------------------------------
 EXPORT_DIR = "xr0_ir"
 DEVICE = "CPU"  # set to "GPU" to run on an Intel GPU
+# Intel GPU compute precision. "bf16" matches the eager/training precision the
+# model was validated at (best parity); "f32" is the safe fallback. Both dodge
+# the f16-only RoPE OpenCL kernel that fails to build on the GPU plugin.
+GPU_PRECISION_HINT = "bf16"
 
 TASK_SUITE = "libero_10"
 TASK_IDS = [0]  # a single, short task
@@ -61,11 +65,12 @@ def main() -> None:
     logger.info("Loading exported model from %s (device=%s) ...", EXPORT_DIR, DEVICE)
     # GPU precision workaround: the DiT action head's rotary-embedding block lowers
     # to a fused eltwise cone whose *f16* OpenCL kernel fails to build on the Intel
-    # GPU plugin ("clBuildProgram, CL_BUILD_PROGRAM_FAILURE -11"); forcing f32
-    # execution makes the build succeed. Apply it at load/compile time -- the
-    # adapter forwards **adapter_kwargs straight into ``compile_model(config=...)``
-    # -- so the exported IR stays untouched. CPU ignores the hint.
-    adapter_kwargs = {"INFERENCE_PRECISION_HINT": "f32"} if DEVICE == "GPU" else {}
+    # GPU plugin ("clBuildProgram, CL_BUILD_PROGRAM_FAILURE -11"); forcing a
+    # non-f16 compute precision makes the build succeed. Apply it at load/compile
+    # time -- the adapter forwards **adapter_kwargs straight into
+    # ``compile_model(config=...)`` -- so the exported IR stays untouched. CPU
+    # ignores the hint.
+    adapter_kwargs = {"INFERENCE_PRECISION_HINT": GPU_PRECISION_HINT} if DEVICE == "GPU" else {}
     model = InferenceModel(EXPORT_DIR, device=DEVICE, **adapter_kwargs)
 
     benchmark = LiberoBenchmark(

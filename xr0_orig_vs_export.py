@@ -45,9 +45,12 @@ CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-LIBERO"
 # Directory / IR produced by ``xr0_to_openvino.py``.
 EXPORT_XML = "xr0_ir/xr0.xml"
 # Device the exported IR is compiled on for the parity run. Set to "GPU" to
-# compare against the same Intel GPU path used at inference (with the f32
-# precision hint applied at compile time, exactly like the InferenceModel load).
+# compare against the same Intel GPU path used at inference (with the precision
+# hint applied at compile time, exactly like the InferenceModel load).
 OV_DEVICE = "GPU"
+# Intel GPU compute precision. "bf16" matches the eager/training precision (best
+# parity); "f32" is the safe fallback. Both dodge the f16-only RoPE OpenCL kernel.
+GPU_PRECISION_HINT = "bf16"
 # Fixed rectified-flow noise seed so eager and export draw identical noise.
 SEED = 42
 # Max abs diff above which we treat the wrappers as having changed the numerics.
@@ -158,13 +161,14 @@ def _ov_config() -> dict[str, str]:
 
     On the Intel GPU the DiT action head's rotary-embedding block has an f16
     OpenCL kernel that fails to build (``clBuildProgram, CL_BUILD_PROGRAM_FAILURE
-    -11``); forcing f32 execution via ``INFERENCE_PRECISION_HINT`` makes it build.
-    This mirrors the hint the ``InferenceModel`` load passes to ``compile_model``.
+    -11``); forcing a non-f16 compute precision via ``INFERENCE_PRECISION_HINT``
+    makes it build. This mirrors the hint the ``InferenceModel`` load passes to
+    ``compile_model``. ``bf16`` additionally matches the eager compute precision.
 
     Returns:
         The compile config dict (empty for non-GPU devices).
     """
-    return {"INFERENCE_PRECISION_HINT": "f32"} if OV_DEVICE == "GPU" else {}
+    return {"INFERENCE_PRECISION_HINT": GPU_PRECISION_HINT} if OV_DEVICE == "GPU" else {}
 
 
 def _find_noise_node(model: ov.Model) -> ov.Node:
