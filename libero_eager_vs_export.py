@@ -76,6 +76,10 @@ GPU_PRECISION_HINT = "bf16"
 CONSTANT_NOISE = True
 CONST_NOISE_DIR = "xr0_ir_constnoise"
 CONST_NOISE_SEED = 0
+# Also run a torch **bfloat16** eager model as a precision floor. The exported IR
+# holds bf16 weights, so "OV vs f32" alone can't tell a real export bug from the
+# normal bf16-vs-f32 gap. If the OV diff tracks this bf16 floor, OV is faithful.
+EAGER_BF16_FLOOR = True
 
 TASK_SUITE = "libero_10"
 TASK_ID = 0
@@ -94,6 +98,23 @@ def build_eager() -> XR0:
         pretrained_name_or_path=CHECKPOINT,
         vlm_attn_implementation="sdpa",
         dtype=EAGER_DTYPE,
+        n_action_steps=N_ACTION_STEPS,
+    )
+    policy.to(torch.device(EAGER_DEVICE))
+    policy.eval()
+    return policy
+
+
+def build_eager_dtype(dtype: str) -> XR0:
+    """Build an eager XR0 policy at an explicit dtype (for the bf16 floor).
+
+    Returns:
+        The XR0 policy in eval mode on ``EAGER_DEVICE``.
+    """
+    policy = XR0(
+        pretrained_name_or_path=CHECKPOINT,
+        vlm_attn_implementation="sdpa",
+        dtype=dtype,
         n_action_steps=N_ACTION_STEPS,
     )
     policy.to(torch.device(EAGER_DEVICE))
@@ -225,11 +246,19 @@ def main() -> None:
     eager = build_eager()
 
     export_dir = EXPORT_DIR
+    noise_np = None
     if CONSTANT_NOISE:
         logger.info("Baking constant noise into IR -> %s ...", CONST_NOISE_DIR)
         noise_np = bake_constant_noise(EXPORT_DIR, CONST_NOISE_DIR, CONST_NOISE_SEED)
         patch_eager_noise(eager, noise_np)
         export_dir = CONST_NOISE_DIR
+
+    floor = None
+    if EAGER_BF16_FLOOR:
+        logger.info("Building bf16 eager floor ...")
+        floor = build_eager_dtype("bfloat16")
+        if noise_np is not None:
+            patch_eager_noise(floor, noise_np)
 
     logger.info("Loading exported OpenVINO IR from %s (device=%s) ...", export_dir, OV_DEVICE)
     export = build_export(export_dir)
@@ -239,9 +268,12 @@ def main() -> None:
     observation, _ = gym.reset(seed=SEED)
     eager.reset()
     export.reset()
+    if floor is not None:
+        floor.reset()
 
-    abs_diffs: list[float] = []
-    header = f"{'step':>4} | {'max abs':>10} | {'mean abs':>10} | {'eager[0]':>10} | {'export[0]':>10}"
+    ov_diffs: list[float] = []
+    floor_diffs: list[float] = []
+    header = f"{'step':>4} | {'OV max':>10} | {'OV mean':>10} | {'bf16 max':>10} | {'eager[0]':>10} | {'export[0]':>10}"
     print(header)
     print("-" * len(header))
 
@@ -249,12 +281,21 @@ def main() -> None:
         with torch.inference_mode():
             a_eager = eager.select_action(observation)
             a_export = export.select_action(observation)
+            a_floor = floor.select_action(observation) if floor is not None else None
 
         ve = _as_1d(a_eager)
         vo = _as_1d(a_export)
         diff = np.abs(ve - vo)
-        abs_diffs.append(float(diff.max()))
-        print(f"{step:>4} | {diff.max():>10.3e} | {diff.mean():>10.3e} | {ve[0]:>10.4f} | {vo[0]:>10.4f}")
+        ov_diffs.append(float(diff.max()))
+        floor_max = float("nan")
+        if a_floor is not None:
+            fdiff = np.abs(ve - _as_1d(a_floor))
+            floor_max = float(fdiff.max())
+            floor_diffs.append(floor_max)
+        print(
+            f"{step:>4} | {diff.max():>10.3e} | {diff.mean():>10.3e} | "
+            f"{floor_max:>10.3e} | {ve[0]:>10.4f} | {vo[0]:>10.4f}"
+        )
 
         # Advance the env with the eager (reference) action.
         step_action = a_eager.squeeze(0) if a_eager.ndim > 1 else a_eager
@@ -263,10 +304,14 @@ def main() -> None:
             logger.info("Episode ended at step %d.", step)
             break
 
-    arr = np.asarray(abs_diffs)
-    print("\n=== eager vs exported OpenVINO -- trajectory action parity ===")
+    arr = np.asarray(ov_diffs)
+    print("\n=== eager(f32) vs exported OpenVINO -- trajectory action parity ===")
     print(f"steps compared      : {arr.size}")
-    print(f"per-step max abs    : mean {arr.mean():.3e} | max {arr.max():.3e} | min {arr.min():.3e}")
+    print(f"OV per-step max abs : mean {arr.mean():.3e} | max {arr.max():.3e} | min {arr.min():.3e}")
+    if floor_diffs:
+        farr = np.asarray(floor_diffs)
+        print(f"bf16 floor max abs  : mean {farr.mean():.3e} | max {farr.max():.3e} | min {farr.min():.3e}")
+        print("(OV within the bf16 floor => faithful export; the gap is bf16 precision, not a bug.)")
     print(f"OV device / precision: {OV_DEVICE} / {GPU_PRECISION_HINT if OV_DEVICE == 'GPU' else 'native'}")
 
 
