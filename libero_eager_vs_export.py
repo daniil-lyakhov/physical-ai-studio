@@ -38,8 +38,12 @@ Run with the LIBERO env python::
 from __future__ import annotations
 
 import logging
+import shutil
+from pathlib import Path
 
 import numpy as np
+import openvino as ov
+import openvino.opset13 as ops
 import torch
 
 from physicalai.benchmark.gyms import LiberoBenchmark
@@ -65,6 +69,14 @@ OV_DEVICE = "CPU"
 # precision; "f32" is the safe fallback. Both dodge the f16-only RoPE OpenCL kernel.
 GPU_PRECISION_HINT = "bf16"
 
+# Fully deterministic parity: replace the rectified-flow sampler with a single
+# fixed noise draw in BOTH models -- baked as a Constant into the exported IR and
+# monkeypatched into the eager sampler -- so the only remaining difference is
+# numerical precision, not the RNG stream.
+CONSTANT_NOISE = True
+CONST_NOISE_DIR = "xr0_ir_constnoise"
+CONST_NOISE_SEED = 0
+
 TASK_SUITE = "libero_10"
 TASK_ID = 0
 N_STEPS = 50
@@ -89,14 +101,93 @@ def build_eager() -> XR0:
     return policy
 
 
-def build_export() -> object:
+def _find_noise_node(model: ov.Model) -> ov.Node:
+    """Locate the Gaussian-noise (``randn``) node in the exported IR.
+
+    ``torch.randn`` lowers to a ``RandomUniform`` followed by a Box-Muller
+    transform: ``sqrt(-2*log(u1)) * cos(2*pi*u2)``. The final ``Multiply`` of that
+    ``Sqrt`` and ``Cos`` branch is the rectified-flow starting noise.
+
+    Returns:
+        The ``Multiply`` node producing the Gaussian noise tensor.
+
+    Raises:
+        RuntimeError: If the Box-Muller ``Multiply`` cannot be found.
+    """
+    for op in model.get_ops():
+        if op.get_type_name() != "Multiply":
+            continue
+        parents = {op.input_value(i).get_node().get_type_name() for i in range(len(op.inputs()))}
+        if {"Sqrt", "Cos"} <= parents:
+            return op
+    msg = "Could not locate the Box-Muller noise node (Sqrt*Cos) in the IR."
+    raise RuntimeError(msg)
+
+
+def bake_constant_noise(src_dir: str, dst_dir: str, seed: int) -> np.ndarray:
+    """Write a copy of the IR whose noise node is replaced by a fixed Constant.
+
+    Reads ``src_dir``'s IR, finds the Box-Muller Gaussian-noise node, and rewires
+    all its consumers to a Constant filled with a single deterministic standard-
+    normal draw. The ``manifest.json`` is copied verbatim so ``InferenceModel``
+    can load the result exactly like the original export.
+
+    Args:
+        src_dir: Directory holding the original ``xr0.xml`` / ``xr0.bin`` / manifest.
+        dst_dir: Directory to write the constant-noise IR into.
+        seed: RNG seed for the fixed noise draw.
+
+    Returns:
+        The baked noise as a float32 numpy array (to feed the eager model too).
+    """
+    src = Path(src_dir)
+    dst = Path(dst_dir)
+    core = ov.Core()
+    model = core.read_model(str(src / "xr0.xml"))
+    noise_node = _find_noise_node(model)
+
+    shape = list(noise_node.get_output_partial_shape(0).to_shape())
+    elem = noise_node.get_output_element_type(0)
+    noise_np = np.random.default_rng(seed).standard_normal(shape).astype(np.float32)
+
+    const = ops.constant(noise_np, dtype=ov.Type.f32)
+    source = const if elem == ov.Type.f32 else ops.convert(const, destination_type=elem)
+    for target in list(noise_node.output(0).get_target_inputs()):
+        target.replace_source_output(source.output(0))
+    model.validate_nodes_and_infer_types()
+
+    dst.mkdir(parents=True, exist_ok=True)
+    ov.save_model(model, str(dst / "xr0.xml"), compress_to_fp16=False)
+    del model  # release the source .bin mmap before returning
+    shutil.copy2(src / "manifest.json", dst / "manifest.json")
+    return noise_np
+
+
+def patch_eager_noise(policy: XR0, noise_np: np.ndarray) -> None:
+    """Force the eager rectified-flow sampler to return the fixed baked noise.
+
+    The IR's noise node output shares the eager action-noise layout, so the same
+    array feeds both sides element-for-element.
+    """
+    fixed = torch.from_numpy(noise_np)
+
+    def _sample_noise(action: torch.Tensor, seed: object) -> torch.Tensor:  # noqa: ARG001
+        return fixed.to(action.device, action.dtype).reshape(action.shape)
+
+    policy.model._sample_noise = _sample_noise  # noqa: SLF001
+
+
+def build_export(export_dir: str) -> object:
     """Load the exported OpenVINO IR through the Runtime InferenceModel.
+
+    Args:
+        export_dir: Directory of the IR to load (original or constant-noise copy).
 
     Returns:
         A Policy-wrapped InferenceModel exposing ``select_action(observation)``.
     """
     adapter_kwargs = {"INFERENCE_PRECISION_HINT": GPU_PRECISION_HINT} if OV_DEVICE == "GPU" else {}
-    inf_model = InferenceModel(EXPORT_DIR, device=OV_DEVICE, **adapter_kwargs)
+    inf_model = InferenceModel(export_dir, device=OV_DEVICE, **adapter_kwargs)
     return _wrap_policy(inf_model)
 
 
@@ -132,8 +223,16 @@ def main() -> None:
 
     logger.info("Building eager XR0 (%s, %s) ...", EAGER_DTYPE, EAGER_DEVICE)
     eager = build_eager()
-    logger.info("Loading exported OpenVINO IR from %s (device=%s) ...", EXPORT_DIR, OV_DEVICE)
-    export = build_export()
+
+    export_dir = EXPORT_DIR
+    if CONSTANT_NOISE:
+        logger.info("Baking constant noise into IR -> %s ...", CONST_NOISE_DIR)
+        noise_np = bake_constant_noise(EXPORT_DIR, CONST_NOISE_DIR, CONST_NOISE_SEED)
+        patch_eager_noise(eager, noise_np)
+        export_dir = CONST_NOISE_DIR
+
+    logger.info("Loading exported OpenVINO IR from %s (device=%s) ...", export_dir, OV_DEVICE)
+    export = build_export(export_dir)
     logger.info("Building LIBERO gym %s task %d ...", TASK_SUITE, TASK_ID)
     gym = build_gym()
 
