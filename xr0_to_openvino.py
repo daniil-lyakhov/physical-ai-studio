@@ -33,7 +33,7 @@ policy = XR0(
     pretrained_name_or_path=CHECKPOINT,
     dataset_stats=stats,
     vlm_attn_implementation="sdpa",
-    dtype="float16",
+    dtype="bfloat16",
 )
 policy.get_supported_export_backends = lambda: [ExportBackend.TORCH, ExportBackend.OPENVINO]
 
@@ -95,11 +95,14 @@ def _rmsnorm_forward_positive_axis(self: torch.nn.Module, hidden_states: torch.T
 Qwen2RMSNorm.forward = _rmsnorm_forward_positive_axis
 Qwen3VLTextRMSNorm.forward = _rmsnorm_forward_positive_axis
 
-# The DiT action head runs in f16 (``dtype="float16"``), but ``XR0Model._run``
-# casts the ``action`` output to f32 while in in-graph export mode, so
-# ``to_openvino`` emits a single, self-consistent f32-output IR that the Runtime
-# OpenVINO adapter can read with NumPy directly -- no fragile post-hoc re-save of
-# the multi-GB ``.bin``.
+# The DiT action head runs in bf16 (``dtype="bfloat16"``, matching the training /
+# eager precision), but ``XR0Model._run`` casts the ``action`` output to f32 while
+# in in-graph export mode, so ``to_openvino`` emits a single, self-consistent
+# f32-output IR that the Runtime OpenVINO adapter can read with NumPy directly --
+# no fragile post-hoc re-save of the multi-GB ``.bin``. bf16 (not fp16) is used
+# deliberately: the Intel GPU runs this IR under ``INFERENCE_PRECISION_HINT=f32``
+# anyway (the RoPE f16 OpenCL kernel fails to build), so fp16 weights would give
+# no speed benefit while risking VLM attention overflow (fp16 caps at 65504).
 policy.to_openvino("xr0_ir", input_sample=input_sample)
 
 # GPU-friendliness pass: the Qwen3-VL attention-mask builder lowers to a GatherND
