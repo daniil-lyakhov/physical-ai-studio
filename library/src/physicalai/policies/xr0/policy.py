@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DTYPES: dict[str, torch.dtype] = {"bfloat16": torch.bfloat16, "float32": torch.float32}
+_DTYPES: dict[str, torch.dtype] = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 
 class XR0(ExportablePolicyMixin, Policy):
@@ -57,7 +57,7 @@ class XR0(ExportablePolicyMixin, Policy):
             (``list[Feature]``). Must be given together with ``input_features``.
         vlm_model_id: HuggingFace id of the Qwen3-VL backbone.
         vlm_attn_implementation: Attention backend for the VLM.
-        dtype: Model precision (``"bfloat16"`` or ``"float32"``).
+        dtype: Model precision (``"bfloat16"``, ``"float16"`` or ``"float32"``).
         n_obs_steps: Number of observation steps.
         chunk_size: Number of action steps to predict.
         n_action_steps: Number of action steps to execute.
@@ -112,7 +112,7 @@ class XR0(ExportablePolicyMixin, Policy):
         pretrained_name_or_path: str | Path | None = None,
         vlm_model_id: str = "Qwen/Qwen3-VL-4B-Instruct",
         vlm_attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "flash_attention_2",
-        dtype: Literal["bfloat16", "float32"] = "bfloat16",
+        dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16",
         n_obs_steps: int = 1,
         chunk_size: int = 30,
         n_action_steps: int = 30,
