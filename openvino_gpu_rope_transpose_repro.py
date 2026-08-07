@@ -159,10 +159,13 @@ def try_device(ovm: ov.Model, device: str, dtype_name: str) -> bool:
     we are hunting happens at compile time."""
     core = ov.Core()
     cfg = {}
-    # Force the plugin to keep the target inference precision (don't let it
-    # silently upcast f16 -> f32 and hide the kernel-build failure).
-    if dtype_name in ("float16", "bfloat16"):
-        cfg["INFERENCE_PRECISION_HINT"] = "f16" if dtype_name == "float16" else "bf16"
+    # Force the plugin to keep f16 execution for float16 (don't let it silently
+    # upcast f16 -> f32 and hide a kernel-build failure). NOTE: the Intel GPU
+    # plugin rejects "bf16" as an INFERENCE_PRECISION_HINT value outright, and it
+    # executes bf16 models as f16 anyway, so for bfloat16 we leave the hint unset
+    # (setting it to bf16 would raise a *config* error, not the kernel-build bug).
+    if dtype_name == "float16":
+        cfg["INFERENCE_PRECISION_HINT"] = "f16"
     try:
         compiled = core.compile_model(ovm, device, cfg)
     except Exception as e:  # noqa: BLE001
