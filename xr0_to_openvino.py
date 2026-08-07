@@ -33,6 +33,7 @@ policy = XR0(
     pretrained_name_or_path=CHECKPOINT,
     dataset_stats=stats,
     vlm_attn_implementation="sdpa",
+    dtype="float16",
 )
 policy.get_supported_export_backends = lambda: [ExportBackend.TORCH, ExportBackend.OPENVINO]
 
@@ -94,10 +95,11 @@ def _rmsnorm_forward_positive_axis(self: torch.nn.Module, hidden_states: torch.T
 Qwen2RMSNorm.forward = _rmsnorm_forward_positive_axis
 Qwen3VLTextRMSNorm.forward = _rmsnorm_forward_positive_axis
 
-# The DiT action head runs in bf16, but ``XR0Model._run`` casts the ``action``
-# output to f32 while in in-graph export mode, so ``to_openvino`` emits a single,
-# self-consistent f32-output IR that the Runtime OpenVINO adapter can read with
-# NumPy directly -- no fragile post-hoc re-save of the multi-GB ``.bin``.
+# The DiT action head runs in f16 (``dtype="float16"``), but ``XR0Model._run``
+# casts the ``action`` output to f32 while in in-graph export mode, so
+# ``to_openvino`` emits a single, self-consistent f32-output IR that the Runtime
+# OpenVINO adapter can read with NumPy directly -- no fragile post-hoc re-save of
+# the multi-GB ``.bin``.
 policy.to_openvino("xr0_ir", input_sample=input_sample)
 
 # GPU-friendliness pass: the Qwen3-VL attention-mask builder lowers to a GatherND
@@ -121,29 +123,6 @@ for _gnd in [op for op in _ovm.get_ops() if op.get_type_name() == "GatherND"]:
     _gnd.input(0).replace_source_output(_d32.output(0))
     _gnd.validate_and_infer_types()
     _back = _ops.convert(_gnd.output(0), destination_type="boolean")
-    for _ti in _consumers:
-        _ti.replace_source_output(_back.output(0))
-
-# GPU-friendliness pass 2: the Intel GPU OpenVINO plugin cannot build the OpenCL
-# kernel for a bf16 4-D ``Transpose`` -- the attention ``.transpose(1, 2)`` permute
-# [0,2,1,3] on [1,32,8,128] -- ``clBuildProgram`` fails (and segfaults under
-# ``OV_GPU_Verbose=1``). The identical permute in f16/f32 builds fine, so this is a
-# plugin bug specific to the bf16 permute kernel (see
-# ``openvino_gpu_bf16_transpose_bug.md`` and ``openvino_gpu_bf16_transpose_repro.py``).
-# Mitigate ONLY that op by wrapping every bf16 Transpose as
-# ``Convert(bf16->f32) -> Transpose(f32) -> Convert(f32->bf16)``. A transpose is pure
-# data movement and every bf16 value is exactly representable in f32, so the
-# round-trip is numerically identical -- the model stays bit-for-bit bf16, preserving
-# parity with the Pi0.5 export while selecting the working f32 permute kernel.
-for _tr in [op for op in _ovm.get_ops() if op.get_type_name() == "Transpose"]:
-    _tin = _tr.input_value(0)
-    if _tin.get_element_type() != ov.Type.bf16:
-        continue
-    _consumers = list(_tr.output(0).get_target_inputs())
-    _f32 = _ops.convert(_tin, destination_type="f32")
-    _tr.input(0).replace_source_output(_f32.output(0))
-    _tr.validate_and_infer_types()
-    _back = _ops.convert(_tr.output(0), destination_type="bf16")
     for _ti in _consumers:
         _ti.replace_source_output(_back.output(0))
 

@@ -26,7 +26,10 @@ class XR0Config(Config):
         vlm_attn_implementation: Attention backend for the VLM. Defaults to
             ``"flash_attention_2"``.
         dtype: Precision for model weights. Options: ``"bfloat16"``,
-            ``"float32"``. Defaults to ``"bfloat16"``.
+            ``"float16"``, ``"float32"``. Defaults to ``"bfloat16"``. Use
+            ``"float16"`` when exporting to OpenVINO for Intel GPU: the GPU
+            plugin cannot build the OpenCL kernel for bf16 attention permutes,
+            while the f16 kernel builds correctly.
         n_obs_steps: Number of observation steps to use. Defaults to 1.
         chunk_size: Number of action steps to predict (action horizon).
             Defaults to 30.
@@ -93,7 +96,7 @@ class XR0Config(Config):
 
     vlm_model_id: str = "Qwen/Qwen3-VL-4B-Instruct"
     vlm_attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "flash_attention_2"
-    dtype: Literal["bfloat16", "float32"] = "bfloat16"
+    dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
 
     n_obs_steps: int = 1
     chunk_size: int = 30
@@ -151,7 +154,7 @@ class XR0Config(Config):
             msg = f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"
             raise ValueError(msg)
 
-        if self.dtype not in {"bfloat16", "float32"}:
+        if self.dtype not in {"bfloat16", "float16", "float32"}:
             msg = f"Invalid dtype: {self.dtype}"
             raise ValueError(msg)
 
