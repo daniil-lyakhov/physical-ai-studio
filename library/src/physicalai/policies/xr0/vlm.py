@@ -351,14 +351,17 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
     ) -> None:
         """Bake the fixed image geometry as constants for a self-contained export.
 
-        For a fixed image size and prompt layout the 3D MRoPE ``position_ids``, the
-        ``image_grid_thw`` geometry and the image-token positions are all
-        deterministic. This precomputes them once from a representative
-        (right-padded) sample and stores them as non-persistent constant buffers,
-        then enables in-graph export mode. During :meth:`forward` (export mode) the
-        real vision tower runs on ``pixel_values`` with the constant
-        ``image_grid_thw`` (so its ``tensor.tolist()`` geometry folds), the
-        constant ``position_ids`` are injected (skipping the non-traceable
+        For a fixed image size the ``image_grid_thw`` geometry, the image-token
+        positions and the MRoPE ``position_ids`` of the fixed prefix (system
+        prompt + image grid) are deterministic. This precomputes them once from a
+        representative (right-padded) sample and stores them as non-persistent
+        constant buffers, then enables in-graph export mode. During :meth:`forward`
+        (export mode) the real vision tower runs on ``pixel_values`` with the
+        constant ``image_grid_thw`` (so its ``tensor.tolist()`` geometry folds),
+        the ``position_ids`` are rebuilt for the runtime prompt length (the fixed
+        prefix reused verbatim, the variable-length post-image task text
+        recomputed from ``attention_mask`` -- see
+        :meth:`_runtime_export_position_ids` -- skipping the non-traceable
         rope-index builder), and the merge / deepstack scatters use the constant
         integer index (``index_copy`` -> ``ScatterND``) instead of the
         OpenVINO-hostile ``masked_scatter``.
@@ -382,6 +385,18 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
             if hasattr(self, name):
                 delattr(self, name)
             self.register_buffer(name, tensor.detach().clone(), persistent=False)
+        # Everything up to (and including) the last image token -- the fixed
+        # system-prompt text and the fixed image grid -- has deterministic MRoPE
+        # positions, so it stays baked. The *task text* after the image varies in
+        # length between prompts, so its positions must be recomputed at inference
+        # from the runtime ``attention_mask`` (see :meth:`_runtime_export_position_ids`);
+        # otherwise a prompt longer than this sample would leave its trailing
+        # tokens with the sample's padding position id (0), corrupting RoPE. The
+        # post-image text is plain 1D sequential (all three MRoPE axes equal), so
+        # we only need where it starts and its first position value.
+        post_image_start = int(image_token_indices.max().item()) + 1
+        self._export_post_image_start = post_image_start
+        self._export_post_image_base = int(position_ids[0, 0, post_image_start].item())
         # Keep the vision geometry as a *Python* constant too. ``torch.export``
         # lifts registered buffers as tensor inputs, so ``grid_thw.tolist()`` in
         # the vision tower would yield unbacked symints; the export-time tower
@@ -392,6 +407,39 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         # under export); the attention patch splits by these constant ints instead.
         self._export_vision_seqlens = [h * w for t, h, w in self._export_grid_list for _ in range(t)]
         self._ingraph_export = True
+
+    def _runtime_export_position_ids(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Rebuild the export MRoPE ``position_ids`` for the runtime prompt length.
+
+        The baked ``_export_position_ids`` are only correct for prompts whose
+        valid length matches the export sample: a longer prompt's trailing task
+        tokens would inherit the sample's padding position id (0). The prefix
+        (system-prompt text + fixed image grid, up to ``_export_post_image_start``)
+        is identical for every prompt, so it is reused verbatim; the post-image
+        task text is plain 1D sequential (all three MRoPE axes equal), so its
+        positions are recomputed as ``base + cumulative_valid_index`` from the
+        runtime ``attention_mask``. All ops are trace-friendly (``ScatterND``-free
+        elementwise / ``cumsum`` / ``where``), unlike the data-dependent
+        ``get_rope_index`` builder.
+
+        Args:
+            attention_mask: The runtime attention mask ``(1, L)``.
+
+        Returns:
+            The 3D MRoPE ``position_ids`` tensor ``(3, 1, L)`` for this prompt.
+        """
+        baked = self._export_position_ids
+        seq_len = baked.shape[-1]
+        mask = attention_mask.reshape(-1)[:seq_len].to(torch.long)
+        seq_index = torch.arange(seq_len, device=baked.device)
+        in_tail = seq_index >= self._export_post_image_start
+        valid_tail = mask * in_tail.to(torch.long)
+        # 0-based running index among the valid post-image tokens.
+        tail_index = torch.cumsum(valid_tail, dim=0) - 1
+        tail_pos = (self._export_post_image_base + tail_index).clamp_min(0)
+        use_tail = (in_tail & (mask > 0)).reshape(1, 1, seq_len).expand_as(baked)
+        tail_pos = tail_pos.reshape(1, 1, seq_len).expand_as(baked)
+        return torch.where(use_tail, tail_pos, baked)
 
     def image_token_positions(self, input_ids: torch.LongTensor) -> torch.Tensor:
         """Return the integer sequence positions of the image tokens.
@@ -588,7 +636,7 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         """
         if getattr(self, "_ingraph_export", False):
             image_grid_thw = self._export_image_grid_thw
-            position_ids = self._export_position_ids
+            position_ids = self._runtime_export_position_ids(attention_mask)
             self._image_token_indices = self._export_image_token_indices
             self._ensure_export_patch()
             if mm_token_type_ids is None and input_ids is not None:

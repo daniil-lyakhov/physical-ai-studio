@@ -9,11 +9,12 @@ from physicalai.policies.xr0.pretrained_utils import extract_xr0_dataset_stats
 
 CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-LIBERO"
 # Fixed, right-padded prompt length the exported graph is baked for. The image
-# tokens are a constant prefix and only the task text varies, so the baked MRoPE
-# ``position_ids`` / image-token positions stay valid for any prompt padded (on
-# the right, masked by ``attention_mask``) to this length. Derived from the
-# policy config below so it matches the ``seq_len`` the manifest's
-# ``XR0InferencePreprocessor`` right-pads to at inference time.
+# tokens are a constant prefix; the post-image task text varies in length between
+# prompts, so its MRoPE ``position_ids`` are recomputed in-graph from the runtime
+# ``attention_mask`` (see ``XR0Qwen3VL._runtime_export_position_ids``) -- only the
+# fixed prefix (system prompt + image grid) and the image-token positions stay
+# baked. Derived from the policy config below so it matches the ``seq_len`` the
+# manifest's ``XR0InferencePreprocessor`` right-pads to at inference time.
 
 # The checkpoint only carries *action* normalization stats, so the auto-generated
 # export sample would be missing the ``state``/image tensors the preprocessor needs
@@ -33,7 +34,7 @@ policy = XR0(
     pretrained_name_or_path=CHECKPOINT,
     dataset_stats=stats,
     vlm_attn_implementation="sdpa",
-    dtype="float32",
+    dtype="bfloat16",
 )
 policy.get_supported_export_backends = lambda: [ExportBackend.TORCH, ExportBackend.OPENVINO]
 
