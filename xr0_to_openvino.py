@@ -35,6 +35,12 @@ policy = XR0(
     dataset_stats=stats,
     vlm_attn_implementation="sdpa",
     dtype="bfloat16",
+    # Execute only 10 of the 30 predicted actions before replanning. This makes
+    # ``chunk_size (30) != n_action_steps (10)``, so the export emits an
+    # ``action_chunk_trimmer`` into the manifest and the deployed Runtime replans
+    # every 10 steps -- matching the working eager LIBERO eval (liber_xr0_.py).
+    # Executing all 30 open-loop overshoots the target and collapses success ~0%.
+    n_action_steps=10,
 )
 policy.get_supported_export_backends = lambda: [ExportBackend.TORCH, ExportBackend.OPENVINO]
 
