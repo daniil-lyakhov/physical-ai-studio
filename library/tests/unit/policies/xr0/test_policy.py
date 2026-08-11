@@ -24,8 +24,10 @@ from physicalai.export.backends import TorchExportParameters
 from physicalai.inference.data import InferenceFeatureType
 from physicalai.policies import get_physicalai_policy_class, get_policy
 from physicalai.policies.xr0 import XR0, XR0Config
+from physicalai.policies.xr0.export_openvino import ov_friendly_rmsnorm_forward
 from physicalai.policies.xr0.vlm import (
     export_add_deepstack_embeds,
+    export_build_additive_causal_mask,
     export_fast_pos_embed_interpolate,
     export_rot_pos_emb,
     export_scatter_visual_embeds,
@@ -360,3 +362,65 @@ class TestExportPatchParity:
 
         assert exported.shape == stock.shape
         assert torch.allclose(exported, stock, atol=1e-6)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "attention_mask",
+        [
+            [[1, 1, 1, 1, 1]],  # no padding -> pure causal
+            [[1, 1, 1, 0, 0]],  # right padding
+            [[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]],  # batched, mixed padding
+        ],
+    )
+    def test_build_additive_causal_mask_matches_stock(
+        self,
+        attention_mask: list[list[int]],
+        dtype: torch.dtype,
+    ) -> None:
+        """``export_build_additive_causal_mask`` matches stock ``eager_mask``."""
+        from transformers.masking_utils import eager_mask
+
+        mask = torch.tensor(attention_mask, dtype=torch.long)
+        batch, seq_len = mask.shape
+
+        stock = eager_mask(
+            batch_size=batch,
+            q_length=seq_len,
+            kv_length=seq_len,
+            attention_mask=mask.to(torch.bool),
+            dtype=dtype,
+        )
+        exported = export_build_additive_causal_mask(mask, dtype)
+
+        assert exported.shape == (batch, 1, seq_len, seq_len)
+        assert exported.shape == stock.shape
+        assert exported.dtype == stock.dtype
+        assert torch.equal(exported, stock)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("shape", [(2, 16), (2, 5, 16), (1, 3, 4, 16)])
+    def test_ov_friendly_rmsnorm_matches_stock(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> None:
+        """``ov_friendly_rmsnorm_forward`` matches stock ``Qwen3VLTextRMSNorm``."""
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextRMSNorm
+
+        torch.manual_seed(0)
+        hidden = shape[-1]
+        norm = Qwen3VLTextRMSNorm(hidden).eval()
+        with torch.no_grad():
+            # Randomize the weight so the weight-scaling path is exercised.
+            norm.weight.copy_(torch.randn(hidden))
+        x = torch.randn(*shape, dtype=dtype)
+
+        with torch.no_grad():
+            # Clone per call: the export forward reduces over ``dim() - 1`` in
+            # place on its float32 copy, which for a float32 input would alias x.
+            stock = norm(x.clone())
+            exported = ov_friendly_rmsnorm_forward(norm, x.clone())
+
+        assert exported.shape == stock.shape
+        assert exported.dtype == stock.dtype
+        assert torch.equal(exported, stock)

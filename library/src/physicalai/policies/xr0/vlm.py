@@ -285,6 +285,38 @@ def export_add_deepstack_embeds(
     return updated.unsqueeze(0)
 
 
+def export_build_additive_causal_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Build a 4-D additive causal mask from a 2-D padding mask.
+
+    OpenVINO-friendly replacement for the text model's default SDPA mask builder.
+    The stock builder combines the causal and padding masks with a vmapped
+    advanced index (``padding_mask[batch_idx, kv_idx]``), which lowers to a
+    boolean ``GatherND`` the Intel GPU plugin has no kernel for. Passing an
+    already-4-D mask makes ``create_causal_mask`` early-exit and return it as-is
+    (see ``transformers.masking_utils._preprocess_mask_arguments``), so the gather
+    is never emitted. This builds the same mask with pure broadcasting
+    (comparisons + ``where`` -> ``Less``/``And``/``Select``, all convertible).
+
+    Args:
+        attention_mask: The 2-D padding mask ``(batch, seq_len)`` (1 = keep,
+            0 = pad).
+        dtype: The floating dtype of the attention scores; masked positions are
+            filled with its most-negative value.
+
+    Returns:
+        A ``(batch, 1, seq_len, seq_len)`` additive mask (``0`` where attended,
+        ``finfo(dtype).min`` where masked).
+    """
+    batch, seq_len = attention_mask.shape
+    device = attention_mask.device
+    positions = torch.arange(seq_len, device=device)
+    causal = positions[None, :] <= positions[:, None]  # (q, kv): kv <= q
+    keep_kv = attention_mask.to(torch.bool).reshape(batch, 1, seq_len)  # valid key positions
+    allowed = causal[None, :, :] & keep_kv  # (batch, q, kv)
+    additive = torch.where(allowed, 0.0, torch.finfo(dtype).min).to(dtype)
+    return additive.unsqueeze(1)
+
+
 class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
     """Stock Qwen3-VL that also exposes the 3D MRoPE ``position_ids``.
 
@@ -571,6 +603,15 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
                     attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     mm_token_type_ids=mm_token_type_ids,
+                )
+            # Pre-build the 4-D additive causal mask so the text model's SDPA mask
+            # builder early-exits instead of emitting a boolean ``GatherND`` the
+            # OpenVINO GPU plugin cannot compile (see
+            # :func:`export_build_additive_causal_mask`).
+            if attention_mask is not None:
+                attention_mask = export_build_additive_causal_mask(
+                    attention_mask,
+                    cast("torch.Tensor", inputs_embeds).dtype,
                 )
             outputs = inner.language_model(
                 input_ids=None,

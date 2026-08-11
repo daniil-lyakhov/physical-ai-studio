@@ -23,7 +23,7 @@ from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
 
 from .config import XR0Config
-from .export_openvino import install_ov_friendly_rmsnorm, rewrite_openvino_gpu_friendly
+from .export_openvino import install_ov_friendly_rmsnorm
 from .preprocessor import make_xr0_preprocessors
 from .pretrained_utils import extract_xr0_dataset_stats, load_xr0_pretrained_weights, resolve_pretrained_path
 from .vla import XR0Model
@@ -878,7 +878,7 @@ class XR0(ExportablePolicyMixin, Policy):
                 # before tracing, then rewrite boolean ``GatherND`` ops to ``i32``
                 # in the written IR so it also loads on the Intel GPU plugin.
                 pre_export_hooks=[self._bake_ingraph_export],
-                post_export_hooks=[rewrite_openvino_gpu_friendly],
+                post_export_hooks=[],
             )
 
         return extra_args
