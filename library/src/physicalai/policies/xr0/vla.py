@@ -16,6 +16,7 @@ computes the flow-matching loss. It exposes the framework
 
 from __future__ import annotations
 
+import logging
 import random
 from typing import Any, cast
 
@@ -27,6 +28,8 @@ from physicalai.policies.base import Model
 
 from .model import XR0FlowModel
 from .vlm import XR0Qwen3VL
+
+logger = logging.getLogger(__name__)
 
 # Extra MRoPE offset applied to the (non-prefix) action tokens so they do not
 # collide with the state / prefix positions (matches the source implementation).
@@ -488,6 +491,30 @@ class XR0Model(Model):
             weight = None
 
         if return_loss:
+            # One-shot magnitude diagnostic: isolates the source of a loss
+            # explosion (raw state scale vs VLM cache vs DiT output). Fires once
+            # per process on the first training forward.
+            if self.training and not getattr(self, "_xr0_diag_logged", False):
+                self._xr0_diag_logged = True
+                with torch.no_grad():
+
+                    def amax(tensor: torch.Tensor) -> float:
+                        return float(tensor.detach().float().abs().max())
+
+                    pkv_k = max(amax(layer[0]) for layer in past_key_values)
+                    pkv_v = max(amax(layer[1]) for layer in past_key_values)
+                    logger.warning(
+                        "[XR0 diag] state|max=%.4g state_embed|max=%.4g pkv_k|max=%.4g "
+                        "pkv_v|max=%.4g noise|max=%.4g action|max=%.4g pred|max=%.4g target|max=%.4g",
+                        amax(state),
+                        amax(state_embed),
+                        pkv_k,
+                        pkv_v,
+                        amax(noise),
+                        amax(action),
+                        amax(pred),
+                        amax(target),
+                    )
             return self._flow_loss(pred, target, action_mask, weight)
         # The DiT action head runs in bf16, which NumPy cannot represent, so the
         # Runtime OpenVINO adapter would fail to read a bf16 ``action`` output. In
