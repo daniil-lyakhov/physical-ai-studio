@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------- #
 
 
-def export_rot_pos_emb(visual: torch.nn.Module, grid_thw_list: list[list[int]]) -> torch.Tensor:
+def export_rot_pos_emb(visual: torch.nn.Module, grid_thw_list: list[list[int]]) -> torch.Tensor:  # noqa: PLR0914
     """Vision rotary position embeddings driven by a *Python* grid list.
 
     Numerically identical to stock ``Qwen3VLVisionModel.rot_pos_emb``, but it
@@ -96,7 +96,7 @@ def export_rot_pos_emb(visual: torch.nn.Module, grid_thw_list: list[list[int]]) 
     return embeddings.flatten(1)
 
 
-def export_fast_pos_embed_interpolate(visual: torch.nn.Module, grid_thw_list: list[list[int]]) -> torch.Tensor:
+def export_fast_pos_embed_interpolate(visual: torch.nn.Module, grid_thw_list: list[list[int]]) -> torch.Tensor:  # noqa: PLR0914
     """Bilinearly interpolate the learned position embeddings to the grid.
 
     Numerically identical to stock ``Qwen3VLVisionModel.fast_pos_embed_interpolate``,
@@ -161,14 +161,14 @@ def export_fast_pos_embed_interpolate(visual: torch.nn.Module, grid_thw_list: li
     # Blend the four gathered corners with their bilinear weights.
     pos_embeds = visual.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
     patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-    patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
+    patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws, strict=False)])
 
     # Reorder each image's patches into spatial_merge_size blocks so they line up
     # with the tower's merged token ordering.
     patch_pos_embeds_permute = []
     merge_size = visual.config.spatial_merge_size
-    for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-        pos_embed = pos_embed.repeat(t, 1)
+    for patch_pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws, strict=False):
+        pos_embed = patch_pos_embed.repeat(t, 1)
         pos_embed = (
             pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
             .permute(0, 1, 3, 2, 4, 5)
@@ -204,7 +204,7 @@ def export_vision_attn_forward(
     Returns:
         The ``(seq_len, dim)`` attention output.
     """
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb_vision  # noqa: PLC0415
 
     seq_length = hidden_states.shape[0]
     query_states, key_states, value_states = (
@@ -227,7 +227,7 @@ def export_vision_attn_forward(
             is_causal=False,
             scale=attn.scaling,
         ).transpose(1, 2)
-        for q, k, v in zip(*splits)
+        for q, k, v in zip(*splits, strict=False)
     ]
     attn_output = torch.cat(attn_outputs, dim=1)
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
@@ -483,6 +483,9 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
 
             Thin wrapper binding one attention module and the baked per-window
             token counts to :func:`export_vision_attn_forward`.
+
+            Returns:
+                The export-friendly ``forward`` callable for the block.
             """
 
             def _forward(
@@ -490,13 +493,13 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
                 cu_seqlens: torch.Tensor | None = None,  # noqa: ARG001
                 rotary_pos_emb: torch.Tensor | None = None,  # noqa: ARG001
                 position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-                **kwargs: object,
+                **kwargs: object,  # noqa: ARG001
             ) -> torch.Tensor:
                 return export_vision_attn_forward(
                     attn,
                     shim._export_vision_seqlens,  # noqa: SLF001
                     hidden_states,
-                    position_embeddings,
+                    cast("tuple[torch.Tensor, torch.Tensor]", position_embeddings),
                 )
 
             return _forward

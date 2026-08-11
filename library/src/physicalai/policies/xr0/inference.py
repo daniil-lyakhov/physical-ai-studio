@@ -30,11 +30,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-
-from physicalai.data.observation import IMAGES, STATE, TASK
 from physicalai.inference.constants import ACTION
 from physicalai.inference.postprocessors.base import Postprocessor
 from physicalai.inference.preprocessors.base import Preprocessor
+
+from physicalai.data.observation import IMAGES, STATE, TASK
 
 from .io import ACTION_EPS
 from .preprocessor import XR0Preprocessor
@@ -91,7 +91,11 @@ class XR0InferencePreprocessor(Preprocessor):
         image_factor: int = 32,
         image_max_pixels: int = 90000,
     ) -> None:
-        """Initialize the XR0 inference preprocessor."""
+        """Initialize the XR0 inference preprocessor.
+
+        Raises:
+            ValueError: If ``camera_views`` is empty or ``seq_len`` is not positive.
+        """
         super().__init__()
         camera_views = tuple(camera_views)
         if not camera_views:
@@ -125,7 +129,8 @@ class XR0InferencePreprocessor(Preprocessor):
             self._pad_id = self._preprocessor.processor.tokenizer.pad_token_id or 0
         return self._pad_id
 
-    def _to_batch(self, inputs: dict[str, object]) -> dict[str, object]:
+    @staticmethod
+    def _to_batch(inputs: dict[str, object]) -> dict[str, object]:
         """Assemble the Torch batch the training preprocessor consumes.
 
         Bridges the Runtime observation (NumPy, nested ``images`` dict, string
@@ -205,7 +210,9 @@ class XR0InferencePreprocessor(Preprocessor):
         attention_mask = processed["attention_mask"]
         cur_len = input_ids.shape[1]
         if cur_len > self._seq_len:
-            msg = f"Prompt ({cur_len} tokens) exceeds the baked seq_len={self._seq_len}; re-export with a larger length."
+            msg = (
+                f"Prompt ({cur_len} tokens) exceeds the baked seq_len={self._seq_len}; re-export with a larger length."
+            )
             raise ValueError(msg)
         pad = self._seq_len - cur_len
         if pad:
@@ -242,7 +249,11 @@ class XR0InferencePostprocessor(Postprocessor):
         action_dim: int | None = None,
         action_eps: float = ACTION_EPS,
     ) -> None:
-        """Initialize the XR0 inference postprocessor."""
+        """Initialize the XR0 inference postprocessor.
+
+        Raises:
+            ValueError: If ``action_mean`` and ``action_std`` shapes differ.
+        """
         super().__init__()
         self._mean = np.asarray(action_mean, dtype=np.float32)
         self._std = np.asarray(action_std, dtype=np.float32)

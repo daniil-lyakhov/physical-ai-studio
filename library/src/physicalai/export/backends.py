@@ -57,18 +57,19 @@ class ExportParameters:
         pre_export_hooks: Callables invoked in order right before the model is
             traced/converted. Use them to mutate the model in place for export
             (e.g. bake constants into the graph, swap ops for export-friendly
-            variants). Signature: ``() -> None``.
+            variants). Signature: ``() -> object`` (any return value is ignored).
         post_export_hooks: Callables invoked in order after the model has been
             written to disk. Each hook receives the path to the exported file
             and may modify the file in place (e.g. to patch the graph for a
-            specific runtime). Signature: ``(export_path: str | Path) -> None``.
+            specific runtime). Signature: ``(export_path: str | Path) -> object``
+            (any return value is ignored).
     """
 
     exporter_kwargs: dict = field(default_factory=dict)
     preprocessors_specs: list = field(default_factory=list)
     postprocessors_specs: list = field(default_factory=list)
-    pre_export_hooks: list[Callable[[], None]] = field(default_factory=list)
-    post_export_hooks: list[Callable[[str | Path], None]] = field(default_factory=list)
+    pre_export_hooks: list[Callable[[], object]] = field(default_factory=list)
+    post_export_hooks: list[Callable[[str | Path], object]] = field(default_factory=list)
 
 
 @dataclass

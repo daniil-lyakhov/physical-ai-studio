@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 from physicalai.inference.data import InferenceFeature, InferenceFeatureDtype, InferenceFeatureType
@@ -17,7 +17,7 @@ from physicalai.inference.manifest import ComponentSpec
 from physicalai.data.dataset import Dataset
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Feature, FeatureType, NormalizationParameters
 from physicalai.export import ExportablePolicyMixin, ExportBackend
-from physicalai.export.backends import ExportParameters, TorchExportParameters, OpenVINOExportParameters
+from physicalai.export.backends import ExportParameters, OpenVINOExportParameters, TorchExportParameters
 from physicalai.policies.base import Policy
 from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
@@ -421,9 +421,9 @@ class XR0(ExportablePolicyMixin, Policy):
             msg = "Model is not initialized"
             raise ValueError(msg)
         self.model.vlm.prepare_ingraph_export(
-            processed["input_ids"],
+            cast("torch.LongTensor", processed["input_ids"]),
             processed["attention_mask"],
-            processed["image_grid_thw"],
+            cast("torch.LongTensor", processed["image_grid_thw"]),
         )
         install_ov_friendly_rmsnorm(self.model)
 

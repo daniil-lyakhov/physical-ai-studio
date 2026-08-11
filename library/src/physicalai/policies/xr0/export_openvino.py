@@ -71,20 +71,30 @@ mapping, then atomically replacing both files avoids that.
 
 from __future__ import annotations
 
-import os
 import types
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
 import openvino as ov
 import openvino.opset13 as ops
 import torch
+
+if TYPE_CHECKING:
+    import os
 
 # Marker attribute used to make the RMSNorm install idempotent (re-running export
 # prep in the same process must not double-wrap a module's forward).
 _PATCHED_FLAG = "_ov_friendly_rmsnorm"
 
 
-def ov_friendly_rmsnorm_forward(self: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+class _RMSNormLike(Protocol):
+    """Structural type for the RMSNorm modules whose forward we swap."""
+
+    weight: torch.Tensor
+    variance_epsilon: float
+
+
+def ov_friendly_rmsnorm_forward(self: _RMSNormLike, hidden_states: torch.Tensor) -> torch.Tensor:
     """RMSNorm forward that reduces over a positive, static axis.
 
     Drop-in replacement for the stock ``Qwen2RMSNorm`` / ``Qwen3VLTextRMSNorm``
@@ -104,7 +114,7 @@ def ov_friendly_rmsnorm_forward(self: torch.nn.Module, hidden_states: torch.Tens
     hidden_states = hidden_states.to(torch.float32)
     axis = hidden_states.dim() - 1  # concrete positive int -> clean ReduceMean axis
     variance = hidden_states.pow(2).mean(axis, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    hidden_states *= torch.rsqrt(variance + self.variance_epsilon)
     return self.weight * hidden_states.to(input_dtype)
 
 
@@ -119,9 +129,7 @@ def _is_rmsnorm(module: torch.nn.Module) -> bool:
         ``True`` if the module is an RMSNorm whose forward should be swapped.
     """
     return (
-        type(module).__name__.endswith("RMSNorm")
-        and hasattr(module, "variance_epsilon")
-        and hasattr(module, "weight")
+        type(module).__name__.endswith("RMSNorm") and hasattr(module, "variance_epsilon") and hasattr(module, "weight")
     )
 
 
@@ -199,7 +207,7 @@ def rewrite_openvino_gpu_friendly(xml_path: str | os.PathLike[str]) -> int:
     bin_path = xml_path.with_suffix(".bin")
     ov.save_model(model, str(tmp_xml), compress_to_fp16=False)
     del model  # release the mmap on the source .bin before overwriting it
-    os.replace(tmp_xml, xml_path)
-    os.replace(tmp_bin, bin_path)
+    Path(tmp_xml).replace(xml_path)
+    Path(tmp_bin).replace(bin_path)
 
     return rewritten
