@@ -61,6 +61,9 @@ class XR0Model(Model):
         enable_freq: bool = False,
         prefix_mask_prob: float = 0.5,
         async_train: bool = False,
+        gradient_checkpointing: bool = False,
+        freeze_vision_encoder: bool = False,
+        freeze_input_embeddings: bool = False,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         """Assemble the VLM backbone and DiT action expert.
@@ -86,6 +89,10 @@ class XR0Model(Model):
             enable_freq: Add the frequency-domain loss term.
             prefix_mask_prob: Probability of masking a prefix token in training.
             async_train: Randomly condition on an action prefix during training.
+            gradient_checkpointing: Enable gradient checkpointing on the VLM
+                vision tower to trade compute for activation memory.
+            freeze_vision_encoder: Freeze the VLM vision tower parameters.
+            freeze_input_embeddings: Freeze the VLM token-embedding table.
             dtype: Model dtype.
         """
         super().__init__()
@@ -106,6 +113,16 @@ class XR0Model(Model):
                 dtype=dtype,
             )
         self.vlm = vlm
+
+        # Memory-footprint controls (mirror the original XR0 training recipe):
+        # checkpoint the vision tower's activations and freeze the (large)
+        # token-embedding table so it carries no gradients / optimizer state.
+        if gradient_checkpointing:
+            self.vlm.model.visual.gradient_checkpointing_enable()
+        if freeze_vision_encoder:
+            self.vlm.model.visual.requires_grad_(requires_grad=False)
+        if freeze_input_embeddings:
+            self.vlm.model.get_input_embeddings().requires_grad_(requires_grad=False)
 
         # DiT action expert + rectified-flow orchestration.
         self.flow = XR0FlowModel(

@@ -69,6 +69,9 @@ class XR0Config(Config):
         compile_mode: Torch compile mode. Defaults to ``"max-autotune"``.
         freeze_vision_encoder: Whether to freeze the vision encoder during
             training. Defaults to False.
+        freeze_input_embeddings: Whether to freeze the VLM token-embedding table
+            during training. Matches the original XR0 recipe and saves the
+            embedding's gradients / optimizer state. Defaults to True.
         normalization_mode: Normalization method for state/action features.
             ``"QUANTILES"`` maps data to [-1, 1] using the 1st and 99th
             percentiles; ``"MEAN_STD"`` uses zero-mean unit-variance
@@ -128,6 +131,7 @@ class XR0Config(Config):
     compile_mode: str = "max-autotune"
 
     freeze_vision_encoder: bool = False
+    freeze_input_embeddings: bool = True
 
     normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES"
 
