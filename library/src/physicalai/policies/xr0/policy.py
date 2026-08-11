@@ -23,6 +23,7 @@ from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
 
 from .config import XR0Config
+from .export_openvino import install_ov_friendly_rmsnorm, rewrite_openvino_gpu_friendly
 from .preprocessor import make_xr0_preprocessors
 from .pretrained_utils import extract_xr0_dataset_stats, load_xr0_pretrained_weights, resolve_pretrained_path
 from .vla import XR0Model
@@ -403,6 +404,12 @@ class XR0(ExportablePolicyMixin, Policy):
         preprocessor; the graph is then valid for any prompt padded to the same
         length.
 
+        Also installs the OpenVINO-friendly RMSNorm forward on every RMSNorm
+        instance in the model (see
+        :func:`~physicalai.policies.xr0.export_openvino.install_ov_friendly_rmsnorm`)
+        so the exported IR loads instead of failing on a mis-materialized negative
+        ``ReduceMean`` axis.
+
         Args:
             processed: A preprocessor output dict containing ``input_ids``,
                 ``attention_mask`` and ``image_grid_thw``.
@@ -418,6 +425,69 @@ class XR0(ExportablePolicyMixin, Policy):
             processed["attention_mask"],
             processed["image_grid_thw"],
         )
+        install_ov_friendly_rmsnorm(self.model)
+
+    def _build_padded_export_sample(self) -> dict[str, torch.Tensor]:
+        """Preprocess the policy's sample input and right-pad it to the graph length.
+
+        Runs :attr:`sample_input` through the preprocessor and right-pads
+        ``input_ids``/``attention_mask`` to ``config.tokenizer_max_length`` -- the
+        same fixed length the manifest's ``XR0InferencePreprocessor`` pads to at
+        inference time -- so the exported static graph and the native pipeline
+        agree.
+
+        Returns:
+            The padded ``processed`` dict (``input_ids``, ``attention_mask``,
+            ``pixel_values``, ``image_grid_thw``, ``state``).
+
+        Raises:
+            ValueError: If the model/preprocessor are not initialized, or the
+                sample prompt is longer than ``tokenizer_max_length``.
+        """
+        if self.model is None or self._preprocessor is None or self.sample_input is None:
+            msg = "Model is not initialized"
+            raise ValueError(msg)
+
+        seq_len = self.config.tokenizer_max_length
+        processed = self._preprocessor(self.sample_input)
+        pad_id = self._preprocessor.processor.tokenizer.pad_token_id or 0
+        cur_len = processed["input_ids"].shape[1]
+        if cur_len > seq_len:
+            msg = f"Sample prompt ({cur_len} tokens) exceeds tokenizer_max_length={seq_len}."
+            raise ValueError(msg)
+        pad = seq_len - cur_len
+        if pad:
+            processed["input_ids"] = torch.nn.functional.pad(processed["input_ids"], (0, pad), value=pad_id)
+            processed["attention_mask"] = torch.nn.functional.pad(processed["attention_mask"], (0, pad), value=0)
+        return processed
+
+    def _bake_ingraph_export(self) -> None:
+        """Pre-export hook: bake the vision geometry and OpenVINO-friendly RMSNorm.
+
+        Registered as a ``pre_export_hooks`` entry for the OpenVINO backend (see
+        :attr:`extra_export_args`) so the base
+        :meth:`ExportablePolicyMixin.to_openvino` runs it in place before tracing.
+        """
+        self.prepare_ingraph_export(self._build_padded_export_sample())
+
+    def _get_default_export_input_sample(self) -> dict[str, torch.Tensor]:
+        """Return the traced input sample for the self-contained OpenVINO graph.
+
+        Overrides the base helper: the exported graph consumes the *padded*
+        preprocessor tensors and excludes ``image_grid_thw`` (the shim supplies it
+        as a baked constant; keeping it would reintroduce the non-traceable
+        ``tensor.tolist()`` vision geometry). The graph consumes
+        ``{input_ids, attention_mask, pixel_values, state} -> action``.
+
+        Returns:
+            The padded traced-input dict, without ``image_grid_thw``.
+        """
+        processed = self._build_padded_export_sample()
+        return {
+            name: tensor
+            for name, tensor in processed.items()
+            if name != "image_grid_thw" and isinstance(tensor, torch.Tensor)
+        }
 
     def training_step(self, batch: Observation, batch_idx: int) -> torch.Tensor:
         """Lightning training step.
@@ -482,13 +552,15 @@ class XR0(ExportablePolicyMixin, Policy):
     def get_supported_export_backends() -> list[str | ExportBackend]:
         """Get the list of export backends supported by the policy.
 
-        XR0 wraps a Qwen3-VL backbone, so only the tracing-free Torch backend is
-        supported; graph-based backends (ONNX/OpenVINO/ExecuTorch) are not.
+        XR0 supports the tracing-free Torch backend and a self-contained OpenVINO
+        graph. The OpenVINO path bakes the vision geometry, rebuilds the MRoPE
+        ``position_ids`` in-graph and applies the export workarounds inside
+        :meth:`to_openvino`. ONNX/ExecuTorch are not supported.
 
         Returns:
             list[str | ExportBackend]: The supported export backends.
         """
-        return [ExportBackend.TORCH]
+        return [ExportBackend.TORCH, ExportBackend.OPENVINO]
 
     @staticmethod
     def _coerce_dataset_feature(feature: Feature) -> Feature:
@@ -802,6 +874,11 @@ class XR0(ExportablePolicyMixin, Policy):
                 via_onnx=True,
                 preprocessors_specs=[ov_preproc],
                 postprocessors_specs=ov_postproc_specs,
+                # Bake the vision geometry + install OpenVINO-friendly RMSNorm
+                # before tracing, then rewrite boolean ``GatherND`` ops to ``i32``
+                # in the written IR so it also loads on the Intel GPU plugin.
+                pre_export_hooks=[self._bake_ingraph_export],
+                post_export_hooks=[rewrite_openvino_gpu_friendly],
             )
 
         return extra_args

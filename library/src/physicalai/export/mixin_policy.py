@@ -487,6 +487,9 @@ class ExportablePolicyMixin:
 
             self.model.eval()
 
+            for pre_hook in extra_model_args.pre_export_hooks:
+                pre_hook()
+
             if extra_model_args.via_onnx:
                 with tempfile.NamedTemporaryFile(suffix=".onnx") as tmp:
                     self._onnx_core_export_step(
@@ -536,6 +539,9 @@ class ExportablePolicyMixin:
             input_features=self._to_component_specs(self.inputs_schema or []),
             output_features=self._to_component_specs(self.outputs_schema or []),
         )
+
+        for post_hook in extra_model_args.post_export_hooks:
+            post_hook(model_path)
 
     @torch.no_grad()
     def to_executorch(
