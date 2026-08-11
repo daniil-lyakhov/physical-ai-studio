@@ -24,26 +24,54 @@ preprocessor is used at train / `select_action` / export, the layout only needs
 to be self-consistent, and the `state_projector` is retrained. It would only
 matter for zero-shot reuse of a frozen projector. **No action required.**
 
-## Divergence 2 — state units / scale (ROOT CAUSE of the loss explosion)
+## Divergence 2 — state units / scale (secondary)
 
 - Upstream feeds **raw** state, which works only because its joints are
   ~radian-scale (O(1-3)). This dataset's state is **joint positions in degrees**
   (O(100), per-dim std ~4-48).
-- Fed unnormalized into the pretrained `state_projector` + DiT AdaLN modulation
-  (16 layers), the out-of-scale state blows up the conditioning -> `pred` ~1e3-1e4
-  while the (normalized) target is O(1) -> masked MSE in the **hundreds of
-  millions**.
+- Fed unnormalized into the pretrained `state_projector` + DiT AdaLN modulation,
+  the out-of-scale state can distort the conditioning.
 
-**Status: FIXED.** `XR0Preprocessor` now supports opt-in state normalization
-(`normalize_state`, identity by default). Enabled via `XR0(normalize_state=True)`
-in `train_local_xr0.py`, it maps state to zero-mean/unit-std (O(1)), matching
-what the conditioning expects. The stats are persisted with the checkpoint and
-baked into the exported manifest (`XR0InferencePreprocessor`), so train /
-benchmark / export stay in lockstep. Raw-state checkpoints (LIBERO/Pretrain) are
-unaffected because the default is identity.
+**Status: mitigated.** `XR0Preprocessor` now supports opt-in state normalization
+(`normalize_state`, identity by default), enabled via `XR0(normalize_state=True)`
+in `train_local_xr0.py`. It maps state to zero-mean/unit-std, matching what the
+conditioning expects. Stats are persisted with the checkpoint and baked into the
+exported manifest, so train / benchmark / export stay in lockstep. Raw-state
+checkpoints (LIBERO/Pretrain) are unaffected because the default is identity.
 
-**Expected effect:** first-batch loss should start in a sane range (single/double
-digits) instead of ~1e8.
+**Note:** enabling `normalize_state` alone did **not** fix the loss explosion.
+See the real root cause below.
+
+## ROOT CAUSE — normalization used the *checkpoint's* stats, not the dataset's
+
+**Symptom (first-batch diagnostic):** `state|max=1.106e5`, `target|max=1.106e5`,
+`pred|max=83`. The flow `target = noise - action_norm` is ~1.1e5 (not O(1)), and
+`pred` is fine. So `loss_mse ≈ mean(target²) ≈ (1.1e5)² → ~1e8`. The explosion
+is entirely in the **normalized target/state**, i.e. the normalization divides by
+the wrong (tiny) std.
+
+**Mechanism (the actual bug):**
+
+1. `XR0(pretrained_name_or_path=...)` given **without** explicit `dataset_stats`.
+2. `XR0.__init__` recovers stats via `extract_xr0_dataset_stats(checkpoint)` —
+   the checkpoint's **delta-action stds are tiny** (~1e-3, padding dims ~1e-6) —
+   and **eagerly** calls `_initialize_model(...)`, building the model **and the
+   preprocessor with those tiny stds**.
+3. `setup()` only rebuilt the model when `self.model is None`. Since the eager
+   init already created it, `setup()` **skipped the rebuild**, so the datamodule
+   (SO-101) stats never reached the preprocessor.
+4. `_prepare_state` / `_prepare_action` then divide raw SO-101 values (~±100°) by
+   the checkpoint's ~1e-3 std → **normalized ~1e5** → target ~1e5 → loss ~1e8.
+
+**Status: FIXED.** `setup()` now rebuilds the pre/post-processors from the
+**datamodule** stats even when the model was eagerly built (`_rebuild_preprocessors`),
+keeping the loaded pretrained weights but swapping the normalization stats. For
+fine-tuning the normalization must come from the fine-tuning dataset, not the
+pretrained checkpoint's (different-embodiment) stats. Standalone inference (no
+datamodule) still uses the checkpoint stats as before.
+
+**Expected effect:** `state|max` and `target|max` drop to O(1); first-batch
+`loss_mse` starts in single/double digits instead of ~1e8.
 
 ## Divergence 3 — action representation
 
@@ -67,11 +95,13 @@ during fine-tuning. Options:
 
 ## Recommended path & what to watch
 
-- Proceed with **absolute joints + `normalize_state=True`** (Divergence 2 fixed;
-  1 and 3 are representation choices, not loss bugs).
-- On the next run, confirm scale is sane on the first batch:
-  `state.abs().max()` (~O(1) after norm), `pred.abs().max()` and
-  `target.abs().max()` (~O(1)), and the `loss_mse` vs `loss_freq` split.
+- Proceed with **absolute joints + `normalize_state=True`**. The loss explosion
+  is fixed by the root-cause fix above (normalization now uses the fine-tuning
+  dataset stats); Divergences 1 and 3 are representation choices, not loss bugs.
+- On the next run, confirm scale is sane on the first batch via the one-shot
+  `[XR0 diag]` log: `state|max` and `target|max` should be ~O(1) (not ~1e5) and
+  `loss_mse` should start in single/double digits.
+- Once confirmed, **remove the temporary `[XR0 diag]` block** in `vla.py._run`.
 - If loss is sane but convergence later stalls, the **delta-action conversion**
   (Divergence 3) is the next lever.
 

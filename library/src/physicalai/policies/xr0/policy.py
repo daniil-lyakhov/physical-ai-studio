@@ -302,6 +302,23 @@ class XR0(ExportablePolicyMixin, Policy):
         if self._input_features is None or self._output_features is None:
             self._input_features, self._output_features = self._stats_to_features(dataset_stats)
 
+    def _rebuild_preprocessors(self, dataset_stats: dict[str, dict[str, Any]]) -> None:
+        """Rebuild the pre/post-processors from dataset stats, keeping model weights.
+
+        Used when the model was already built eagerly (e.g. from a pretrained
+        checkpoint) but fine-tuning needs the dataset's own normalization.
+        """
+        cfg = self.config
+        self._preprocessor, self._postprocessor = make_xr0_preprocessors(
+            camera_views=cfg.camera_views,
+            max_state_dim=cfg.max_state_dim,
+            max_action_dim=cfg.max_action_dim,
+            stats=dataset_stats,
+            processor_name=cfg.vlm_model_id,
+            normalize_state=cfg.normalize_state,
+        )
+        self._dataset_stats = dataset_stats
+
     def _load_pretrained_weights(self, pretrained_path: Path) -> None:
         """Load remapped pretrained weights into ``self.model`` (non-strict).
 
@@ -349,9 +366,18 @@ class XR0(ExportablePolicyMixin, Policy):
             self.hparams["output_features"] = output_features
 
         stats_dict = train_dataset.stats
+        self.hparams["dataset_stats"] = stats_dict
         if self.model is None:
-            self.hparams["dataset_stats"] = stats_dict
             self._initialize_model(stats_dict)
+        else:
+            # The model was built eagerly in ``__init__`` (e.g. from a pretrained
+            # checkpoint whose normalization stats belong to a *different*
+            # embodiment -- delta actions with tiny std). For fine-tuning, the
+            # normalization must come from the fine-tuning dataset, otherwise the
+            # action/state get divided by the wrong (tiny) std and the flow
+            # target explodes. Rebuild the pre/post-processors from the datamodule
+            # stats while keeping the already-loaded model weights.
+            self._rebuild_preprocessors(stats_dict)
 
         reformat_dataset_to_match_policy(self, datamodule)
 
