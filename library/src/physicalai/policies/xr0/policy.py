@@ -86,6 +86,10 @@ class XR0(ExportablePolicyMixin, Policy):
         freeze_vision_encoder: Freeze the vision encoder.
         freeze_input_embeddings: Freeze the VLM token-embedding table (matches
             the original XR0 recipe; saves the embedding grads/optimizer state).
+        normalize_state: Normalize the proprioceptive state with the dataset's
+            per-dimension mean/std. Defaults to False (raw state), keeping
+            existing raw-state checkpoints/exports unchanged; enable it for
+            embodiments whose raw state is off the pretrained checkpoint's scale.
         normalization_mode: Normalization method for state/action features.
         optimizer_lr: Learning rate.
         optimizer_betas: Adam beta coefficients.
@@ -144,6 +148,7 @@ class XR0(ExportablePolicyMixin, Policy):
         compile_mode: str = "max-autotune",
         freeze_vision_encoder: bool = False,
         freeze_input_embeddings: bool = True,
+        normalize_state: bool = False,
         normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES",
         optimizer_lr: float = 1.0e-4,
         optimizer_betas: tuple[float, float] = (0.9, 0.95),
@@ -200,6 +205,7 @@ class XR0(ExportablePolicyMixin, Policy):
             compile_mode=compile_mode,
             freeze_vision_encoder=freeze_vision_encoder,
             freeze_input_embeddings=freeze_input_embeddings,
+            normalize_state=normalize_state,
             normalization_mode=normalization_mode,
             optimizer_lr=optimizer_lr,
             optimizer_betas=optimizer_betas,
@@ -286,6 +292,7 @@ class XR0(ExportablePolicyMixin, Policy):
             max_action_dim=cfg.max_action_dim,
             stats=dataset_stats,
             processor_name=cfg.vlm_model_id,
+            normalize_state=cfg.normalize_state,
         )
         self._dataset_stats = dataset_stats
 
@@ -326,7 +333,6 @@ class XR0(ExportablePolicyMixin, Policy):
         Raises:
             TypeError: If the train dataset is not a physicalai Dataset.
         """
-        del stage
         datamodule = self.trainer.datamodule  # type: ignore[attr-defined]
         train_dataset = datamodule.train_dataset
         if not isinstance(train_dataset, Dataset):
@@ -348,6 +354,15 @@ class XR0(ExportablePolicyMixin, Policy):
             self._initialize_model(stats_dict)
 
         reformat_dataset_to_match_policy(self, datamodule)
+
+        # The Qwen3-VL backbone is built via ``from_pretrained``, which returns an
+        # eval-mode module, and Lightning does not implicitly flip module
+        # train/eval state -- it only warns ("N module(s) in eval mode at the
+        # start of training"). Put the whole model into train mode for fitting so
+        # the backbone trains correctly and the warning does not fire. ``setup``
+        # runs before Lightning's eval-mode check, so this also clears the warning.
+        if stage == "fit" and self.model is not None:
+            self.model.train()
 
     def forward(self, batch: Observation) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """Forward pass: training loss (train) or action chunk (eval).
@@ -870,7 +885,7 @@ class XR0(ExportablePolicyMixin, Policy):
             ),
         }
 
-        if self.model is not None and self._postprocessor is not None:
+        if self.model is not None and self._preprocessor is not None and self._postprocessor is not None:
             cfg = self.config
             ov_preproc = ComponentSpec(
                 class_path="physicalai.policies.xr0.inference.XR0InferencePreprocessor",
@@ -880,6 +895,12 @@ class XR0(ExportablePolicyMixin, Policy):
                     "max_action_dim": cfg.max_action_dim,
                     "seq_len": cfg.tokenizer_max_length,
                     "processor_name": cfg.vlm_model_id,
+                    # Bake the state normalization so the exported graph applies
+                    # the exact transform used at training time (identity when
+                    # ``normalize_state`` is disabled -> raw-state parity).
+                    "normalize_state": self._preprocessor.normalize_state,
+                    "state_mean": self._preprocessor.state_mean.tolist(),
+                    "state_std": self._preprocessor.state_std.tolist(),
                 },
             )
             ov_postproc = ComponentSpec(

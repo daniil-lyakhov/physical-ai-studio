@@ -51,12 +51,16 @@ def main() -> None:
     # Fine-tune from the pretrained LIBERO checkpoint. `sdpa` avoids the hard
     # dependency on flash-attention; gradient checkpointing keeps memory in check.
     # `MEAN_STD` matches the state/action normalization used by the original
-    # Xiaomi XR0 training pipeline.
+    # Xiaomi XR0 training pipeline. `normalize_state=True` normalizes the raw
+    # proprioceptive state (this dataset stores joint positions in degrees, which
+    # is off the scale the pretrained checkpoint expects) so the DiT conditioning
+    # stays well-scaled during fine-tuning.
     policy = XR0(
         pretrained_name_or_path=CHECKPOINT,
         vlm_attn_implementation="sdpa",
         gradient_checkpointing=True,
         normalization_mode="MEAN_STD",
+        normalize_state=True,
     )
 
     checkpoint_callback = ModelCheckpoint(

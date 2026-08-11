@@ -72,6 +72,14 @@ class XR0Config(Config):
         freeze_input_embeddings: Whether to freeze the VLM token-embedding table
             during training. Matches the original XR0 recipe and saves the
             embedding's gradients / optimizer state. Defaults to True.
+        normalize_state: Whether to normalize the proprioceptive state with the
+            dataset's per-dimension mean/std before feeding it to the model.
+            Defaults to False, which preserves the raw-state behavior of the
+            upstream XR0 recipe and keeps existing checkpoints/exports byte
+            compatible. Enable it for embodiments whose raw state is off the
+            scale the pretrained checkpoint expects (e.g. joint positions in
+            degrees). The resulting mean/std become part of the trained
+            checkpoint's contract and are baked into the exported manifest.
         normalization_mode: Normalization method for state/action features.
             ``"QUANTILES"`` maps data to [-1, 1] using the 1st and 99th
             percentiles; ``"MEAN_STD"`` uses zero-mean unit-variance
@@ -132,6 +140,7 @@ class XR0Config(Config):
 
     freeze_vision_encoder: bool = False
     freeze_input_embeddings: bool = True
+    normalize_state: bool = False
 
     normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES"
 

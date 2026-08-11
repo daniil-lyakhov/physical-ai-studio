@@ -108,10 +108,19 @@ class XR0Preprocessor(torch.nn.Module):
         image_factor: Patch-alignment factor for :func:`resize_image`.
         image_max_pixels: Maximum image area for :func:`resize_image`.
         processor_name: HuggingFace id of the Qwen3-VL processor.
+        normalize_state: When True, normalize the state with per-dimension
+            mean/std (from ``features`` or explicit ``state_mean`` / ``state_std``).
+            Defaults to False (raw state, matching the upstream recipe).
+        state_mean: Optional explicit ``max_state_dim`` state mean overriding the
+            feature-derived value (used to reload the exported normalization).
+        state_std: Optional explicit ``max_state_dim`` state std overriding the
+            feature-derived value (used to reload the exported normalization).
     """
 
     action_mean: torch.Tensor
     action_std: torch.Tensor
+    state_mean: torch.Tensor
+    state_std: torch.Tensor
 
     def __init__(
         self,
@@ -122,6 +131,10 @@ class XR0Preprocessor(torch.nn.Module):
         image_factor: int = 32,
         image_max_pixels: int = 90000,
         processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
+        *,
+        normalize_state: bool = False,
+        state_mean: Sequence[float] | None = None,
+        state_std: Sequence[float] | None = None,
     ) -> None:
         """Initialize the XR0 preprocessor."""
         super().__init__()
@@ -131,11 +144,25 @@ class XR0Preprocessor(torch.nn.Module):
         self.image_factor = image_factor
         self.image_max_pixels = image_max_pixels
         self.processor_name = processor_name
+        self.normalize_state = bool(normalize_state)
         self._processor: Any = None
 
         mean, std = self._action_stats(features)
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
+
+        # State normalization is opt-in and identity by default so raw-state
+        # checkpoints (e.g. the upstream LIBERO / Pretrain releases) are
+        # unaffected. Explicit ``state_mean`` / ``state_std`` (baked into the
+        # exported manifest) take precedence over feature-derived stats so the
+        # exported graph reproduces the training normalization exactly.
+        if state_mean is not None and state_std is not None:
+            s_mean = torch.as_tensor(state_mean, dtype=torch.float32).flatten()
+            s_std = torch.as_tensor(state_std, dtype=torch.float32).flatten()
+        else:
+            s_mean, s_std = self._state_stats(features)
+        self.register_buffer("state_mean", s_mean, persistent=False)
+        self.register_buffer("state_std", s_std, persistent=False)
 
     def _action_stats(self, features: dict[str, Feature] | None) -> tuple[torch.Tensor, torch.Tensor]:
         """Build padded ``(max_action_dim,)`` mean/std buffers from action features.
@@ -156,6 +183,34 @@ class XR0Preprocessor(torch.nn.Module):
             feat_mean = torch.as_tensor(norm.mean, dtype=torch.float32).flatten()
             feat_std = torch.as_tensor(norm.std, dtype=torch.float32).flatten()
             dim = min(self.max_action_dim, feat_mean.numel())
+            mean[:dim] = feat_mean[:dim]
+            std[:dim] = feat_std[:dim]
+            break
+        return mean, std
+
+    def _state_stats(self, features: dict[str, Feature] | None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build padded ``(max_state_dim,)`` mean/std buffers from state features.
+
+        Returns identity buffers (mean 0, std 1) when state normalization is
+        disabled or no state stats are available, so ``_prepare_state`` is a
+        no-op and raw-state checkpoints stay bit-for-bit unchanged.
+
+        Returns:
+            A ``(mean, std)`` tuple of ``(max_state_dim,)`` buffers.
+        """
+        mean = torch.zeros(self.max_state_dim)
+        std = torch.ones(self.max_state_dim)
+        if features is None or not self.normalize_state:
+            return mean, std
+        for feature in features.values():
+            if feature.ftype != FeatureType.STATE or feature.normalization_data is None:
+                continue
+            norm = feature.normalization_data
+            if norm.mean is None or norm.std is None:
+                continue
+            feat_mean = torch.as_tensor(norm.mean, dtype=torch.float32).flatten()
+            feat_std = torch.as_tensor(norm.std, dtype=torch.float32).flatten()
+            dim = min(self.max_state_dim, feat_mean.numel())
             mean[:dim] = feat_mean[:dim]
             std[:dim] = feat_std[:dim]
             break
@@ -240,6 +295,12 @@ class XR0Preprocessor(torch.nn.Module):
             state = state[:, -1, :]
         state = state.to(torch.float32)
         state = F.pad(state, (0, max(0, self.max_state_dim - state.shape[-1])))[:, : self.max_state_dim]
+        if self.normalize_state:
+            # (state - mean) / (std + eps); padded dims use identity stats so
+            # they stay zero. Mirrors the action normalization convention.
+            mean = self.state_mean.to(state.device)
+            std = self.state_std.to(state.device)
+            state = (state - mean) / (std + ACTION_EPS)
         return state.unsqueeze(1).to(device)
 
     def _prepare_action(self, action: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -380,6 +441,7 @@ def make_xr0_preprocessors(
     image_factor: int = 32,
     image_max_pixels: int = 90000,
     processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
+    normalize_state: bool = False,
 ) -> tuple[XR0Preprocessor, XR0Postprocessor]:
     """Create the XR0 preprocessor / postprocessor pair from dataset stats.
 
@@ -391,6 +453,8 @@ def make_xr0_preprocessors(
         image_factor: Patch-alignment factor for image resizing.
         image_max_pixels: Maximum image area for image resizing.
         processor_name: HuggingFace id of the Qwen3-VL processor.
+        normalize_state: When True, normalize the state with the dataset's
+            per-dimension mean/std. Defaults to False (raw state).
 
     Returns:
         Tuple of (preprocessor, postprocessor).
@@ -428,6 +492,7 @@ def make_xr0_preprocessors(
         image_factor=image_factor,
         image_max_pixels=image_max_pixels,
         processor_name=processor_name,
+        normalize_state=normalize_state,
     )
     postprocessor = XR0Postprocessor(max_action_dim=max_action_dim, features=features)
     return preprocessor, postprocessor

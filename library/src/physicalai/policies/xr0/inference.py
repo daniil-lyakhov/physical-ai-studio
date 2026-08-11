@@ -79,6 +79,10 @@ class XR0InferencePreprocessor(Preprocessor):
         processor_name: HuggingFace id of the Qwen3-VL processor.
         image_factor: Patch-alignment factor for image resizing.
         image_max_pixels: Maximum image area for image resizing.
+        normalize_state: Whether the exported model expects normalized state.
+            Defaults to False (raw state), matching the training default.
+        state_mean: Baked ``max_state_dim`` state mean (identity when disabled).
+        state_std: Baked ``max_state_dim`` state std (identity when disabled).
     """
 
     def __init__(
@@ -90,6 +94,10 @@ class XR0InferencePreprocessor(Preprocessor):
         processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
         image_factor: int = 32,
         image_max_pixels: int = 90000,
+        *,
+        normalize_state: bool = False,
+        state_mean: Sequence[float] | None = None,
+        state_std: Sequence[float] | None = None,
     ) -> None:
         """Initialize the XR0 inference preprocessor.
 
@@ -115,6 +123,9 @@ class XR0InferencePreprocessor(Preprocessor):
             image_factor=int(image_factor),
             image_max_pixels=int(image_max_pixels),
             processor_name=str(processor_name),
+            normalize_state=bool(normalize_state),
+            state_mean=state_mean,
+            state_std=state_std,
         )
         self._pad_id: int | None = None
 

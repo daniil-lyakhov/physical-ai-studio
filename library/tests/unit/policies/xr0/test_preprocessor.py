@@ -86,6 +86,76 @@ class TestNormalization:
         assert torch.allclose(pre.action_std, torch.ones(32))
 
 
+def _state_stats() -> dict:
+    """Stats with non-identity state mean/std for normalization tests."""
+    return {
+        "observation.state": {
+            "name": "observation.state",
+            "shape": (STATE_DIM,),
+            "mean": [float(i) for i in range(STATE_DIM)],
+            "std": [2.0] * STATE_DIM,
+        },
+        "action": {"name": "action", "shape": (ACTION_DIM,), "mean": [0.1] * ACTION_DIM, "std": [2.0] * ACTION_DIM},
+    }
+
+
+class TestStateNormalization:
+    """State normalization is opt-in with an identity (raw-state) default."""
+
+    def test_state_buffers_identity_by_default(self) -> None:
+        # Even with state stats present, disabling normalization keeps identity.
+        pre, _ = make_xr0_preprocessors(stats=_state_stats(), max_state_dim=32)
+        assert pre.normalize_state is False
+        assert torch.allclose(pre.state_mean, torch.zeros(32))
+        assert torch.allclose(pre.state_std, torch.ones(32))
+
+    def test_prepare_state_raw_when_disabled(self) -> None:
+        # Default path must match the legacy raw-state behavior exactly.
+        pre, _ = make_xr0_preprocessors(stats=_state_stats(), max_state_dim=32)
+        state = torch.arange(STATE_DIM, dtype=torch.float32).repeat(2, 1)
+        out = pre._prepare_state({STATE: state}, torch.device("cpu"))  # noqa: SLF001
+        assert out.shape == (2, 1, 32)
+        assert torch.allclose(out[:, 0, :STATE_DIM], state)
+        assert torch.allclose(out[:, 0, STATE_DIM:], torch.zeros(32 - STATE_DIM))
+
+    def test_state_buffers_from_features(self) -> None:
+        pre, _ = make_xr0_preprocessors(stats=_state_stats(), max_state_dim=32, normalize_state=True)
+        assert pre.normalize_state is True
+        expected_mean = torch.tensor([float(i) for i in range(STATE_DIM)])
+        assert torch.allclose(pre.state_mean[:STATE_DIM], expected_mean)
+        assert torch.allclose(pre.state_std[:STATE_DIM], torch.full((STATE_DIM,), 2.0))
+        # padding dims stay identity so padded state stays zero
+        assert torch.allclose(pre.state_mean[STATE_DIM:], torch.zeros(32 - STATE_DIM))
+        assert torch.allclose(pre.state_std[STATE_DIM:], torch.ones(32 - STATE_DIM))
+
+    def test_prepare_state_normalizes_when_enabled(self) -> None:
+        pre, _ = make_xr0_preprocessors(stats=_state_stats(), max_state_dim=32, normalize_state=True)
+        state = torch.arange(STATE_DIM, dtype=torch.float32).repeat(2, 1)
+        out = pre._prepare_state({STATE: state}, torch.device("cpu"))  # noqa: SLF001
+        # (i - i) / (2 + eps) == 0 for every real dim; padding stays zero.
+        assert torch.allclose(out[:, 0, :], torch.zeros(2, 32), atol=1e-6)
+
+    def test_explicit_state_buffers_override_features(self) -> None:
+        # Inference path: baked mean/std override feature-derived stats.
+        mean = [1.0] * 32
+        std = [4.0] * 32
+        pre = XR0Preprocessor(
+            max_state_dim=32,
+            features=None,
+            normalize_state=True,
+            state_mean=mean,
+            state_std=std,
+        )
+        assert torch.allclose(pre.state_mean, torch.full((32,), 1.0))
+        assert torch.allclose(pre.state_std, torch.full((32,), 4.0))
+        state = torch.full((1, STATE_DIM), 5.0)
+        out = pre._prepare_state({STATE: state}, torch.device("cpu"))  # noqa: SLF001
+        # (5 - 1) / (4 + eps) ~= 1 for real dims; padding dims -> (0-1)/4 = -0.25
+        assert torch.allclose(out[:, 0, :STATE_DIM], torch.ones(1, STATE_DIM), atol=1e-6)
+        assert torch.allclose(out[:, 0, STATE_DIM:], torch.full((1, 32 - STATE_DIM), -0.25), atol=1e-6)
+
+
+
 @requires_processor
 class TestVisionPrompt:
     """Prompt + vision pipeline through the real Qwen3-VL processor."""
