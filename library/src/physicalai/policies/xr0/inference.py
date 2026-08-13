@@ -208,7 +208,9 @@ class XR0InferencePreprocessor(Preprocessor):
         Returns:
             Dict with ``input_ids`` / ``attention_mask`` (int64) and
             ``pixel_values`` / ``state`` (float32) NumPy arrays, with the prompt
-            right-padded to ``seq_len``.
+            right-padded to ``seq_len``. ``pixel_values`` is the pre-patchify
+            normalized image grid ``(num_images, C, H, W)`` -- the exported graph
+            bakes the Qwen3-VL temporal-duplication + patchify reshape/transpose.
 
         Raises:
             ValueError: If the tokenized prompt is longer than ``seq_len``.
@@ -230,10 +232,12 @@ class XR0InferencePreprocessor(Preprocessor):
             input_ids = F.pad(input_ids, (0, pad), value=self.pad_id)
             attention_mask = F.pad(attention_mask, (0, pad), value=0)
 
+        pixel_values = self._preprocessor.image_grid(batch)
+
         return {
             "input_ids": np.ascontiguousarray(input_ids.cpu().numpy().astype(np.int64)),
             "attention_mask": np.ascontiguousarray(attention_mask.cpu().numpy().astype(np.int64)),
-            "pixel_values": np.ascontiguousarray(processed["pixel_values"].cpu().numpy().astype(np.float32)),
+            "pixel_values": np.ascontiguousarray(pixel_values.astype(np.float32)),
             "state": np.ascontiguousarray(processed["state"].cpu().numpy().astype(np.float32)),
         }
 

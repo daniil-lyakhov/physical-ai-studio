@@ -28,6 +28,8 @@ import torch
 from transformers import Qwen3VLForConditionalGeneration
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModelOutputWithPast
 
+from .patchify import patchify_image_grid
+
 if TYPE_CHECKING:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
 
@@ -581,6 +583,17 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
                 shim._export_grid_list,  # noqa: SLF001
                 dtype=torch.long,
                 device=pixel_values.device,
+            )
+            # The graph's ``pixel_values`` input is the pre-patchify normalized image
+            # grid ``(num_images, C, H, W)``; bake the Qwen3-VL temporal-duplication +
+            # patchify reshape/transpose into the graph (constant geometry from the
+            # baked grid) so the Runtime preprocessor does not have to reproduce it.
+            pixel_values = patchify_image_grid(
+                pixel_values,
+                shim._export_grid_list,  # noqa: SLF001
+                temporal_patch_size=visual.config.temporal_patch_size,
+                patch_size=visual.config.patch_size,
+                merge_size=visual.config.spatial_merge_size,
             )
             vision_output = visual(
                 pixel_values.type(visual.dtype),

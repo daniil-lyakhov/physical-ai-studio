@@ -34,7 +34,7 @@ from PIL import Image
 from physicalai.data import Feature, FeatureType
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Observation
 
-from .io import ACTION_EPS, resize_image
+from .io import ACTION_EPS, build_pixel_grid, resize_image
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -283,6 +283,29 @@ class XR0Preprocessor(torch.nn.Module):
             ]
             images.append(sample_images)
         return images
+
+    def image_grid(self, batch: dict[str, Any]) -> np.ndarray:
+        """Build the pre-patchify normalized image grid the exported graph consumes.
+
+        Reproduces the Qwen3-VL image path (resize + rescale + normalize) in NumPy,
+        omitting the patchify -- the exported OpenVINO graph bakes the temporal
+        duplication + patchify reshape/transpose. Used by the inference
+        preprocessor and the export input sample so the native pipeline builds the
+        grid directly instead of patchifying (via the processor) and un-patchifying.
+
+        Returns:
+            The ``(num_images, C, H, W)`` float32 grid, views concatenated
+            sample-major to match the processor's ``pixel_values`` ordering.
+        """
+        images = self._extract_view_images(batch)
+        image_processor = self.processor.image_processor
+        flat_images = [image for sample in images for image in sample]
+        return build_pixel_grid(
+            flat_images,
+            image_processor.image_mean,
+            image_processor.image_std,
+            image_processor.rescale_factor,
+        )
 
     def _prepare_state(self, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
         """Pad the state into ``(B, 1, max_state_dim)`` (source ``state.view(1, 1, -1)``).

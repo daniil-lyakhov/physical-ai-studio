@@ -524,13 +524,16 @@ class XR0(ExportablePolicyMixin, Policy):
         Overrides the base helper: the exported graph consumes the *padded*
         preprocessor tensors and excludes ``image_grid_thw`` (the shim supplies it
         as a baked constant; keeping it would reintroduce the non-traceable
-        ``tensor.tolist()`` vision geometry). The graph consumes
+        ``tensor.tolist()`` vision geometry). ``pixel_values`` is emitted as the
+        pre-patchify normalized image grid ``(num_images, C, H, W)`` -- the graph
+        bakes the Qwen3-VL temporal-duplication + patchify. The graph consumes
         ``{input_ids, attention_mask, pixel_values, state} -> action``.
 
         Returns:
             The padded traced-input dict, without ``image_grid_thw``.
         """
         processed = self._build_padded_export_sample()
+        processed["pixel_values"] = torch.from_numpy(self._preprocessor.image_grid(self.sample_input))
         return {
             name: tensor
             for name, tensor in processed.items()

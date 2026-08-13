@@ -100,6 +100,39 @@ def resize_image(
     return image.resize((new_width, new_height))
 
 
+def build_pixel_grid(
+    images: Sequence[Image.Image | np.ndarray],
+    image_mean: Sequence[float],
+    image_std: Sequence[float],
+    rescale_factor: float,
+) -> np.ndarray:
+    """Rescale + normalize already-resized images into a Qwen3-VL pixel grid.
+
+    Reproduces the Qwen3-VL image processor's rescale + normalize + channel-first
+    steps in pure NumPy (the images must already be resized to patch-aligned
+    dimensions) and stacks the views into the ``(num_images, C, H, W)`` normalized
+    grid the exported graph patchifies. This is the NumPy replacement for calling
+    the HuggingFace image processor and inverting its patchify.
+
+    Args:
+        images: Already-resized RGB images (PIL images or ``(H, W, C)`` arrays),
+            one per camera view, all the same size.
+        image_mean: Per-channel mean (the image processor's ``image_mean``).
+        image_std: Per-channel std (the image processor's ``image_std``).
+        rescale_factor: Pixel rescale factor (``1/255`` for Qwen3-VL).
+
+    Returns:
+        The normalized image grid of shape ``(num_images, C, H, W)`` as float32.
+    """
+    mean = np.asarray(image_mean, dtype=np.float32)
+    std = np.asarray(image_std, dtype=np.float32)
+    grid = [
+        np.transpose((np.asarray(image, dtype=np.float32) * np.float32(rescale_factor) - mean) / std, (2, 0, 1))
+        for image in images
+    ]
+    return np.stack(grid).astype(np.float32)
+
+
 def _axis_from_pi(rotm: np.ndarray) -> np.ndarray:
     """Recover the unit rotation axis for a near-180-degree rotation.
 
