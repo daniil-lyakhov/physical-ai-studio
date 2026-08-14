@@ -19,12 +19,12 @@ image geometry, the 3D MRoPE ``position_ids`` and the image-token scatter
 positions were baked in as constants at export time, and the ``action`` output
 was baked to f32.
 
-The XR0 tokenisation (``XR0InferencePreprocessor``: Qwen3-VL chat template + image
-resize + right-padding) and the action denormalization
-(``XR0InferencePostprocessor``) are declared in the exported ``manifest.json``, so
-``InferenceModel("xr0_ir")`` reconstructs the full pipeline and
-``benchmark.evaluate(model)`` runs it natively -- exactly the path a deployed
-Runtime would take.
+The XR0 tokenisation (the Runtime ``xr0`` preprocessor: Qwen3-VL chat template +
+image resize + rendered ``task`` prompt) and the action denormalization (the
+Runtime ``xr0_denormalize`` postprocessor) are declared in the exported
+``manifest.json`` as registered component types, so ``InferenceModel("xr0_ir")``
+reconstructs the full pipeline and ``benchmark.evaluate(model)`` runs it natively
+-- exactly the path a deployed Runtime would take.
 
 Run with the LIBERO env python::
 

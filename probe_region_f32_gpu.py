@@ -20,12 +20,17 @@ def build_fail(e):
 
 
 def ancestor_parameters(out):
+    # Dedup by the STABLE per-node instance id. Python's id() is unreliable here
+    # because get_node() returns a throwaway wrapper each call and CPython can
+    # recycle a freed wrapper's id(), falsely pruning a whole ancestor branch
+    # (which drops Parameters and yields "undeclared parameters" on assemble).
     seen, params, stack = set(), [], [out.get_node()]
     while stack:
         node = stack.pop()
-        if id(node) in seen:
+        iid = node.get_instance_id()
+        if iid in seen:
             continue
-        seen.add(id(node))
+        seen.add(iid)
         if node.get_type_name() == "Parameter":
             params.append(node)
             continue
@@ -34,13 +39,13 @@ def ancestor_parameters(out):
     return params
 
 
-def compile_out(core, out, name):
+def compile_out(core, out, name, device="GPU"):
     try:
         model = ov.Model([ops.result(out)], ancestor_parameters(out), name)
     except Exception as e:  # noqa: BLE001
         return f"assemble-error: {e!r}"
     try:
-        core.compile_model(model, "GPU")
+        core.compile_model(model, device)
     except Exception as e:  # noqa: BLE001
         return "BUILD-FAIL" if build_fail(e) else f"other: {repr(e)[:160]}"
     return "OK"
