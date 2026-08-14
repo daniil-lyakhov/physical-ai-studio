@@ -5,20 +5,23 @@
 
 The exported XR0 OpenVINO graph is self-contained: the Qwen3-VL vision tower, the
 language model, the 3D MRoPE ``position_ids`` and the image-token scatter all run
-*inside* the graph. Its inputs are only the tokenized prompt plus the raw
-pixels/state (``input_ids`` / ``attention_mask`` / ``pixel_values`` / ``state``)
+*inside* the graph. Its inputs are the tokenized prompt plus the raw pixels/state
+(``tokenized_prompt`` / ``tokenized_prompt_mask`` / ``pixel_values`` / ``state``)
 and its output is the still-normalized, ``max_action_dim``-wide action chunk.
 
 These two components let the Runtime :class:`~physicalai.inference.model.InferenceModel`
 reconstruct the XR0 inference pipeline directly from ``manifest.json`` (via
 ``class_path`` + ``init_args``), so the exported model runs natively in the gym
-without the Torch policy:
+without the Torch policy or the full Qwen3-VL processor:
 
-* :class:`XR0InferencePreprocessor` reuses the model-free training
-  :class:`~physicalai.policies.xr0.preprocessor.XR0Preprocessor` (Qwen3-VL
-  tokenization + image resize + state padding) to build the graph inputs, then
-  right-pads the token sequence to the fixed length the graph was baked for and
-  drops ``image_grid_thw`` (supplied as a baked constant inside the graph).
+* :class:`XR0InferencePreprocessor` is a lightweight, torch-free NumPy component:
+  it resizes the camera views into the Qwen3-VL ``pixel_values`` grid, pads the
+  ``state`` and renders the multi-view chat prompt as a plain ``task`` string.
+  It does **not** tokenize -- a sibling OpenVINO tokenizer (``tokenizer.xml``,
+  exported next to the graph) turns ``task`` into the graph's ``tokenized_prompt``
+  / ``tokenized_prompt_mask`` inputs. The image geometry and normalization
+  constants are baked at export time so no HuggingFace processor is loaded at
+  inference; ``image_grid_thw`` is carried inside the graph as a baked constant.
 * :class:`XR0InferencePostprocessor` denormalizes the predicted action with the
   source mean/std convention and slices it back to the real action dimension.
 """
@@ -28,57 +31,81 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
-import torch.nn.functional as F  # noqa: N812
+from physicalai.data.observation import IMAGES, STATE, TASK
 from physicalai.inference.constants import ACTION
 from physicalai.inference.postprocessors.base import Postprocessor
 from physicalai.inference.preprocessors.base import Preprocessor
+from PIL import Image
 
-from physicalai.data.observation import IMAGES, STATE, TASK
-
-from .io import ACTION_EPS
-from .preprocessor import XR0Preprocessor
+from .io import ACTION_EPS, build_pixel_grid, resize_image
+from .prompt import image_pad_count, render_chat_prompt
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-# Names of the exported OpenVINO graph inputs the preprocessor must emit.
-_MODEL_INPUT_KEYS = ("input_ids", "attention_mask", "pixel_values", "state")
-# Prompt inputs that are integer-typed (the rest are float32).
-_INT_INPUT_KEYS = ("input_ids", "attention_mask")
+# Qwen3-VL image-normalization + geometry constants. These are baked into the
+# manifest ``init_args`` at export time from the source image processor; the
+# defaults mirror ``Qwen/Qwen3-VL-4B-Instruct`` so the component is usable
+# standalone.
+_QWEN3VL_IMAGE_MEAN = (0.5, 0.5, 0.5)
+_QWEN3VL_IMAGE_STD = (0.5, 0.5, 0.5)
+_QWEN3VL_RESCALE_FACTOR = 1.0 / 255.0
+_QWEN3VL_PATCH_SIZE = 16
+_QWEN3VL_MERGE_SIZE = 2
+
+_TEMPORAL_IMAGE_NDIM = 5
+_BATCHED_IMAGE_NDIM = 4
+_CHANNELS_FIRST_NDIM = 3
+_TEMPORAL_STATE_NDIM = 3
 
 
-def _as_tensor(value: object) -> torch.Tensor:
-    """Convert a NumPy array / tensor / sequence into a CPU ``torch.Tensor``.
+def _to_pil(array: object) -> Image.Image:
+    """Convert a NumPy image (``(H,W,C)`` / ``(C,H,W)`` / batched / temporal) to PIL.
+
+    Mirrors the training :func:`~physicalai.policies.xr0.preprocessor._to_pil`
+    convention (channels-first detection, ``[0, 1]`` float rescaling, grayscale
+    expansion) so the resized geometry matches the baked export exactly.
 
     Returns:
-        The value as a CPU ``torch.Tensor``.
+        The image as an RGB PIL ``Image``.
     """
-    if isinstance(value, torch.Tensor):
-        return value.detach().to("cpu")
-    return torch.as_tensor(np.asarray(value))
+    arr = np.asarray(array)
+    if arr.ndim == _TEMPORAL_IMAGE_NDIM:  # (B, T, C, H, W) -> last frame of first sample
+        arr = arr[0, -1]
+    elif arr.ndim == _BATCHED_IMAGE_NDIM:  # (T|B, C, H, W) -> last frame
+        arr = arr[-1]
+    if arr.ndim == _CHANNELS_FIRST_NDIM and arr.shape[0] in {1, 3}:  # channels-first
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    return Image.fromarray(arr)
 
 
 class XR0InferencePreprocessor(Preprocessor):
     """Build the exported XR0 graph inputs from a raw observation dict.
 
-    Wraps the model-free training :class:`XR0Preprocessor`: converts the Runtime
-    observation (NumPy) into the batch layout it expects, runs it to obtain
-    ``input_ids`` / ``attention_mask`` / ``pixel_values`` / ``state``, right-pads
-    the prompt to ``seq_len`` (the baked graph length, masked by
-    ``attention_mask``) and returns NumPy arrays with the exact dtypes the graph
-    expects. ``image_grid_thw`` is intentionally dropped -- the graph carries it
-    as a baked constant.
+    Lightweight, torch-free NumPy preprocessor: resizes the camera views into the
+    Qwen3-VL ``pixel_values`` grid, pads/normalizes the ``state`` and renders the
+    multi-view chat prompt as a plain ``task`` string. It does **not** tokenize --
+    a sibling OpenVINO tokenizer (``tokenizer.xml``) turns ``task`` into
+    ``tokenized_prompt`` / ``tokenized_prompt_mask``. The image geometry and
+    normalization constants are baked at export time so no HuggingFace processor
+    is loaded at inference. ``image_grid_thw`` is carried inside the graph as a
+    baked constant.
 
     Args:
         camera_views: Ordered view names embedded into the prompt (must match the
             views used at export time so the baked image geometry stays valid).
         max_state_dim: State dimension after padding.
-        max_action_dim: Action dimension after padding.
-        seq_len: Fixed, right-padded prompt length the graph was baked for.
-        processor_name: HuggingFace id of the Qwen3-VL processor.
         image_factor: Patch-alignment factor for image resizing.
         image_max_pixels: Maximum image area for image resizing.
+        image_mean: Per-channel image mean (baked from the source image processor).
+        image_std: Per-channel image std (baked from the source image processor).
+        rescale_factor: Pixel rescale factor (``1/255`` for Qwen3-VL).
+        patch_size: Vision patch size used to derive the ``<|image_pad|>`` count.
+        merge_size: Spatial merge size used to derive the ``<|image_pad|>`` count.
         normalize_state: Whether the exported model expects normalized state.
             Defaults to False (raw state), matching the training default.
         state_mean: Baked ``max_state_dim`` state mean (identity when disabled).
@@ -89,11 +116,13 @@ class XR0InferencePreprocessor(Preprocessor):
         self,
         camera_views: Sequence[str] = ("base", "wrist_left"),
         max_state_dim: int = 32,
-        max_action_dim: int = 32,
-        seq_len: int = 256,
-        processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
         image_factor: int = 32,
         image_max_pixels: int = 90000,
+        image_mean: Sequence[float] = _QWEN3VL_IMAGE_MEAN,
+        image_std: Sequence[float] = _QWEN3VL_IMAGE_STD,
+        rescale_factor: float = _QWEN3VL_RESCALE_FACTOR,
+        patch_size: int = _QWEN3VL_PATCH_SIZE,
+        merge_size: int = _QWEN3VL_MERGE_SIZE,
         *,
         normalize_state: bool = False,
         state_mean: Sequence[float] | None = None,
@@ -102,70 +131,59 @@ class XR0InferencePreprocessor(Preprocessor):
         """Initialize the XR0 inference preprocessor.
 
         Raises:
-            ValueError: If ``camera_views`` is empty or ``seq_len`` is not positive.
+            ValueError: If ``camera_views`` is empty or ``patch_size`` / ``merge_size``
+                is not positive.
         """
         super().__init__()
         camera_views = tuple(camera_views)
         if not camera_views:
             msg = "XR0InferencePreprocessor requires at least one camera view"
             raise ValueError(msg)
-        if int(seq_len) <= 0:
-            msg = f"seq_len must be a positive integer, got {seq_len!r}"
+        if int(patch_size) <= 0 or int(merge_size) <= 0:
+            msg = f"patch_size and merge_size must be positive, got {patch_size!r} / {merge_size!r}"
             raise ValueError(msg)
 
         self._camera_views = camera_views
-        self._seq_len = int(seq_len)
-        self._preprocessor = XR0Preprocessor(
-            camera_views=camera_views,
-            max_state_dim=int(max_state_dim),
-            max_action_dim=int(max_action_dim),
-            features=None,
-            image_factor=int(image_factor),
-            image_max_pixels=int(image_max_pixels),
-            processor_name=str(processor_name),
-            normalize_state=bool(normalize_state),
-            state_mean=state_mean,
-            state_std=state_std,
-        )
-        self._pad_id: int | None = None
+        self._max_state_dim = int(max_state_dim)
+        self._image_factor = int(image_factor)
+        self._image_max_pixels = int(image_max_pixels)
+        self._image_mean = tuple(float(v) for v in image_mean)
+        self._image_std = tuple(float(v) for v in image_std)
+        self._rescale_factor = float(rescale_factor)
+        self._patch_size = int(patch_size)
+        self._merge_size = int(merge_size)
+        self._normalize_state = bool(normalize_state)
 
-    @property
-    def pad_id(self) -> int:
-        """Lazily resolve the tokenizer pad id used for right-padding.
+        # State normalization is opt-in; padded dims use identity stats (mean 0,
+        # std 1) so they stay zero, mirroring the training XR0Preprocessor.
+        if normalize_state and state_mean is not None and state_std is not None:
+            self._state_mean = self._pad_state_stat(state_mean, 0.0)
+            self._state_std = self._pad_state_stat(state_std, 1.0)
+        else:
+            self._state_mean = np.zeros(self._max_state_dim, dtype=np.float32)
+            self._state_std = np.ones(self._max_state_dim, dtype=np.float32)
+
+    def _pad_state_stat(self, values: Sequence[float], fill: float) -> np.ndarray:
+        """Pad/truncate a state stat to ``max_state_dim`` (padded dims use ``fill``).
 
         Returns:
-            The tokenizer ``pad_token_id`` (or ``0`` when undefined).
+            The ``(max_state_dim,)`` float32 stat array.
         """
-        if self._pad_id is None:
-            self._pad_id = self._preprocessor.processor.tokenizer.pad_token_id or 0
-        return self._pad_id
+        arr = np.asarray(values, dtype=np.float32).flatten()
+        out = np.full(self._max_state_dim, fill, dtype=np.float32)
+        dim = min(self._max_state_dim, arr.shape[0])
+        out[:dim] = arr[:dim]
+        return out
 
-    @staticmethod
-    def _to_batch(inputs: dict[str, object]) -> dict[str, object]:
-        """Assemble the Torch batch the training preprocessor consumes.
-
-        Bridges the Runtime observation (NumPy, nested ``images`` dict, string
-        ``task``) into the ``STATE`` / ``TASK`` / flattened ``images.*`` layout
-        expected by :class:`XR0Preprocessor`, adding a leading batch dim when the
-        observation is a single unbatched frame.
+    def _extract_images(self, inputs: dict[str, object]) -> list[Image.Image]:
+        """Return the resized PIL views in ``camera_views`` (sorted-key) order.
 
         Returns:
-            A batch dict with ``state``, ``task`` and one ``images.<view>`` tensor
-            per camera view.
+            The list of resized PIL images (one per available camera view).
 
         Raises:
-            ValueError: If the observation has no state entry.
+            ValueError: If the observation contains no image entry.
         """
-        state_value = inputs.get(STATE)
-        if state_value is None:
-            msg = "XR0 inference requires a 'state' observation"
-            raise ValueError(msg)
-        state = _as_tensor(state_value).to(torch.float32)
-        if state.ndim == 1:  # (D,) -> (1, D)
-            state = state.unsqueeze(0)
-
-        batch: dict[str, object] = {STATE: state}
-
         images_value = inputs.get(IMAGES)
         if isinstance(images_value, dict):
             image_items = {f"{IMAGES}.{view}": array for view, array in images_value.items()}
@@ -175,30 +193,61 @@ class XR0InferencePreprocessor(Preprocessor):
                 for key, value in inputs.items()
                 if isinstance(key, str) and key.startswith(f"{IMAGES}.") and "is_pad" not in key
             }
-        if not image_items:
+        keys = sorted(image_items)[: len(self._camera_views)]
+        if not keys:
             msg = "XR0 inference requires at least one image observation"
             raise ValueError(msg)
-        for key, array in image_items.items():
-            image = _as_tensor(array)
-            if image.ndim == 3:  # (C, H, W) -> (1, C, H, W)  # noqa: PLR2004
-                image = image.unsqueeze(0)
-            batch[key] = image
+        return [
+            resize_image(_to_pil(image_items[key]), factor=self._image_factor, max_pixels=self._image_max_pixels)
+            for key in keys
+        ]
 
+    def _prepare_state(self, inputs: dict[str, object]) -> np.ndarray:
+        """Pad the state into ``(B, 1, max_state_dim)`` (optionally normalized).
+
+        Returns:
+            The padded ``(B, 1, max_state_dim)`` float32 state array.
+
+        Raises:
+            ValueError: If the observation has no state entry.
+        """
+        state_value = inputs.get(STATE)
+        if state_value is None:
+            msg = "XR0 inference requires a 'state' observation"
+            raise ValueError(msg)
+        state = np.asarray(state_value, dtype=np.float32)
+        if state.ndim == 1:  # (D,) -> (1, D)
+            state = state[None, :]
+        if state.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> last frame
+            state = state[:, -1, :]
+        dim = state.shape[-1]
+        if dim < self._max_state_dim:
+            state = np.pad(state, ((0, 0), (0, self._max_state_dim - dim)))
+        state = state[:, : self._max_state_dim]
+        if self._normalize_state:
+            state = (state - self._state_mean) / (self._state_std + ACTION_EPS)
+        return state[:, None, :].astype(np.float32)  # (B, 1, max_state_dim)
+
+    @staticmethod
+    def _instruction(inputs: dict[str, object]) -> str:
+        """Extract the task instruction string from the observation.
+
+        Returns:
+            The (first) task instruction as a string (empty when absent).
+        """
         task = inputs.get(TASK)
         if task is None:
-            batch[TASK] = [""]
-        elif isinstance(task, str):
-            batch[TASK] = [task]
-        elif isinstance(task, np.ndarray):
-            batch[TASK] = [str(entry) for entry in np.atleast_1d(task).tolist()]
-        elif isinstance(task, (list, tuple)):
-            batch[TASK] = [str(entry) for entry in task]
-        else:
-            batch[TASK] = [str(task)]
+            return ""
+        if isinstance(task, str):
+            return task
+        if isinstance(task, np.ndarray):
+            flat = np.atleast_1d(task).tolist()
+            return str(flat[0]) if flat else ""
+        if isinstance(task, (list, tuple)):
+            return str(task[0]) if task else ""
+        return str(task)
 
-        return batch
-
-    def __call__(self, inputs: dict[str, object]) -> dict[str, np.ndarray]:
+    def __call__(self, inputs: dict[str, object]) -> dict[str, object]:
         """Transform a raw observation into the exported graph inputs.
 
         Args:
@@ -206,39 +255,32 @@ class XR0InferencePreprocessor(Preprocessor):
                 dict or flattened ``images.*`` keys) and a ``task`` string.
 
         Returns:
-            Dict with ``input_ids`` / ``attention_mask`` (int64) and
-            ``pixel_values`` / ``state`` (float32) NumPy arrays, with the prompt
-            right-padded to ``seq_len``. ``pixel_values`` is the pre-patchify
-            normalized image grid ``(num_images, C, H, W)`` -- the exported graph
-            bakes the Qwen3-VL temporal-duplication + patchify reshape/transpose.
-
-        Raises:
-            ValueError: If the tokenized prompt is longer than ``seq_len``.
+            Dict with ``pixel_values`` / ``state`` (float32 NumPy) and ``task``
+            (a single-element list holding the rendered chat prompt string).
+            ``pixel_values`` is the pre-patchify normalized image grid
+            ``(num_images, C, H, W)`` -- the exported graph bakes the Qwen3-VL
+            temporal-duplication + patchify reshape/transpose; the sibling
+            OpenVINO tokenizer turns ``task`` into the graph's ``tokenized_prompt``
+            / ``tokenized_prompt_mask`` inputs.
         """
-        batch = self._to_batch(inputs)
-        with torch.no_grad():
-            processed = self._preprocessor(batch)
-
-        input_ids = processed["input_ids"]
-        attention_mask = processed["attention_mask"]
-        cur_len = input_ids.shape[1]
-        if cur_len > self._seq_len:
-            msg = (
-                f"Prompt ({cur_len} tokens) exceeds the baked seq_len={self._seq_len}; re-export with a larger length."
+        images = self._extract_images(inputs)
+        pixel_values = build_pixel_grid(images, self._image_mean, self._image_std, self._rescale_factor)
+        pad_counts = [
+            image_pad_count(
+                1,
+                image.size[1] // self._patch_size,  # image.size == (width, height)
+                image.size[0] // self._patch_size,
+                self._merge_size,
             )
-            raise ValueError(msg)
-        pad = self._seq_len - cur_len
-        if pad:
-            input_ids = F.pad(input_ids, (0, pad), value=self.pad_id)
-            attention_mask = F.pad(attention_mask, (0, pad), value=0)
-
-        pixel_values = self._preprocessor.image_grid(batch)
-
+            for image in images
+        ]
+        views = self._camera_views[: len(images)]
+        prompt = render_chat_prompt(views, pad_counts, self._instruction(inputs))
+        state = self._prepare_state(inputs)
         return {
-            "input_ids": np.ascontiguousarray(input_ids.cpu().numpy().astype(np.int64)),
-            "attention_mask": np.ascontiguousarray(attention_mask.cpu().numpy().astype(np.int64)),
             "pixel_values": np.ascontiguousarray(pixel_values.astype(np.float32)),
-            "state": np.ascontiguousarray(processed["state"].cpu().numpy().astype(np.float32)),
+            "state": np.ascontiguousarray(state),
+            TASK: [prompt],
         }
 
 

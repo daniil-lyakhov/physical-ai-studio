@@ -3,11 +3,9 @@
 
 """Unit tests for the baked Qwen3-VL image patchify and NumPy pixel-grid builder.
 
-Fast, self-contained tests with no model downloads. The torch
-:func:`patchify_image_grid` (baked into the exported graph) is pinned against a
-plain-NumPy reimplementation of the transformers ``Qwen2VLImageProcessor``
-patchify block, and the full NumPy image path
-(:func:`~physicalai.policies.xr0.io.build_pixel_grid` + patchify) is checked for
+Fast, self-contained tests with no model downloads. The full NumPy image path
+(:func:`~physicalai.policies.xr0.io.build_pixel_grid` + the baked
+:func:`~physicalai.policies.xr0.patchify.patchify_image_grid`) is checked for
 parity against the *real* HuggingFace image processor (instantiated offline). That
 parity is what lets the native pipeline build the pre-patchify grid directly in
 NumPy instead of un-patchifying the processor's output.
@@ -27,80 +25,6 @@ TEMPORAL_PATCH_SIZE = 2
 PATCH_SIZE = 16
 MERGE_SIZE = 2
 CHANNELS = 3
-
-
-def _reference_patchify(
-    images: np.ndarray,
-    grid_thw: list[list[int]],
-    temporal_patch_size: int,
-    patch_size: int,
-    merge_size: int,
-) -> np.ndarray:
-    """Plain-NumPy reference mirroring the transformers Qwen3-VL patchify.
-
-    Returns:
-        The flat ``pixel_values`` array.
-    """
-    flattened = []
-    for index, (grid_t, grid_h, grid_w) in enumerate(grid_thw):
-        # Single-frame image temporally duplicated to ``temporal_patch_size`` frames.
-        patches = np.repeat(images[index][np.newaxis], temporal_patch_size, axis=0)
-        channel = patches.shape[1]
-        patches = patches.reshape(
-            grid_t,
-            temporal_patch_size,
-            channel,
-            grid_h // merge_size,
-            merge_size,
-            patch_size,
-            grid_w // merge_size,
-            merge_size,
-            patch_size,
-        )
-        patches = patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
-        flattened.append(
-            patches.reshape(
-                grid_t * grid_h * grid_w,
-                channel * temporal_patch_size * patch_size * patch_size,
-            ),
-        )
-    return np.concatenate(flattened, axis=0)
-
-
-def _make_grid(grid_thw: list[list[int]]) -> torch.Tensor:
-    """Build a random normalized image grid matching ``grid_thw``.
-
-    Returns:
-        A ``(num_images, C, H, W)`` float32 tensor.
-    """
-    generator = torch.Generator().manual_seed(0)
-    height = grid_thw[0][1] * PATCH_SIZE
-    width = grid_thw[0][2] * PATCH_SIZE
-    return torch.randn(len(grid_thw), CHANNELS, height, width, generator=generator, dtype=torch.float32)
-
-
-def test_patchify_matches_transformers_reference() -> None:
-    """The torch patchify equals the plain-NumPy transformers reference."""
-    grid_thw = [[1, 16, 16], [1, 16, 16]]
-    images = _make_grid(grid_thw)
-
-    result = patchify_image_grid(
-        images,
-        grid_thw,
-        temporal_patch_size=TEMPORAL_PATCH_SIZE,
-        patch_size=PATCH_SIZE,
-        merge_size=MERGE_SIZE,
-    )
-    reference = _reference_patchify(
-        images.numpy(),
-        grid_thw,
-        TEMPORAL_PATCH_SIZE,
-        PATCH_SIZE,
-        MERGE_SIZE,
-    )
-
-    assert result.shape == (2 * 16 * 16, CHANNELS * TEMPORAL_PATCH_SIZE * PATCH_SIZE * PATCH_SIZE)
-    np.testing.assert_array_equal(result.numpy(), reference)
 
 
 def test_numpy_grid_plus_patchify_matches_image_processor() -> None:

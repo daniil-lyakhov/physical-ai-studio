@@ -883,9 +883,12 @@ class XR0(ExportablePolicyMixin, Policy):
         For the Torch backend the reconstructed policy runs its own
         preprocessor/postprocessor, so only lightweight input casting and
         optional action trimming are declared. For the self-contained OpenVINO
-        graph the whole XR0 pipeline is declared instead -- an
+        graph the whole XR0 pipeline is declared instead -- a lightweight,
+        torch-free
         :class:`~physicalai.policies.xr0.inference.XR0InferencePreprocessor`
-        (Qwen3-VL tokenization + right-padding) and an
+        (image resize + ``pixel_values`` grid + state padding + rendered ``task``
+        prompt), a sibling OpenVINO ``ov_tokenizer`` (``task`` ->
+        ``tokenized_prompt`` / ``tokenized_prompt_mask``) and an
         :class:`~physicalai.policies.xr0.inference.XR0InferencePostprocessor`
         (action denormalization) -- so the Runtime ``InferenceModel`` can run the
         exported model natively from ``manifest.json``. The OpenVINO entry is only
@@ -916,14 +919,23 @@ class XR0(ExportablePolicyMixin, Policy):
 
         if self.model is not None and self._preprocessor is not None and self._postprocessor is not None:
             cfg = self.config
+            # The OpenVINO tokenizer pads to the graph's baked prompt length.
+            self._preprocessor.max_token_len = cfg.tokenizer_max_length
+            # Bake the Qwen3-VL image geometry + normalization so the lightweight
+            # NumPy inference preprocessor needs no HuggingFace processor at runtime.
+            image_processor = self._preprocessor.processor.image_processor
             ov_preproc = ComponentSpec(
                 class_path="physicalai.policies.xr0.inference.XR0InferencePreprocessor",
                 init_args={
                     "camera_views": list(cfg.camera_views),
                     "max_state_dim": cfg.max_state_dim,
-                    "max_action_dim": cfg.max_action_dim,
-                    "seq_len": cfg.tokenizer_max_length,
-                    "processor_name": cfg.vlm_model_id,
+                    "image_factor": self._preprocessor.image_factor,
+                    "image_max_pixels": self._preprocessor.image_max_pixels,
+                    "image_mean": list(image_processor.image_mean),
+                    "image_std": list(image_processor.image_std),
+                    "rescale_factor": float(image_processor.rescale_factor),
+                    "patch_size": int(image_processor.patch_size),
+                    "merge_size": int(image_processor.merge_size),
                     # Bake the state normalization so the exported graph applies
                     # the exact transform used at training time (identity when
                     # ``normalize_state`` is disabled -> raw-state parity).
@@ -946,8 +958,22 @@ class XR0(ExportablePolicyMixin, Policy):
 
             extra_args["openvino"] = OpenVINOExportParameters(
                 via_onnx=True,
-                preprocessors_specs=[ov_preproc],
+                export_tokenizer=True,
+                # The NumPy preprocessor emits the prompt as a ``task`` string; a
+                # sibling OpenVINO tokenizer (``tokenizer.xml``) turns it into
+                # ``tokenized_prompt`` / ``tokenized_prompt_mask``.
+                preprocessors_specs=[
+                    ov_preproc,
+                    ComponentSpec(type="ov_tokenizer", artifact="tokenizer.xml"),
+                ],
                 postprocessors_specs=ov_postproc_specs,
+                # Rename the traced graph inputs to the tokenizer's output keys so
+                # the exported ``ov_tokenizer`` step feeds them directly (matches
+                # ``physicalai.inference.preprocessors.ov_tokenizer.OVTokenizer``).
+                input_name_map={
+                    "input_ids": "tokenized_prompt",
+                    "attention_mask": "tokenized_prompt_mask",
+                },
                 # Bake the vision geometry + install OpenVINO-friendly RMSNorm
                 # before tracing, then rewrite boolean ``GatherND`` ops to ``i32``
                 # in the written IR so it also loads on the Intel GPU plugin.

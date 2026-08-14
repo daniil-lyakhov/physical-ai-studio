@@ -35,41 +35,15 @@ from physicalai.data import Feature, FeatureType
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Observation
 
 from .io import ACTION_EPS, build_pixel_grid, resize_image
+from .prompt import _ASSISTANT_PRIMER, _MULTI_VIEW_HEADER, _TASK_TEMPLATE, view_title as _view_title
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
-_MULTI_VIEW_HEADER = "The following observations are captured from multiple views.\n"
-_TASK_TEMPLATE = "Generate robot actions for the task:\n{instruction} /no_cot"
-_ASSISTANT_PRIMER = "<cot></cot>"
 _TEMPORAL_STATE_NDIM = 3
 _TEMPORAL_IMAGE_NDIM = 5
-
-# View titles the model was trained with (Xiaomi reference server prompt in
-# deploy/server.py), e.g. "wrist_left" -> "Left-Wrist" so the prompt reads
-# "# Left-Wrist View". A plain capitalize would wrongly yield "Wrist Left".
-_VIEW_TITLES = {
-    "base": "Base",
-    "wrist_left": "Left-Wrist",
-    "wrist_right": "Right-Wrist",
-}
-
-
-def _view_title(view: str) -> str:
-    """Human-readable view title matching the reference prompt.
-
-    Known views use the reference eval's exact titles (e.g. ``"wrist_left"`` ->
-    ``"Left-Wrist"``); unknown views fall back to a capitalized join.
-
-    Returns:
-        The human-readable view title.
-    """
-    key = view.replace("-", "_")
-    if key in _VIEW_TITLES:
-        return _VIEW_TITLES[key]
-    return " ".join(word.capitalize() for word in key.split("_"))
 
 
 def _to_pil(image: torch.Tensor) -> Image.Image:
@@ -108,6 +82,8 @@ class XR0Preprocessor(torch.nn.Module):
         image_factor: Patch-alignment factor for :func:`resize_image`.
         image_max_pixels: Maximum image area for :func:`resize_image`.
         processor_name: HuggingFace id of the Qwen3-VL processor.
+        max_token_len: Fixed prompt length the OpenVINO tokenizer pads to at export
+            (matches the graph's baked ``tokenizer_max_length``).
         normalize_state: When True, normalize the state with per-dimension
             mean/std (from ``features`` or explicit ``state_mean`` / ``state_std``).
             Defaults to False (raw state, matching the upstream recipe).
@@ -131,6 +107,7 @@ class XR0Preprocessor(torch.nn.Module):
         image_factor: int = 32,
         image_max_pixels: int = 90000,
         processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
+        max_token_len: int = 256,
         *,
         normalize_state: bool = False,
         state_mean: Sequence[float] | None = None,
@@ -144,6 +121,7 @@ class XR0Preprocessor(torch.nn.Module):
         self.image_factor = image_factor
         self.image_max_pixels = image_max_pixels
         self.processor_name = processor_name
+        self.max_token_len = int(max_token_len)
         self.normalize_state = bool(normalize_state)
         self._processor: Any = None
 
@@ -232,6 +210,15 @@ class XR0Preprocessor(torch.nn.Module):
             self._processor = AutoProcessor.from_pretrained(self.processor_name)
             self._processor.tokenizer.padding_side = "right"
         return self._processor
+
+    @property
+    def tokenizer(self) -> Any:  # noqa: ANN401
+        """Return the Qwen3-VL tokenizer (used for the OpenVINO tokenizer export).
+
+        Returns:
+            The processor's underlying HuggingFace tokenizer.
+        """
+        return self.processor.tokenizer
 
     def _build_message(self, instruction: str, images: list[Image.Image]) -> list[dict[str, Any]]:
         """Assemble the Qwen3-VL multi-view chat message for one sample.
