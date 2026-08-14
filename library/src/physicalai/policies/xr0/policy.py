@@ -480,7 +480,7 @@ class XR0(ExportablePolicyMixin, Policy):
 
         Runs :attr:`sample_input` through the preprocessor and right-pads
         ``input_ids``/``attention_mask`` to ``config.tokenizer_max_length`` -- the
-        same fixed length the manifest's ``XR0InferencePreprocessor`` pads to at
+        same fixed length the manifest's ``xr0`` preprocessor pads to at
         inference time -- so the exported static graph and the native pipeline
         agree.
 
@@ -884,12 +884,11 @@ class XR0(ExportablePolicyMixin, Policy):
         preprocessor/postprocessor, so only lightweight input casting and
         optional action trimming are declared. For the self-contained OpenVINO
         graph the whole XR0 pipeline is declared instead -- a lightweight,
-        torch-free
-        :class:`~physicalai.policies.xr0.inference.XR0InferencePreprocessor`
+        torch-free Runtime ``xr0`` preprocessor
         (image resize + ``pixel_values`` grid + state padding + rendered ``task``
         prompt), a sibling OpenVINO ``ov_tokenizer`` (``task`` ->
-        ``tokenized_prompt`` / ``tokenized_prompt_mask``) and an
-        :class:`~physicalai.policies.xr0.inference.XR0InferencePostprocessor`
+        ``tokenized_prompt`` / ``tokenized_prompt_mask``) and an ``xr0_denormalize``
+        postprocessor
         (action denormalization) -- so the Runtime ``InferenceModel`` can run the
         exported model natively from ``manifest.json``. The OpenVINO entry is only
         emitted once the model/postprocessor are initialized (their action
@@ -925,32 +924,28 @@ class XR0(ExportablePolicyMixin, Policy):
             # NumPy inference preprocessor needs no HuggingFace processor at runtime.
             image_processor = self._preprocessor.processor.image_processor
             ov_preproc = ComponentSpec(
-                class_path="physicalai.policies.xr0.inference.XR0InferencePreprocessor",
-                init_args={
-                    "camera_views": list(cfg.camera_views),
-                    "max_state_dim": cfg.max_state_dim,
-                    "image_factor": self._preprocessor.image_factor,
-                    "image_max_pixels": self._preprocessor.image_max_pixels,
-                    "image_mean": list(image_processor.image_mean),
-                    "image_std": list(image_processor.image_std),
-                    "rescale_factor": float(image_processor.rescale_factor),
-                    "patch_size": int(image_processor.patch_size),
-                    "merge_size": int(image_processor.merge_size),
-                    # Bake the state normalization so the exported graph applies
-                    # the exact transform used at training time (identity when
-                    # ``normalize_state`` is disabled -> raw-state parity).
-                    "normalize_state": self._preprocessor.normalize_state,
-                    "state_mean": self._preprocessor.state_mean.tolist(),
-                    "state_std": self._preprocessor.state_std.tolist(),
-                },
+                type="xr0",
+                camera_views=list(cfg.camera_views),
+                max_state_dim=cfg.max_state_dim,
+                image_factor=self._preprocessor.image_factor,
+                image_max_pixels=self._preprocessor.image_max_pixels,
+                image_mean=list(image_processor.image_mean),
+                image_std=list(image_processor.image_std),
+                rescale_factor=float(image_processor.rescale_factor),
+                patch_size=int(image_processor.patch_size),
+                merge_size=int(image_processor.merge_size),
+                # Bake the state normalization so the exported graph applies
+                # the exact transform used at training time (identity when
+                # ``normalize_state`` is disabled -> raw-state parity).
+                normalize_state=self._preprocessor.normalize_state,
+                state_mean=self._preprocessor.state_mean.tolist(),
+                state_std=self._preprocessor.state_std.tolist(),
             )
             ov_postproc = ComponentSpec(
-                class_path="physicalai.policies.xr0.inference.XR0InferencePostprocessor",
-                init_args={
-                    "action_mean": self._postprocessor.action_mean.tolist(),
-                    "action_std": self._postprocessor.action_std.tolist(),
-                    "action_dim": self._postprocessor.action_dim,
-                },
+                type="xr0_denormalize",
+                action_mean=self._postprocessor.action_mean.tolist(),
+                action_std=self._postprocessor.action_std.tolist(),
+                action_dim=self._postprocessor.action_dim,
             )
             ov_postproc_specs: list[ComponentSpec] = [ov_postproc]
             if chunk_trimmer is not None:

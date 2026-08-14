@@ -240,18 +240,20 @@ def _load_numpy_preprocessor(manifest: dict[str, Any]) -> Any:  # noqa: ANN401
     """Reconstruct the exported XR0 NumPy inference preprocessor from the manifest.
 
     Returns:
-        The :class:`XR0InferencePreprocessor` built from the manifest ``init_args``
-        (so the baked image geometry / normalization constants are exercised).
+        The Runtime ``XR0Preprocessor`` resolved from the ``type="xr0"`` spec via
+        the component registry (so the baked image geometry / normalization
+        constants are exercised through the real instantiation path).
 
     Raises:
         RuntimeError: If the preprocessor spec is missing from the manifest.
     """
-    from physicalai.policies.xr0.inference import XR0InferencePreprocessor  # noqa: PLC0415
+    from physicalai.inference.component_factory import instantiate_component  # noqa: PLC0415
+    from physicalai.inference.manifest import ComponentSpec  # noqa: PLC0415
 
     for spec in manifest["model"]["preprocessors"]:
-        if spec.get("class_path", "").endswith(".XR0InferencePreprocessor"):
-            return XR0InferencePreprocessor(**spec.get("init_args", {}))
-    msg = "XR0InferencePreprocessor spec not found in the export manifest"
+        if spec.get("type") == "xr0":
+            return instantiate_component(ComponentSpec.model_validate(spec))
+    msg = "xr0 preprocessor spec not found in the export manifest"
     raise RuntimeError(msg)
 
 
@@ -341,11 +343,9 @@ def numerical_parity(native_policy: XR0, export_dir: Path) -> tuple[np.ndarray, 
     pixel_grid = np.ascontiguousarray(np_out["pixel_values"], dtype=np.float32)
     state = np.ascontiguousarray(np_out["state"], dtype=np.float32)
 
-    spec = next(
-        s for s in manifest["model"]["preprocessors"] if s.get("class_path", "").endswith(".XR0InferencePreprocessor")
-    )
-    patch_size = int(spec["init_args"]["patch_size"])
-    merge_size = int(spec["init_args"]["merge_size"])
+    spec = next(s for s in manifest["model"]["preprocessors"] if s.get("type") == "xr0")
+    patch_size = int(spec["patch_size"])
+    merge_size = int(spec["merge_size"])
 
     # The rendered NumPy prompt tokenizes to the same ids as the full processor
     # (see the tokenizer-parity test), so reuse the eager preprocessor's ids/mask
