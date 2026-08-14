@@ -28,8 +28,11 @@ from collections.abc import Sequence
 
 import torch
 
-# Transposition transformers applies after the 9-D reshape.
-_PATCHIFY_PERM = (0, 3, 6, 4, 7, 2, 1, 5, 8)
+# Rank-6 spatial layout ``(gh, gw, C, tp, ps_h, ps_w)`` obtained from the
+# ``(tp, C, gh, ps_h, gw, ps_w)`` reshape.
+_SPATIAL_PERM = (2, 4, 1, 0, 3, 5)
+# Rank-5 merge-block reorder ``(gh/m, m_h, gw/m, m_w, D) -> (gh/m, gw/m, m_h, m_w, D)``.
+_MERGE_PERM = (0, 2, 1, 3, 4)
 
 
 def patchify_image_grid(
@@ -65,24 +68,30 @@ def patchify_image_grid(
     for index, (grid_t, grid_h, grid_w) in enumerate(grid_thw):
         image = images[index : index + 1]  # (1, C, H, W)
         channel = image.shape[1]
+        feature = channel * temporal_patch_size * patch_size * patch_size
         patches = image.repeat(temporal_patch_size, 1, 1, 1)  # (tp, C, H, W)
+        # The transformers patchify is a single 9-D reshape/transpose, but the
+        # Intel GPU plugin's tensor layouts top out at rank 6. Split it into
+        # rank<=6 steps that produce a bit-identical result: first carve the
+        # spatial patches (rank 6), then reorder the merge blocks (rank 5).
         patches = patches.reshape(
-            grid_t,
             temporal_patch_size,
             channel,
+            grid_h,
+            patch_size,
+            grid_w,
+            patch_size,
+        )
+        patches = patches.permute(*_SPATIAL_PERM)  # (gh, gw, C, tp, ps_h, ps_w)
+        patches = patches.reshape(grid_h * grid_w, feature)
+        patches = patches.reshape(
             grid_h // merge_size,
             merge_size,
-            patch_size,
             grid_w // merge_size,
             merge_size,
-            patch_size,
+            feature,
         )
-        patches = patches.permute(*_PATCHIFY_PERM)
-        flattened.append(
-            patches.reshape(
-                grid_t * grid_h * grid_w,
-                channel * temporal_patch_size * patch_size * patch_size,
-            ),
-        )
+        patches = patches.permute(*_MERGE_PERM)
+        flattened.append(patches.reshape(grid_t * grid_h * grid_w, feature))
     return torch.cat(flattened, dim=0)
 
