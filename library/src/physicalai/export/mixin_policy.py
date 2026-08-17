@@ -563,7 +563,9 @@ class ExportablePolicyMixin:
                 - ``"openvino"``: OpenVINO delegation — requires ``nncf`` for export and a
                   custom-built ExecuTorch runtime with OpenVINO backend for inference.
             delegate_config: Optional delegate-specific configuration. For ``"openvino"``,
-                supports ``{"device": "CPU"}`` (or other supported target device).
+                supports ``{"device": "CPU"}`` (or other supported target device) and
+                ``{"compress_weights": "int8_sym"}`` to apply INT8 symmetric weight
+                compression (requires ``nncf``) before lowering.
             **export_kwargs: Additional keyword arguments passed to ``torch.export.export``.
 
         Returns:
@@ -643,6 +645,11 @@ class ExportablePolicyMixin:
         except ImportError as e:
             msg = f"ExecuTorch delegate dependencies are required for delegate={delegate!r}."
             raise ImportError(msg) from e
+
+        if delegate == "openvino" and (delegate_config or {}).get("compress_weights") == "int8_sym":
+            from .hooks import compress_weights_executorch_openvino_int8_sym  # noqa: PLC0415
+
+            aten_dialect = compress_weights_executorch_openvino_int8_sym(aten_dialect, (input_sample,))
 
         if partitioner is not None:
             edge_program = to_edge_transform_and_lower(aten_dialect, partitioner=[partitioner])
