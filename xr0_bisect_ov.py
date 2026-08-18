@@ -31,19 +31,30 @@ Run with the project env python::
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import openvino as ov
 import torch
 import torch.nn.functional as F  # noqa: N812
 from openvino.preprocess import PrePostProcessor
 
+from physicalai.data.observation import IMAGES, STATE, TASK
+from physicalai.inference.constants import TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
 from physicalai.policies import XR0
+from physicalai.policies.xr0.patchify import patchify_image_grid
 from physicalai.policies.xr0.pretrained_utils import extract_xr0_dataset_stats
 
 CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-LIBERO"
+EXPORT_DIR = "xr0_ir"
 EXPORT_XML = "xr0_ir/xr0.xml"
 OV_DEVICE = "CPU"
 N_DIT_LAYERS = 16
+TEMPORAL_PATCH_SIZE = 2
+OV_RANDOM_UNIFORM_GLOBAL_SEED = 42
+OV_RANDOM_UNIFORM_OP_SEED = 7
 # Input source. False = the baked `sample_input` (the exact layout the graph was
 # exported for). True = a real LIBERO observation (step 0 of a rollout), which is
 # what the failing deployment actually feeds -- surfaces observation-dependent
@@ -336,7 +347,115 @@ def _velocity_ladder(noise_node: ov.Node) -> list[tuple[ov.Output, ov.Output]]:
     return steps
 
 
-def expose_and_run(processed: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
+def _pin_random_uniform_seed(model: ov.Model) -> None:
+    """Force the IR's ``RandomUniform`` onto a fixed seed for reproducible noise.
+
+    The exported graph bakes ``global_seed=0`` / ``op_seed=0``, which OpenVINO
+    treats as non-deterministic (a fresh seed every execution). Overriding both
+    seeds with fixed non-zero values makes a fresh compile's first inference draw
+    identical starting noise on every run.
+
+    Raises:
+        RuntimeError: If no ``RandomUniform`` node is present in the IR.
+    """
+    for op in model.get_ops():
+        if op.get_type_name() == "RandomUniform":
+            op.set_attribute("global_seed", OV_RANDOM_UNIFORM_GLOBAL_SEED)
+            op.set_attribute("op_seed", OV_RANDOM_UNIFORM_OP_SEED)
+            return
+    msg = "Could not locate a RandomUniform node to pin the noise seed in the IR."
+    raise RuntimeError(msg)
+
+
+def _load_numpy_preprocessor(manifest: dict[str, Any]) -> Any:  # noqa: ANN401
+    """Reconstruct the exported XR0 NumPy inference preprocessor from the manifest.
+
+    Returns:
+        The Runtime ``XR0Preprocessor`` resolved from the ``type="xr0"`` spec.
+
+    Raises:
+        RuntimeError: If the preprocessor spec is missing from the manifest.
+    """
+    from physicalai.inference.component_factory import instantiate_component  # noqa: PLC0415
+    from physicalai.inference.manifest import ComponentSpec  # noqa: PLC0415
+
+    for spec in manifest["model"]["preprocessors"]:
+        if spec.get("type") == "xr0":
+            return instantiate_component(ComponentSpec.model_validate(spec))
+    msg = "xr0 preprocessor spec not found in the export manifest"
+    raise RuntimeError(msg)
+
+
+def _raw_observation(policy: XR0) -> dict[str, object]:
+    """Convert the policy's torch ``sample_input`` into a raw NumPy observation.
+
+    Returns:
+        The observation dict with flattened ``images.*`` arrays, a ``state`` array
+        and a ``task`` string, as the NumPy inference preprocessor consumes.
+    """
+    observation: dict[str, object] = {}
+    for key, value in policy.sample_input.items():
+        if isinstance(key, str) and key.startswith(f"{IMAGES}."):
+            observation[key] = value.detach().cpu().numpy()
+        elif key == STATE:
+            observation[STATE] = value.detach().cpu().numpy()
+        elif key == TASK:
+            observation[TASK] = value
+    return observation
+
+
+def build_inputs(policy: XR0) -> tuple[dict[str, np.ndarray], dict[str, torch.Tensor]]:
+    """Build the OpenVINO feed and the matching eager batch, exactly as the test.
+
+    Mirrors ``test_xr0_openvino_parity``: the NumPy inference preprocessor turns
+    the sample observation into the raw pixel grid + state the graph consumes on
+    its renamed ``tokenized_prompt`` / ``pixel_values`` / ``state`` ports, and the
+    same grid is patchified for the eager model so both backends see identical
+    inputs.
+
+    Returns:
+        Tuple of ``(graph_inputs, eager_processed)`` -- the NumPy feed dict keyed
+        by the graph's input names, and the torch batch (patchified grid + shared
+        ids/mask/state) for the eager replay.
+    """
+    manifest = json.loads((Path(EXPORT_DIR) / "manifest.json").read_text())
+    preprocessor = _load_numpy_preprocessor(manifest)
+    np_out = preprocessor(_raw_observation(policy))
+    pixel_grid = np.ascontiguousarray(np_out["pixel_values"], dtype=np.float32)
+    state = np.ascontiguousarray(np_out["state"], dtype=np.float32)
+
+    spec = next(s for s in manifest["model"]["preprocessors"] if s.get("type") == "xr0")
+    patch_size = int(spec["patch_size"])
+    merge_size = int(spec["merge_size"])
+
+    processed = build_processed(policy)
+    graph_inputs = {
+        TOKENIZED_PROMPT: processed["input_ids"].cpu().numpy().astype(np.int64),
+        TOKENIZED_PROMPT_MASK: processed["attention_mask"].cpu().numpy().astype(np.int64),
+        "pixel_values": pixel_grid,
+        "state": state,
+    }
+
+    num_images, _, height, width = pixel_grid.shape
+    grid_thw = [[1, height // patch_size, width // patch_size]] * num_images
+    eager_pixels = patchify_image_grid(
+        torch.from_numpy(pixel_grid),
+        grid_thw,
+        temporal_patch_size=TEMPORAL_PATCH_SIZE,
+        patch_size=patch_size,
+        merge_size=merge_size,
+    )
+    eager_processed = {
+        "input_ids": processed["input_ids"],
+        "attention_mask": processed["attention_mask"],
+        "pixel_values": eager_pixels,
+        "image_grid_thw": torch.tensor(grid_thw, dtype=torch.int64),
+        "state": torch.from_numpy(state),
+    }
+    return graph_inputs, eager_processed
+
+
+def expose_and_run(graph_inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Compile the IR with extra outputs for the bisection cut points and run it.
 
     Returns:
@@ -344,6 +463,7 @@ def expose_and_run(processed: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
     """
     core = ov.Core()
     model = core.read_model(EXPORT_XML)
+    _pin_random_uniform_seed(model)
 
     noise_node = _find_noise_node(model)
 
@@ -388,13 +508,7 @@ def expose_and_run(processed: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
     model = ppp.build()
 
     compiled = core.compile_model(model, OV_DEVICE, {"INFERENCE_PRECISION_HINT": "f32"})
-    feed = {
-        "input_ids": processed["input_ids"].cpu().numpy().astype(np.int64),
-        "attention_mask": processed["attention_mask"].cpu().numpy().astype(np.int64),
-        "pixel_values": processed["pixel_values"].float().cpu().numpy().astype(np.float32),
-        "state": processed["state"].float().cpu().numpy().astype(np.float32),
-    }
-    result = compiled(feed)
+    result = compiled(graph_inputs)
     out: dict[str, np.ndarray] = {}
     base = len(compiled.outputs) - len(names)
     for i, name in enumerate(names):
@@ -485,20 +599,19 @@ def _report3(name: str, f32: np.ndarray, bf16: np.ndarray, ov: np.ndarray) -> No
 def main() -> None:
     """Run the eager-vs-OpenVINO bisection on one observation and report diffs."""
     policy = build_policy("float32")
-    processed = build_processed_libero(policy) if USE_LIBERO_OBS else build_processed(policy)
-    print(f"Input source: {'real LIBERO obs' if USE_LIBERO_OBS else 'sample_input'}")
+    graph_inputs, eager_processed = build_inputs(policy)
 
     print("Running exported IR with exposed cut points ...")
-    ov_out = expose_and_run(processed)
+    ov_out = expose_and_run(graph_inputs)
 
     noise = ov_out["noise"].astype(np.float32)
     print("Replaying the IR noise through the f32 eager head ...")
-    eager = run_eager(policy, processed, noise)
+    eager = run_eager(policy, eager_processed, noise)
     del policy
 
     print("Replaying the IR noise through the bf16 eager head ...")
     policy_bf16 = build_policy("bfloat16")
-    eager_bf16 = run_eager(policy_bf16, processed, noise)
+    eager_bf16 = run_eager(policy_bf16, eager_processed, noise)
 
     n_steps = sum(1 for k in ov_out if k.startswith("velocity"))
     print("\n=== velocity ladder: OV vs f32 eager vs bf16 eager ===")

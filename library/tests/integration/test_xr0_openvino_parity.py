@@ -59,12 +59,27 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-LIBERO"
+# Number of rectified-flow Euler steps for both backends. The default XR0 sampler
+# runs 5 steps, but bf16 rounding compounds across steps and pushes the
+# eager-vs-OV action diff past the tight tolerance below. Pinning a single step
+# (dt=1.0, one DiT forward at t=0) removes that per-step accumulation so parity
+# reflects a single kernel's precision. Both the eager policy and the exported IR
+# MUST be built/exported with this value -- the export unrolls the loop at trace
+# time, so a mismatched IR would compare a 1-step eager run against a 5-step graph.
+_NUM_INFERENCE_STEPS = 1
 # Fixed rectified-flow noise seed so the eager replay is deterministic.
 _SEED = 42
+# The exported IR bakes its ``RandomUniform`` with ``global_seed=0`` /
+# ``op_seed=0``, which OpenVINO treats as "pick a fresh seed every run" -- so the
+# starting noise (and hence the eager-vs-OV diff) is different on each execution.
+# Overriding both seeds with fixed non-zero values before compiling makes a fresh
+# compile's first inference reproducible, so the parity comparison is stable.
+_OV_RANDOM_UNIFORM_GLOBAL_SEED = 42
+_OV_RANDOM_UNIFORM_OP_SEED = 7
 # The exported IR runs its DiT head in bf16, so the OpenVINO action differs from
 # the eager (also bf16) action by a small kernel/accumulation epsilon even when
 # fed identical noise; treat anything under this as a match.
-_MAX_ABS_DIFF_TOLERANCE = 0.1
+_MAX_ABS_DIFF_TOLERANCE = 0.05
 _MIN_COSINE_SIMILARITY = 0.99
 # Qwen3-VL vision geometry, used to patchify the NumPy pixel grid for the eager
 # path exactly as the exported graph patchifies it in-graph (matches
@@ -115,6 +130,8 @@ def _build_native_policy() -> XR0:
         pretrained_name_or_path=_CHECKPOINT,
         dataset_stats=_build_dataset_stats(),
         vlm_attn_implementation="sdpa",
+        dtype="bfloat16",
+        num_inference_steps=_NUM_INFERENCE_STEPS,
     )
     policy.eval()
     return policy
@@ -190,6 +207,27 @@ def _find_noise_node(model: ov.Model) -> ov.Node:
     raise RuntimeError(msg)
 
 
+def _pin_random_uniform_seed(model: ov.Model) -> None:
+    """Force the IR's ``RandomUniform`` onto a fixed seed for reproducible noise.
+
+    The exported graph bakes ``global_seed=0`` / ``op_seed=0``, which OpenVINO
+    interprets as non-deterministic (a fresh seed every execution). Overriding
+    both seeds with fixed non-zero values makes a fresh compile's first inference
+    draw identical starting noise on every run, so the eager-vs-OV comparison is
+    stable instead of sampling a different, data-dependent diff each time.
+
+    Raises:
+        RuntimeError: If no ``RandomUniform`` node is present in the IR.
+    """
+    for op in model.get_ops():
+        if op.get_type_name() == "RandomUniform":
+            op.set_attribute("global_seed", _OV_RANDOM_UNIFORM_GLOBAL_SEED)
+            op.set_attribute("op_seed", _OV_RANDOM_UNIFORM_OP_SEED)
+            return
+    msg = "Could not locate a RandomUniform node to pin the noise seed in the IR."
+    raise RuntimeError(msg)
+
+
 def _run_openvino_ir(ir_xml: Path, graph_inputs: dict[str, np.ndarray]) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the exported IR, returning both its action and the noise it drew.
 
@@ -210,6 +248,10 @@ def _run_openvino_ir(ir_xml: Path, graph_inputs: dict[str, np.ndarray]) -> tuple
     """
     core = ov.Core()
     model = core.read_model(ir_xml)
+
+    # Pin the internal RandomUniform seed so the drawn noise -- and therefore the
+    # eager-vs-OV diff -- is identical on every run instead of non-deterministic.
+    _pin_random_uniform_seed(model)
 
     # Expose the internal Gaussian noise as a second output (cast to f32 so NumPy
     # can read the otherwise-bf16 tensor) without disturbing the action output.

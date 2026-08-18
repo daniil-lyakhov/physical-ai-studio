@@ -32,25 +32,44 @@ Run with the project env python::
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import openvino as ov
 import torch
 import torch.nn.functional as F  # noqa: N812
 from openvino.preprocess import PrePostProcessor
 
+from physicalai.data.observation import IMAGES, STATE, TASK
+from physicalai.inference.constants import TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
 from physicalai.policies import XR0
+from physicalai.policies.xr0.patchify import patchify_image_grid
 from physicalai.policies.xr0.pretrained_utils import extract_xr0_dataset_stats
 
 CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-LIBERO"
+# Directory of the exported IR + manifest produced by ``policy.export(...)``.
+EXPORT_DIR = "xr0_ir"
 # Directory / IR produced by ``xr0_to_openvino.py``.
-EXPORT_XML = "xr0_ir/xr0.xml"
+EXPORT_XML = f"{EXPORT_DIR}/xr0.xml"
+# Qwen3-VL temporal patch size, used to patchify the NumPy pixel grid for the
+# eager path exactly as the exported graph patchifies it in-graph.
+TEMPORAL_PATCH_SIZE = 2
+# The exported IR bakes its ``RandomUniform`` with ``global_seed=0`` /
+# ``op_seed=0``, which OpenVINO treats as non-deterministic (fresh seed each
+# run). Overriding both with fixed non-zero values before compiling makes a
+# fresh compile's first inference reproducible, so the eager-vs-OV diff is
+# stable instead of a different sample every run.
+OV_RANDOM_UNIFORM_GLOBAL_SEED = 42
+OV_RANDOM_UNIFORM_OP_SEED = 7
 # Device the exported IR is compiled on for the parity run. Set to "GPU" to
 # compare against the same Intel GPU path used at inference (with the precision
 # hint applied at compile time, exactly like the InferenceModel load).
-OV_DEVICE = "GPU"
+OV_DEVICE = "CPU"
 # Intel GPU compute precision. "bf16" matches the eager/training precision (best
 # parity); "f32" is the safe fallback. Both dodge the f16-only RoPE OpenCL kernel.
-GPU_PRECISION_HINT = "bf16"
+GPU_PRECISION_HINT = "f32"
 # Fixed rectified-flow noise seed so eager and export draw identical noise.
 SEED = 42
 # Max abs diff above which we treat the wrappers as having changed the numerics.
@@ -60,7 +79,7 @@ TOLERANCE = 1e-2
 # The exported IR runs its DiT head in bf16 on CPU, so the OpenVINO action will
 # differ from the eager (also bf16) action by a small kernel/accumulation epsilon
 # even when fed identical noise; treat anything under this as a match.
-OV_TOLERANCE = 1e-1
+OV_TOLERANCE = 5e-2
 
 
 def build_policy() -> XR0:
@@ -194,20 +213,98 @@ def _find_noise_node(model: ov.Model) -> ov.Node:
     raise RuntimeError(msg)
 
 
-def run_openvino(processed: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the exported IR, returning both its action and the noise it drew.
+def _pin_random_uniform_seed(model: ov.Model) -> None:
+    """Force the IR's ``RandomUniform`` onto a fixed seed for reproducible noise.
 
-    The IR's ``RandomUniform`` (seed 0) draws fresh noise every inference, so the
-    noise node is exposed as an extra output and read back from the *same* run as
-    the action -- guaranteeing the returned ``action`` and ``noise`` are
-    consistent. The noise can then be replayed through the eager model for an
-    apples-to-apples comparison.
+    The exported graph bakes ``global_seed=0`` / ``op_seed=0``, which OpenVINO
+    treats as non-deterministic (a fresh seed every execution). Overriding both
+    seeds with fixed non-zero values makes a fresh compile's first inference draw
+    identical starting noise on every run.
+
+    Raises:
+        RuntimeError: If no ``RandomUniform`` node is present in the IR.
+    """
+    for op in model.get_ops():
+        if op.get_type_name() == "RandomUniform":
+            op.set_attribute("global_seed", OV_RANDOM_UNIFORM_GLOBAL_SEED)
+            op.set_attribute("op_seed", OV_RANDOM_UNIFORM_OP_SEED)
+            return
+    msg = "Could not locate a RandomUniform node to pin the noise seed in the IR."
+    raise RuntimeError(msg)
+
+
+def _load_numpy_preprocessor(manifest: dict[str, Any]) -> Any:  # noqa: ANN401
+    """Reconstruct the exported XR0 NumPy inference preprocessor from the manifest.
 
     Returns:
-        Tuple of ``(action, noise)`` as CPU float32 tensors.
+        The Runtime ``XR0Preprocessor`` resolved from the ``type="xr0"`` spec.
+
+    Raises:
+        RuntimeError: If the preprocessor spec is missing from the manifest.
     """
+    from physicalai.inference.component_factory import instantiate_component
+    from physicalai.inference.manifest import ComponentSpec
+
+    for spec in manifest["model"]["preprocessors"]:
+        if spec.get("type") == "xr0":
+            return instantiate_component(ComponentSpec.model_validate(spec))
+    msg = "xr0 preprocessor spec not found in the export manifest"
+    raise RuntimeError(msg)
+
+
+def _raw_observation(policy: XR0) -> dict[str, object]:
+    """Convert the policy's torch ``sample_input`` into a raw NumPy observation.
+
+    Returns:
+        The observation dict with flattened ``images.*`` arrays, a ``state`` array
+        and a ``task`` string, as the NumPy inference preprocessor consumes.
+    """
+    observation: dict[str, object] = {}
+    for key, value in policy.sample_input.items():
+        if isinstance(key, str) and key.startswith(f"{IMAGES}."):
+            observation[key] = value.detach().cpu().numpy()
+        elif key == STATE:
+            observation[STATE] = value.detach().cpu().numpy()
+        elif key == TASK:
+            observation[TASK] = value
+    return observation
+
+
+def run_openvino(
+    policy: XR0,
+    processed: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Run the exported IR and build the matching eager-replay batch.
+
+    The deployed graph consumes the NumPy inference preprocessor's *pixel grid*
+    and patchifies it in-graph, so both backends are fed identical inputs: the IR
+    gets the raw grid on the renamed ``tokenized_prompt`` / ``pixel_values`` /
+    ``state`` ports, and the eager batch gets the same grid patchified. The IR's
+    ``RandomUniform`` seed is pinned (reproducible) and its Gaussian noise node is
+    exposed as a second output so the eager model can replay the exact same noise.
+
+    Returns:
+        Tuple of ``(ov_action, ov_noise, eager_processed)`` -- the IR action and
+        drawn noise as CPU float32 tensors, plus the eager batch (patchified grid
+        + shared ids/mask/state) ready for ``run_forward_with_noise``.
+    """
+    export_dir = Path(EXPORT_DIR)
+    manifest = json.loads((export_dir / "manifest.json").read_text())
+    preprocessor = _load_numpy_preprocessor(manifest)
+    np_out = preprocessor(_raw_observation(policy))
+    pixel_grid = np.ascontiguousarray(np_out["pixel_values"], dtype=np.float32)
+    state = np.ascontiguousarray(np_out["state"], dtype=np.float32)
+
+    spec = next(s for s in manifest["model"]["preprocessors"] if s.get("type") == "xr0")
+    patch_size = int(spec["patch_size"])
+    merge_size = int(spec["merge_size"])
+
     core = ov.Core()
     model = core.read_model(EXPORT_XML)
+
+    # Pin the internal RandomUniform seed so the drawn noise -- and therefore the
+    # eager-vs-OV diff -- is identical on every run instead of non-deterministic.
+    _pin_random_uniform_seed(model)
 
     # Expose the internal Gaussian noise as a second output (cast to f32 so NumPy
     # can read the otherwise-bf16 tensor) without disturbing the action output.
@@ -219,15 +316,34 @@ def run_openvino(processed: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torc
 
     compiled = core.compile_model(model, OV_DEVICE, _ov_config())
     feed = {
-        "input_ids": processed["input_ids"].cpu().numpy().astype(np.int64),
-        "attention_mask": processed["attention_mask"].cpu().numpy().astype(np.int64),
-        "pixel_values": processed["pixel_values"].float().cpu().numpy().astype(np.float32),
-        "state": processed["state"].float().cpu().numpy().astype(np.float32),
+        TOKENIZED_PROMPT: processed["input_ids"].cpu().numpy().astype(np.int64),
+        TOKENIZED_PROMPT_MASK: processed["attention_mask"].cpu().numpy().astype(np.int64),
+        "pixel_values": pixel_grid,
+        "state": state,
     }
     result = compiled(feed)
     action = torch.from_numpy(np.asarray(result[compiled.output(0)])).float()
     noise = torch.from_numpy(np.asarray(result[compiled.output(1)])).float()
-    return action, noise
+
+    # Patchify the identical pixel grid so the eager vision tower sees exactly
+    # what the in-graph patchify produces.
+    num_images, _, height, width = pixel_grid.shape
+    grid_thw = [[1, height // patch_size, width // patch_size]] * num_images
+    eager_pixels = patchify_image_grid(
+        torch.from_numpy(pixel_grid),
+        grid_thw,
+        temporal_patch_size=TEMPORAL_PATCH_SIZE,
+        patch_size=patch_size,
+        merge_size=merge_size,
+    )
+    eager_processed = {
+        "input_ids": processed["input_ids"],
+        "attention_mask": processed["attention_mask"],
+        "pixel_values": eager_pixels,
+        "image_grid_thw": torch.tensor(grid_thw, dtype=torch.int64),
+        "state": torch.from_numpy(state),
+    }
+    return action, noise, eager_processed
 
 
 def _report(name: str, reference: torch.Tensor, other: torch.Tensor, tolerance: float) -> bool:
@@ -296,10 +412,10 @@ def main() -> None:
     # Exported OpenVINO IR vs eager (in-graph-export mode), same noise.   #
     # ------------------------------------------------------------------ #
     print("\nRunning EXPORTED OpenVINO IR ...")
-    ov_action, ov_noise = run_openvino(processed)
+    ov_action, ov_noise, eager_processed = run_openvino(policy, processed)
 
     print("Replaying the IR's noise through the eager model ...")
-    eager_ov = run_forward_with_noise(policy, processed, ov_noise)
+    eager_ov = run_forward_with_noise(policy, eager_processed, ov_noise)
 
     if ov_action.shape != eager_ov.shape:
         msg = f"Shape mismatch: OV {tuple(ov_action.shape)} vs eager {tuple(eager_ov.shape)}"

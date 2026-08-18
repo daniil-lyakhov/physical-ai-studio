@@ -27,11 +27,12 @@ policy = XR0(
     # ``action_chunk_trimmer`` into the manifest and the deployed Runtime replans
     # every 10 steps -- matching the working eager LIBERO eval (liber_xr0_.py).
     # Executing all 30 open-loop overshoots the target and collapses success ~0%.
-    n_action_steps=10,
+    #n_action_steps=10,
+    num_inference_steps=1
 )
 
 # All XR0 export preparation and workarounds live inside ``XR0.to_openvino``:
 # right-padding the sample to the graph length, baking the vision geometry,
 # rebuilding the MRoPE ``position_ids`` in-graph, installing the OpenVINO-friendly
 # RMSNorm, and the post-export GPU-friendly ``GatherND`` rewrite.
-policy.to_openvino("xr0_ir")
+policy.to_openvino("xr0_ir_1step")
