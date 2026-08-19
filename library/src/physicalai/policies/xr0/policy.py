@@ -586,6 +586,8 @@ class XR0(ExportablePolicyMixin, Policy):
         del batch_idx
         loss, loss_dict = self(batch)
         self.log("train/loss", loss_dict["loss"], prog_bar=True)
+        self.log("train/loss_mse", loss_dict["loss_mse"])
+        self.log("train/loss_freq", loss_dict["loss_freq"])
         return loss
 
     def configure_optimizers(self) -> dict[str, Any]:

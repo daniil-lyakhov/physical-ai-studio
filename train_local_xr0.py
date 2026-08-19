@@ -38,8 +38,9 @@ CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-Pretrain"
 SMOKE_TEST = True
 
 # Training hyperparameters. XR0 is far larger than ACT, so keep the batch small.
-MAX_STEPS = 50 if SMOKE_TEST else 40_000
-BATCH_SIZE = 2 if SMOKE_TEST else 16
+MAX_STEPS = 300 if SMOKE_TEST else 40_000
+BATCH_SIZE = 16 if SMOKE_TEST else 16
+WARMUP_STEPS = 20 if SMOKE_TEST else 2_000
 
 # Smoke-test knobs: cap the delta-stats estimation and the train/val loop to a
 # few batches so the sanity run stays fast without iterating the whole dataset.
@@ -91,6 +92,7 @@ def main() -> None:
         # Align the cosine decay horizon with the full training length (the
         # config default decays over 30k steps, which under-decays a 40k run).
         scheduler_decay_steps=MAX_STEPS,
+        scheduler_warmup_steps=WARMUP_STEPS,
     )
 
     # Estimate the per-timestep delta-action mean/std from the fine-tuning data.
