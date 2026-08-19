@@ -107,6 +107,11 @@ class XR0Model(Model):
         self.prefix_mask_prob = prefix_mask_prob
         self.async_train = async_train
         self._dtype = dtype
+        # When True (set only during ``action_mode="delta"`` OpenVINO export) the
+        # traced eval graph emits the current-frame ``state`` as a second output
+        # so the Runtime ``xr0_denormalize`` step can re-add it to the predicted
+        # delta. Off for training and normal inference.
+        self.export_state_passthrough = False
 
         # VLM backbone (surfaces the 3D MRoPE position_ids for the DiT).
         if vlm is None:
@@ -522,6 +527,11 @@ class XR0Model(Model):
         # single, self-consistent f32-output IR -- no fragile post-hoc re-save of
         # the multi-GB ``.bin``. Numerically identical at inference.
         if getattr(self.vlm, "_ingraph_export", False):
+            # For ``action_mode="delta"`` also echo the current-frame state as a
+            # second f32 output so the Runtime postprocessor can reconstruct the
+            # absolute action (``delta + state``) without needing the observation.
+            if self.export_state_passthrough:
+                return pred.float(), state.float()
             return pred.float()
         return pred
 

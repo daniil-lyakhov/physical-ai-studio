@@ -80,6 +80,13 @@ class XR0Config(Config):
             scale the pretrained checkpoint expects (e.g. joint positions in
             degrees). The resulting mean/std become part of the trained
             checkpoint's contract and are baked into the exported manifest.
+        action_mode: How the action target is represented. ``"absolute"`` (the
+            default) predicts the raw action directly. ``"delta"`` predicts the
+            per-step delta relative to the current state (``action[t] - state``),
+            matching the pretrained XR0 flow head's delta prior; the inverse
+            (``delta + state``) is applied at inference. Delta mode requires
+            per-timestep delta stats supplied via ``action_delta_mean`` /
+            ``action_delta_std``.
         normalization_mode: Normalization method for state/action features.
             ``"QUANTILES"`` maps data to [-1, 1] using the 1st and 99th
             percentiles; ``"MEAN_STD"`` uses zero-mean unit-variance
@@ -141,6 +148,8 @@ class XR0Config(Config):
     freeze_vision_encoder: bool = False
     freeze_input_embeddings: bool = True
     normalize_state: bool = False
+
+    action_mode: Literal["absolute", "delta"] = "absolute"
 
     normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES"
 

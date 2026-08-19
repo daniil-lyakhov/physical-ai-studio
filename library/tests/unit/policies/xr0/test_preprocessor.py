@@ -18,6 +18,7 @@ from physicalai.data.observation import ACTION, STATE, TASK
 from physicalai.policies.xr0.preprocessor import (
     XR0Postprocessor,
     XR0Preprocessor,
+    compute_delta_action_stats,
     make_xr0_preprocessors,
 )
 
@@ -154,6 +155,140 @@ class TestStateNormalization:
         assert torch.allclose(out[:, 0, :STATE_DIM], torch.ones(1, STATE_DIM), atol=1e-6)
         assert torch.allclose(out[:, 0, STATE_DIM:], torch.full((1, 32 - STATE_DIM), -0.25), atol=1e-6)
 
+
+class TestDeltaAction:
+    """Delta-action mode: target = action - current state, inverse re-adds state."""
+
+    def _delta_pair(
+        self, mean_val: float = 0.5, std_val: float = 2.0
+    ) -> tuple[XR0Preprocessor, XR0Postprocessor]:
+        return make_xr0_preprocessors(
+            stats=_stats(),
+            max_action_dim=32,
+            action_mode="delta",
+            action_delta_mean=torch.full((HORIZON, 32), mean_val),
+            action_delta_std=torch.full((HORIZON, 32), std_val),
+        )
+
+    def test_delta_stats_override_buffers(self) -> None:
+        pre, post = self._delta_pair()
+        assert pre.action_mode == "delta"
+        assert post.action_mode == "delta"
+        # Per-timestep (T, D) delta stats replace the feature-derived 1D stats.
+        assert pre.action_mean.shape == (HORIZON, 32)
+        assert torch.allclose(pre.action_mean, torch.full((HORIZON, 32), 0.5))
+        assert torch.allclose(post.action_std, torch.full((HORIZON, 32), 2.0))
+        # The unpadded action_dim is still recovered from features for the slice.
+        assert post.action_dim == ACTION_DIM
+
+    def test_prepare_action_subtracts_current_state(self) -> None:
+        # Identity delta stats so the normalized target is the raw delta.
+        pre, _ = self._delta_pair(mean_val=0.0, std_val=1.0)
+        state = torch.randn(2, STATE_DIM)
+        action = torch.randn(2, HORIZON, ACTION_DIM)
+        normalized, mask = pre._prepare_action(action, torch.device("cpu"), state=state)  # noqa: SLF001
+        overlap = min(ACTION_DIM, STATE_DIM)
+        expected = action - state[:, :overlap].unsqueeze(1)
+        assert normalized.shape == (2, HORIZON, 32)
+        assert torch.allclose(normalized[..., :overlap], expected, atol=1e-5)
+        assert torch.allclose(normalized[..., ACTION_DIM:], torch.zeros(2, HORIZON, 32 - ACTION_DIM), atol=1e-6)
+        assert mask[..., :ACTION_DIM].all()
+        assert not mask[..., ACTION_DIM:].any()
+
+    def test_delta_roundtrip_recovers_absolute_action(self) -> None:
+        pre, post = self._delta_pair()
+        state = torch.randn(2, STATE_DIM)
+        action = torch.randn(2, HORIZON, ACTION_DIM)
+        normalized, _ = pre._prepare_action(action, torch.device("cpu"), state=state)  # noqa: SLF001
+        recovered = post({ACTION: normalized, STATE: state})[ACTION]
+        assert recovered.shape == (2, HORIZON, ACTION_DIM)
+        assert torch.allclose(recovered, action, atol=1e-5)
+
+    def test_delta_roundtrip_with_temporal_state(self) -> None:
+        # A (B, T, D) state uses its current (last) frame on both sides.
+        pre, post = self._delta_pair()
+        state = torch.randn(2, 4, STATE_DIM)
+        action = torch.randn(2, HORIZON, ACTION_DIM)
+        normalized, _ = pre._prepare_action(action, torch.device("cpu"), state=state)  # noqa: SLF001
+        recovered = post({ACTION: normalized, STATE: state})[ACTION]
+        assert torch.allclose(recovered, action, atol=1e-5)
+
+    def test_delta_requires_state(self) -> None:
+        pre, post = self._delta_pair()
+        action = torch.randn(2, HORIZON, ACTION_DIM)
+        with pytest.raises(ValueError, match="delta"):
+            pre._prepare_action(action, torch.device("cpu"))  # noqa: SLF001
+        with pytest.raises(ValueError, match="delta"):
+            post({ACTION: torch.randn(2, HORIZON, 32)})
+
+    def test_absolute_mode_ignores_state(self) -> None:
+        # Default absolute mode does not subtract the state even if provided.
+        pre, _ = make_xr0_preprocessors(stats=_stats(), max_action_dim=32)
+        action = torch.randn(2, HORIZON, ACTION_DIM)
+        state = torch.randn(2, STATE_DIM)
+        with_state, _ = pre._prepare_action(action, torch.device("cpu"), state=state)  # noqa: SLF001
+        without_state, _ = pre._prepare_action(action, torch.device("cpu"))  # noqa: SLF001
+        assert torch.allclose(with_state, without_state)
+
+
+class _FakeDataModule:
+    """Minimal datamodule exposing ``train_dataloader`` over pre-built batches."""
+
+    def __init__(self, batches: list[dict]) -> None:
+        self._batches = batches
+
+    def train_dataloader(self) -> list[dict]:
+        return self._batches
+
+
+class TestComputeDeltaActionStats:
+    """Offline per-timestep delta-action stats over a training dataloader."""
+
+    def test_constant_delta_gives_zero_std_and_identity_padding(self) -> None:
+        batch_size = 4
+        offset = torch.randn(HORIZON, ACTION_DIM)  # per-(t, d) delta, constant over batch
+        state = torch.randn(batch_size, STATE_DIM)
+        action = state[:, :ACTION_DIM].unsqueeze(1) + offset.unsqueeze(0)
+        dm = _FakeDataModule([{STATE: state, ACTION: action}])
+
+        mean, std = compute_delta_action_stats(dm, chunk_size=HORIZON, action_dim=ACTION_DIM)
+
+        assert mean.shape == (HORIZON, 32)
+        assert std.shape == (HORIZON, 32)
+        assert torch.allclose(mean[:, :ACTION_DIM], offset, atol=1e-5)
+        assert torch.allclose(std[:, :ACTION_DIM], torch.zeros(HORIZON, ACTION_DIM), atol=1e-5)
+        # Padding columns keep identity stats so downstream normalization is a no-op.
+        assert torch.allclose(mean[:, ACTION_DIM:], torch.zeros(HORIZON, 32 - ACTION_DIM))
+        assert torch.allclose(std[:, ACTION_DIM:], torch.ones(HORIZON, 32 - ACTION_DIM))
+
+    def test_matches_manual_mean_std_across_batches(self) -> None:
+        torch.manual_seed(0)
+        batches = []
+        deltas = []
+        for _ in range(3):
+            state = torch.randn(5, STATE_DIM)
+            action = torch.randn(5, HORIZON, ACTION_DIM)
+            batches.append({STATE: state, ACTION: action})
+            deltas.append(action - state[:, :ACTION_DIM].unsqueeze(1))
+        stacked = torch.cat(deltas, dim=0)  # (N, T, action_dim)
+        dm = _FakeDataModule(batches)
+
+        mean, std = compute_delta_action_stats(dm, chunk_size=HORIZON, action_dim=ACTION_DIM)
+
+        assert torch.allclose(mean[:, :ACTION_DIM], stacked.mean(dim=0), atol=1e-5)
+        assert torch.allclose(std[:, :ACTION_DIM], stacked.std(dim=0, unbiased=False), atol=1e-5)
+
+    def test_raises_on_empty_dataset(self) -> None:
+        dm = _FakeDataModule([])
+        with pytest.raises(ValueError, match="no samples"):
+            compute_delta_action_stats(dm, chunk_size=HORIZON, action_dim=ACTION_DIM)
+
+    def test_raises_on_chunk_mismatch(self) -> None:
+        state = torch.randn(2, STATE_DIM)
+        action = torch.randn(2, HORIZON + 1, ACTION_DIM)
+        dm = _FakeDataModule([{STATE: state, ACTION: action}])
+        with pytest.raises(ValueError, match="chunk_size"):
+            compute_delta_action_stats(dm, chunk_size=HORIZON, action_dim=ACTION_DIM)
 
 
 @requires_processor

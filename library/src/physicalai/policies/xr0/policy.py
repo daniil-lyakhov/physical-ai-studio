@@ -29,6 +29,7 @@ from .pretrained_utils import extract_xr0_dataset_stats, load_xr0_pretrained_wei
 from .vla import XR0Model
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from physicalai.data import Observation
@@ -90,6 +91,14 @@ class XR0(ExportablePolicyMixin, Policy):
             per-dimension mean/std. Defaults to False (raw state), keeping
             existing raw-state checkpoints/exports unchanged; enable it for
             embodiments whose raw state is off the pretrained checkpoint's scale.
+        action_mode: ``"absolute"`` (default) predicts the raw action;
+            ``"delta"`` predicts ``action[t] - state`` and re-adds the state at
+            inference, matching the pretrained flow head's delta prior.
+        action_delta_mean: Per-timestep delta-action mean
+            (``(chunk_size, max_action_dim)``) used when ``action_mode="delta"``;
+            compute it with :func:`compute_delta_action_stats`.
+        action_delta_std: Per-timestep delta-action std, same shape as
+            ``action_delta_mean``.
         normalization_mode: Normalization method for state/action features.
         optimizer_lr: Learning rate.
         optimizer_betas: Adam beta coefficients.
@@ -149,6 +158,9 @@ class XR0(ExportablePolicyMixin, Policy):
         freeze_vision_encoder: bool = False,
         freeze_input_embeddings: bool = True,
         normalize_state: bool = False,
+        action_mode: Literal["absolute", "delta"] = "absolute",
+        action_delta_mean: Sequence[float] | torch.Tensor | None = None,
+        action_delta_std: Sequence[float] | torch.Tensor | None = None,
         normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES",
         optimizer_lr: float = 1.0e-4,
         optimizer_betas: tuple[float, float] = (0.9, 0.95),
@@ -206,6 +218,7 @@ class XR0(ExportablePolicyMixin, Policy):
             freeze_vision_encoder=freeze_vision_encoder,
             freeze_input_embeddings=freeze_input_embeddings,
             normalize_state=normalize_state,
+            action_mode=action_mode,
             normalization_mode=normalization_mode,
             optimizer_lr=optimizer_lr,
             optimizer_betas=optimizer_betas,
@@ -219,6 +232,19 @@ class XR0(ExportablePolicyMixin, Policy):
 
         self.save_hyperparameters(ignore=["config", "compile_model", "pretrained_name_or_path"])
         self._set_hparam_keys()
+
+        # Per-timestep delta-action stats (only used when action_mode="delta").
+        # Stored as tensors for the preprocessors and mirrored into hparams as
+        # plain lists so they round-trip through Lightning checkpoints.
+        self._action_delta_mean: torch.Tensor | None = (
+            None if action_delta_mean is None else torch.as_tensor(action_delta_mean, dtype=torch.float32)
+        )
+        self._action_delta_std: torch.Tensor | None = (
+            None if action_delta_std is None else torch.as_tensor(action_delta_std, dtype=torch.float32)
+        )
+        if self._action_delta_mean is not None and self._action_delta_std is not None:
+            self.hparams["action_delta_mean"] = self._action_delta_mean.tolist()
+            self.hparams["action_delta_std"] = self._action_delta_std.tolist()
 
         self.model: XR0Model | None = None
         self._preprocessor: XR0Preprocessor | None = None
@@ -293,6 +319,9 @@ class XR0(ExportablePolicyMixin, Policy):
             stats=dataset_stats,
             processor_name=cfg.vlm_model_id,
             normalize_state=cfg.normalize_state,
+            action_mode=cfg.action_mode,
+            action_delta_mean=self._action_delta_mean,
+            action_delta_std=self._action_delta_std,
         )
         self._dataset_stats = dataset_stats
 
@@ -316,6 +345,9 @@ class XR0(ExportablePolicyMixin, Policy):
             stats=dataset_stats,
             processor_name=cfg.vlm_model_id,
             normalize_state=cfg.normalize_state,
+            action_mode=cfg.action_mode,
+            action_delta_mean=self._action_delta_mean,
+            action_delta_std=self._action_delta_std,
         )
         self._dataset_stats = dataset_stats
 
@@ -432,14 +464,15 @@ class XR0(ExportablePolicyMixin, Policy):
         Raises:
             ValueError: If the model is not initialized.
         """
-        from physicalai.data.observation import ACTION  # noqa: PLC0415
+        from physicalai.data.observation import ACTION, STATE  # noqa: PLC0415
 
         if self.model is None or self._preprocessor is None or self._postprocessor is None:
             msg = "Model is not initialized"
             raise ValueError(msg)
-        processed = self._preprocessor(batch.to(self.device).to_dict())
+        observation = batch.to(self.device).to_dict()
+        processed = self._preprocessor(observation)
         actions = self.model.predict_action_chunk(processed)
-        return self._postprocessor({ACTION: actions})[ACTION]
+        return self._postprocessor({ACTION: actions, STATE: observation[STATE]})[ACTION]
 
     def prepare_ingraph_export(self, processed: dict[str, torch.Tensor]) -> None:
         """Bake the fixed image geometry into the VLM for a self-contained export.
@@ -515,7 +548,11 @@ class XR0(ExportablePolicyMixin, Policy):
         Registered as a ``pre_export_hooks`` entry for the OpenVINO backend (see
         :attr:`extra_export_args`) so the base
         :meth:`ExportablePolicyMixin.to_openvino` runs it in place before tracing.
+        In ``action_mode="delta"`` it also enables the model's state pass-through
+        so the traced graph emits the current-frame ``state`` as a second output.
         """
+        if self.model is not None:
+            self.model.export_state_passthrough = self.config.action_mode == "delta"
         self.prepare_ingraph_export(self._build_padded_export_sample())
 
     def _get_default_export_input_sample(self) -> dict[str, torch.Tensor]:
@@ -867,7 +904,7 @@ class XR0(ExportablePolicyMixin, Policy):
             msg = "output feature missing concrete shape for export"
             raise ValueError(msg)
 
-        return [
+        schema = [
             InferenceFeature(
                 ftype=InferenceFeatureType.ACTION,
                 shape=(self.config.chunk_size, *tuple(action_feature.shape)),
@@ -875,6 +912,19 @@ class XR0(ExportablePolicyMixin, Policy):
                 dtype=InferenceFeatureDtype.FLOAT32,
             ),
         ]
+        # In delta mode the graph echoes the current-frame state as a second
+        # output so the Runtime ``xr0_denormalize`` can rebuild the absolute
+        # action (``delta + state``). Declare it so the manifest maps the port.
+        if self.config.action_mode == "delta":
+            schema.append(
+                InferenceFeature(
+                    ftype=InferenceFeatureType.STATE,
+                    shape=tuple(self.model.state_shape),
+                    name=STATE,
+                    dtype=InferenceFeatureDtype.FLOAT32,
+                ),
+            )
+        return schema
 
     @property
     def extra_export_args(self) -> dict[str, ExportParameters]:
@@ -943,6 +993,15 @@ class XR0(ExportablePolicyMixin, Policy):
             )
             ov_postproc = ComponentSpec(
                 type="xr0_denormalize",
+                # In ``action_mode="delta"`` the baked ``action_mean``/``action_std``
+                # are per-timestep ``(chunk_size, max_action_dim)`` delta stats and
+                # the denormalized prediction is a delta. The graph additionally
+                # emits the current-frame ``state`` as a second output (see
+                # ``outputs`` below), so the Runtime ``xr0_denormalize`` step must,
+                # when ``action_mode == "delta"``, re-add it to the denormalized
+                # delta (``action[..., :action_dim] += state``) before returning
+                # the absolute action, mirroring ``XR0Postprocessor.forward``.
+                action_mode=self._postprocessor.action_mode,
                 action_mean=self._postprocessor.action_mean.tolist(),
                 action_std=self._postprocessor.action_std.tolist(),
                 action_dim=self._postprocessor.action_dim,
@@ -954,6 +1013,9 @@ class XR0(ExportablePolicyMixin, Policy):
             extra_args["openvino"] = OpenVINOExportParameters(
                 via_onnx=True,
                 export_tokenizer=True,
+                # Delta mode adds a second graph output: the current-frame state,
+                # renamed here so the manifest port lines up with ``STATE``.
+                outputs=["action", "state"] if cfg.action_mode == "delta" else ["action"],
                 # The NumPy preprocessor emits the prompt as a ``task`` string; a
                 # sibling OpenVINO tokenizer (``tokenizer.xml``) turns it into
                 # ``tokenized_prompt`` / ``tokenized_prompt_mask``.

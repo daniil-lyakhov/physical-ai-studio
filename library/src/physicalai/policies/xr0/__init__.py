@@ -8,7 +8,12 @@ from __future__ import annotations
 from .config import XR0Config
 from .model import XR0FlowModel
 from .policy import XR0
-from .preprocessor import XR0Postprocessor, XR0Preprocessor, make_xr0_preprocessors
+from .preprocessor import (
+    XR0Postprocessor,
+    XR0Preprocessor,
+    compute_delta_action_stats,
+    make_xr0_preprocessors,
+)
 from .pretrained_utils import (
     extract_xr0_dataset_stats,
     load_xr0_pretrained_weights,
@@ -26,6 +31,7 @@ __all__ = [
     "XR0Postprocessor",
     "XR0Preprocessor",
     "XR0Qwen3VL",
+    "compute_delta_action_stats",
     "extract_xr0_dataset_stats",
     "load_xr0_pretrained_weights",
     "make_xr0_preprocessors",

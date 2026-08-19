@@ -112,6 +112,9 @@ class XR0Preprocessor(torch.nn.Module):
         normalize_state: bool = False,
         state_mean: Sequence[float] | None = None,
         state_std: Sequence[float] | None = None,
+        action_mode: str = "absolute",
+        action_mean: Sequence[float] | torch.Tensor | None = None,
+        action_std: Sequence[float] | torch.Tensor | None = None,
     ) -> None:
         """Initialize the XR0 preprocessor."""
         super().__init__()
@@ -123,9 +126,18 @@ class XR0Preprocessor(torch.nn.Module):
         self.processor_name = processor_name
         self.max_token_len = int(max_token_len)
         self.normalize_state = bool(normalize_state)
+        self.action_mode = str(action_mode)
         self._processor: Any = None
 
-        mean, std = self._action_stats(features)
+        # Explicit ``action_mean`` / ``action_std`` (e.g. per-timestep delta
+        # stats for ``action_mode="delta"``) take precedence over the
+        # feature-derived absolute-action stats. They may be 1D ``(D,)`` or 2D
+        # ``(T, D)`` and broadcast over the action chunk.
+        if action_mean is not None and action_std is not None:
+            mean = torch.as_tensor(action_mean, dtype=torch.float32)
+            std = torch.as_tensor(action_std, dtype=torch.float32)
+        else:
+            mean, std = self._action_stats(features)
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
 
@@ -313,16 +325,41 @@ class XR0Preprocessor(torch.nn.Module):
             state = (state - mean) / (std + ACTION_EPS)
         return state.unsqueeze(1).to(device)
 
-    def _prepare_action(self, action: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_action(
+        self,
+        action: torch.Tensor,
+        device: torch.device,
+        state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalize (source convention) + pad the action, and build its validity mask.
+
+        When ``action_mode == "delta"`` the raw current-frame ``state`` is
+        subtracted from the action target (on the overlapping leading channels)
+        before padding/normalization, so the flow head predicts
+        ``action[t] - state`` against the per-timestep delta stats.
 
         Returns:
             A ``(action, mask)`` tuple of padded action and its validity mask.
         """
         action = action.to(torch.float32)
+        if self.action_mode == "delta":
+            if state is None:
+                raise ValueError("action_mode='delta' requires the current state to form the delta target.")
+            raw_state = state
+            if raw_state.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> current (last) frame
+                raw_state = raw_state[:, -1, :]
+            raw_state = raw_state.to(torch.float32)
+            overlap = min(action.shape[-1], raw_state.shape[-1])
+            current = raw_state[..., :overlap].unsqueeze(1)  # (B, 1, overlap)
+            if overlap < action.shape[-1]:
+                head = action[..., :overlap] - current
+                action = torch.cat([head, action[..., overlap:]], dim=-1)
+            else:
+                action = action - current
         real_dim = min(action.shape[-1], self.max_action_dim)
         action = F.pad(action, (0, max(0, self.max_action_dim - action.shape[-1])))[..., : self.max_action_dim]
-        # Mirror io.normalize_action: (action - mean) / (std + eps).
+        # Mirror io.normalize_action: (action - mean) / (std + eps). In delta mode
+        # action_mean/action_std are per-timestep (T, D) and broadcast over batch.
         action = (action - self.action_mean) / (self.action_std + ACTION_EPS)
 
         mask = torch.zeros_like(action, dtype=torch.int32)
@@ -370,7 +407,7 @@ class XR0Preprocessor(torch.nn.Module):
         }
 
         if ACTION in batch and batch[ACTION] is not None:
-            action, action_mask = self._prepare_action(batch[ACTION], device)
+            action, action_mask = self._prepare_action(batch[ACTION], device, state=batch[STATE])
             out[ACTION] = action
             out["action_mask"] = action_mask
 
@@ -397,11 +434,16 @@ class XR0Postprocessor(torch.nn.Module):
         self,
         max_action_dim: int = 32,
         features: dict[str, Feature] | None = None,
+        *,
+        action_mode: str = "absolute",
+        action_mean: Sequence[float] | torch.Tensor | None = None,
+        action_std: Sequence[float] | torch.Tensor | None = None,
     ) -> None:
         """Initialize the XR0 postprocessor."""
         super().__init__()
         self.max_action_dim = max_action_dim
         self.action_dim: int | None = None
+        self.action_mode = str(action_mode)
 
         mean = torch.zeros(max_action_dim)
         std = torch.ones(max_action_dim)
@@ -420,11 +462,22 @@ class XR0Postprocessor(torch.nn.Module):
                 self.action_dim = int(feat_mean.numel())
                 break
 
+        # Explicit stats (per-timestep delta stats for ``action_mode="delta"``)
+        # override the feature-derived denormalization mean/std; the unpadded
+        # ``action_dim`` is still recovered from ``features`` for the final slice.
+        if action_mean is not None and action_std is not None:
+            mean = torch.as_tensor(action_mean, dtype=torch.float32)
+            std = torch.as_tensor(action_std, dtype=torch.float32)
+
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
 
     def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
         """Denormalize and unpad the predicted actions.
+
+        In ``action_mode="delta"`` the denormalized prediction is a delta and the
+        current-frame ``state`` is re-added (on the overlapping leading channels)
+        to recover the absolute action.
 
         Returns:
             Batch dict with the denormalized action.
@@ -436,6 +489,22 @@ class XR0Postprocessor(torch.nn.Module):
             std = self.action_std.to(action.device)
             # Mirror io.denormalize_action: action * (std + eps) + mean.
             action = action * (std + ACTION_EPS) + mean
+            if self.action_mode == "delta":
+                state = batch.get(STATE)
+                if state is None:
+                    raise ValueError(
+                        "action_mode='delta' requires the current state to invert the delta prediction."
+                    )
+                current = state.to(torch.float32).to(action.device)
+                if current.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> current (last) frame
+                    current = current[:, -1, :]
+                overlap = min(action.shape[-1], current.shape[-1])
+                current = current[..., :overlap].unsqueeze(1)  # (B, 1, overlap)
+                if overlap < action.shape[-1]:
+                    head = action[..., :overlap] + current
+                    action = torch.cat([head, action[..., overlap:]], dim=-1)
+                else:
+                    action = action + current
             if self.action_dim is not None:
                 action = action[..., : self.action_dim]
             batch[ACTION] = action
@@ -452,6 +521,9 @@ def make_xr0_preprocessors(
     image_max_pixels: int = 90000,
     processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
     normalize_state: bool = False,
+    action_mode: str = "absolute",
+    action_delta_mean: Sequence[float] | torch.Tensor | None = None,
+    action_delta_std: Sequence[float] | torch.Tensor | None = None,
 ) -> tuple[XR0Preprocessor, XR0Postprocessor]:
     """Create the XR0 preprocessor / postprocessor pair from dataset stats.
 
@@ -465,6 +537,12 @@ def make_xr0_preprocessors(
         processor_name: HuggingFace id of the Qwen3-VL processor.
         normalize_state: When True, normalize the state with the dataset's
             per-dimension mean/std. Defaults to False (raw state).
+        action_mode: ``"absolute"`` (default) or ``"delta"``. In delta mode the
+            action target/inverse use ``action_delta_mean`` / ``action_delta_std``.
+        action_delta_mean: Per-timestep delta-action mean (``(chunk_size,
+            max_action_dim)``), used only when ``action_mode="delta"``.
+        action_delta_std: Per-timestep delta-action std, same shape as
+            ``action_delta_mean``.
 
     Returns:
         Tuple of (preprocessor, postprocessor).
@@ -494,6 +572,12 @@ def make_xr0_preprocessors(
                 ),
             )
 
+    override_mean: torch.Tensor | None = None
+    override_std: torch.Tensor | None = None
+    if action_mode == "delta" and action_delta_mean is not None and action_delta_std is not None:
+        override_mean = torch.as_tensor(action_delta_mean, dtype=torch.float32)
+        override_std = torch.as_tensor(action_delta_std, dtype=torch.float32)
+
     preprocessor = XR0Preprocessor(
         camera_views=camera_views,
         max_state_dim=max_state_dim,
@@ -503,6 +587,119 @@ def make_xr0_preprocessors(
         image_max_pixels=image_max_pixels,
         processor_name=processor_name,
         normalize_state=normalize_state,
+        action_mode=action_mode,
+        action_mean=override_mean,
+        action_std=override_std,
     )
-    postprocessor = XR0Postprocessor(max_action_dim=max_action_dim, features=features)
+    postprocessor = XR0Postprocessor(
+        max_action_dim=max_action_dim,
+        features=features,
+        action_mode=action_mode,
+        action_mean=override_mean,
+        action_std=override_std,
+    )
     return preprocessor, postprocessor
+
+
+def _delta_feature_tensor(value: Any) -> torch.Tensor:
+    """Coerce an observation field (tensor or single-entry dict) to a tensor.
+
+    Returns:
+        The underlying tensor for the field.
+
+    Raises:
+        TypeError: If no tensor can be extracted from ``value``.
+    """
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, dict):
+        for sub in value.values():
+            if isinstance(sub, torch.Tensor):
+                return sub
+    msg = f"expected a tensor (or dict containing one), got {type(value)!r}"
+    raise TypeError(msg)
+
+
+def compute_delta_action_stats(
+    datamodule: Any,  # noqa: ANN401
+    *,
+    chunk_size: int,
+    action_dim: int,
+    max_action_dim: int = 32,
+    max_batches: int | None = None,
+    setup_stage: str | None = "fit",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-timestep delta-action mean/std over a training dataset.
+
+    Iterates the datamodule's train dataloader once and, for every sample, forms
+    the delta action ``action[t] - state`` (the current-frame state broadcast over
+    the chunk, matching the XR0 delta target). Per-chunk-position mean and std are
+    accumulated in float64 and returned as ``(chunk_size, max_action_dim)`` buffers,
+    padded with identity stats (mean ``0``, std ``1``) on the unused columns so the
+    downstream normalization is a no-op there.
+
+    Args:
+        datamodule: A Lightning datamodule exposing ``train_dataloader()`` (and an
+            optional ``setup`` method) yielding batched observations with ``state``
+            and ``action`` fields.
+        chunk_size: Number of action steps per chunk (the temporal dimension).
+        action_dim: True (unpadded) action dimension used to compute deltas.
+        max_action_dim: Padded action dimension of the returned buffers.
+        max_batches: Optional cap on the number of batches to consume (for a quick
+            estimate). ``None`` consumes the full train set.
+        setup_stage: Stage passed to ``datamodule.setup(...)`` before iterating.
+            Pass ``None`` to skip setup (e.g. when already set up).
+
+    Returns:
+        A ``(mean, std)`` tuple of ``(chunk_size, max_action_dim)`` float32 tensors.
+
+    Raises:
+        ValueError: If the dataset yields no samples, or an action chunk whose
+            temporal dimension does not match ``chunk_size``.
+    """
+    if setup_stage is not None and hasattr(datamodule, "setup"):
+        datamodule.setup(setup_stage)
+    loader = datamodule.train_dataloader()
+
+    sum_1 = torch.zeros(chunk_size, action_dim, dtype=torch.float64)
+    sum_2 = torch.zeros(chunk_size, action_dim, dtype=torch.float64)
+    count = 0
+
+    for index, batch in enumerate(loader):
+        if max_batches is not None and index >= max_batches:
+            break
+
+        state_field = batch.state if hasattr(batch, "state") else batch[STATE]
+        action_field = batch.action if hasattr(batch, "action") else batch[ACTION]
+        state = _delta_feature_tensor(state_field).to(torch.float64)
+        action = _delta_feature_tensor(action_field).to(torch.float64)
+
+        if state.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> current (last) frame
+            state = state[:, -1, :]
+        state = state[..., :action_dim]
+
+        if action.ndim == 2:  # (B, D) -> (B, 1, D)
+            action = action.unsqueeze(1)
+        if action.shape[1] != chunk_size:
+            msg = f"action chunk has temporal dim {action.shape[1]}, expected chunk_size={chunk_size}"
+            raise ValueError(msg)
+        action = action[..., :action_dim]
+
+        delta = action - state.unsqueeze(1)  # (B, T, action_dim)
+        sum_1 += delta.sum(dim=0)
+        sum_2 += (delta * delta).sum(dim=0)
+        count += delta.shape[0]
+
+    if count == 0:
+        msg = "no samples found while computing delta action stats"
+        raise ValueError(msg)
+
+    mean = sum_1 / count
+    var = (sum_2 / count - mean * mean).clamp_min(0.0)
+    std = var.sqrt()
+
+    mean_full = torch.zeros(chunk_size, max_action_dim, dtype=torch.float32)
+    std_full = torch.ones(chunk_size, max_action_dim, dtype=torch.float32)
+    mean_full[:, :action_dim] = mean.to(torch.float32)
+    std_full[:, :action_dim] = std.to(torch.float32)
+    return mean_full, std_full
