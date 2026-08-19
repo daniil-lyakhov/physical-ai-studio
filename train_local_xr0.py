@@ -32,9 +32,25 @@ DATASET_ROOT = Path("/home/dlyakhov/datasets/Put-the-yellow-ball-to-the-black-bo
 # Pretrained XR0 checkpoint to fine-tune from.
 CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-Pretrain"
 
+# Smoke test: overfit a few batches for a handful of steps to confirm the
+# training loop runs end-to-end and the loss decreases before committing to a
+# full run. Flip to False for real fine-tuning.
+SMOKE_TEST = True
+
 # Training hyperparameters. XR0 is far larger than ACT, so keep the batch small.
-MAX_STEPS = 40_000
-BATCH_SIZE = 16
+MAX_STEPS = 50 if SMOKE_TEST else 40_000
+BATCH_SIZE = 2 if SMOKE_TEST else 16
+
+# Smoke-test knobs: cap the delta-stats estimation and the train/val loop to a
+# few batches so the sanity run stays fast without iterating the whole dataset.
+# ``None`` means "use everything" for a full run.
+STATS_MAX_BATCHES = 8 if SMOKE_TEST else None
+LIMIT_TRAIN_BATCHES = 4 if SMOKE_TEST else None
+LIMIT_VAL_BATCHES = 2 if SMOKE_TEST else None
+LOG_EVERY_N_STEPS = 1 if SMOKE_TEST else 50
+
+# Single episode to overfit during the smoke test.
+OVERFIT_EPISODE = 3
 
 # Action-chunk geometry. XR0 predicts a fixed 30-step chunk; the local SO-101
 # arm exposes 6 joint targets. Both are hardcoded here to compute the
@@ -52,7 +68,8 @@ def main() -> None:
         # `repo_id` is only used as a name when `root` points at a local dataset.
         root=str(DATASET_ROOT),
         train_batch_size=BATCH_SIZE,
-        val_split=0.1,
+        episodes=[OVERFIT_EPISODE] if SMOKE_TEST else None,
+        val_split=0.0 if SMOKE_TEST else 0.1,
         data_format="physicalai",
     )
 
@@ -88,6 +105,7 @@ def main() -> None:
         chunk_size=CHUNK_SIZE,
         action_dim=ACTION_DIM,
         max_action_dim=policy.config.max_action_dim,
+        max_batches=STATS_MAX_BATCHES,
         setup_stage=None,
     )
     policy._action_delta_mean = delta_mean  # noqa: SLF001
@@ -100,7 +118,7 @@ def main() -> None:
         filename="xr0-{step:06d}",
         save_top_k=1,
         save_last=True,
-        monitor="val/loss",
+        monitor=None if SMOKE_TEST else "val/loss",
         mode="min",
         every_n_train_steps=20_000,
     )
@@ -111,8 +129,10 @@ def main() -> None:
         devices=1,
         precision="bf16-mixed",
         callbacks=[checkpoint_callback],
-        log_every_n_steps=50,
+        log_every_n_steps=LOG_EVERY_N_STEPS,
         check_val_every_n_epoch=1,
+        limit_train_batches=LIMIT_TRAIN_BATCHES,
+        limit_val_batches=LIMIT_VAL_BATCHES,
     )
 
     trainer.fit(model=policy, datamodule=datamodule)
