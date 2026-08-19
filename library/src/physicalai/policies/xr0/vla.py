@@ -638,9 +638,18 @@ class XR0Model(Model):
         loss_mse = (F.mse_loss(pred, target, reduction="none") * weight)[action_mask].mean()
 
         if self.freq_coefficient > 0.0:
-            loss_freq = (torch.fft.rfft(pred, dim=1) - torch.fft.rfft(target, dim=1)).abs()
+            # Frequency-domain (chunk-axis FFT) term, restricted to valid action
+            # channels. On padded channels the target is ``action - noise = -noise``
+            # (fresh Gaussian), which is unpredictable: including them added a large
+            # irreducible floor *and* diluted the real-channel gradient by averaging
+            # over all ``max_action_dim`` channels. The FFT along time is per-channel
+            # independent, so dropping padded channels after the transform is exact.
+            freq = (torch.fft.rfft(pred, dim=1) - torch.fft.rfft(target, dim=1)).abs()
             weight_dct = weight.mean(dim=[1, 2])
-            loss_freq = (loss_freq * weight_dct.unsqueeze(1).unsqueeze(2)).mean()
+            freq = freq * weight_dct.unsqueeze(1).unsqueeze(2)
+            chan_mask = action_mask.any(dim=1, keepdim=True).to(freq.dtype)  # (B, 1, D)
+            denom = (chan_mask.sum() * freq.shape[1]).clamp_min(1.0)
+            loss_freq = (freq * chan_mask).sum() / denom
         else:
             loss_freq = loss_mse * 0.0
 
