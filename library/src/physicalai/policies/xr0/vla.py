@@ -351,10 +351,19 @@ class XR0Model(Model):
             action_mask = batch.pop("action_mask", None)
             if action_mask is None:
                 action_mask = torch.ones_like(action, dtype=torch.int32)
-            state = batch.pop("state").to(self._dtype)
         else:
             action = torch.zeros((1, *self.action_shape), device=device, dtype=self._dtype)
             action_mask = torch.ones_like(action, dtype=torch.int32)
+        # Always use the real current state when the batch provides it (both
+        # training and inference/export do). The DiT conditions on this state and
+        # -- critically for ``action_mode="delta"`` -- the OpenVINO export echoes
+        # it as the ``state_passthrough`` output the postprocessor adds back to
+        # reconstruct the absolute action. Zero-filling here (the old inference
+        # path) baked a constant-zero passthrough, so the exported delta was never
+        # inverted (the t=0 prediction collapsed to ~0 instead of ~state).
+        if "state" in batch:
+            state = batch.pop("state").to(self._dtype)
+        else:
             state = torch.zeros((1, *self.state_shape), device=device, dtype=self._dtype)
         return action, action_mask, state
 
