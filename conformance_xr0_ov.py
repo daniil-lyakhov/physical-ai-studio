@@ -28,6 +28,9 @@ EPISODE = 3
 ACTION_DIM = 6
 DEVICE = "CPU"  # "GPU" + bf16 mirrors deployment; "CPU" is portable
 PRECISION_HINT = "f32"
+# Must match conformance_xr0.py so both scripts select the same shuffled frame
+# (identical reference target) for a fair comparison.
+SEED = 0
 
 
 def main() -> None:
@@ -45,6 +48,8 @@ def main() -> None:
     policy = XR0.load_from_checkpoint(CKPT, dtype="float32", vlm_attn_implementation="sdpa", map_location="cpu")
     reformat_dataset_to_match_policy(policy, dm)
 
+    # Seed the shuffled sampler so we pull the same frame as conformance_xr0.py.
+    torch.manual_seed(SEED)
     batch = next(iter(dm.train_dataloader()))
     target = batch.action[..., :ACTION_DIM].reshape(-1, ACTION_DIM).cpu().numpy()
 

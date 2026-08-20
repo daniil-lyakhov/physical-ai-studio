@@ -19,6 +19,9 @@ CKPT = "experiments/xr0_Put-the-yellow-ball-to-the-black-box/checkpoints/last.ck
 DATASET_ROOT = "/home/dlyakhov/datasets/Put-the-yellow-ball-to-the-black-box"
 EPISODE = 3
 ACTION_DIM = 6
+# Shared with conformance_xr0_ov.py so both pick the *same* shuffled frame
+# (same reference target) and the same rectified-flow noise -> fair 1-to-1.
+SEED = 0
 
 
 def main() -> None:
@@ -37,10 +40,16 @@ def main() -> None:
     dm.setup("fit")
     reformat_dataset_to_match_policy(policy, dm)
 
+    # Seed the shuffled sampler so we always pull the same frame (identical to
+    # conformance_xr0_ov.py).
+    torch.manual_seed(SEED)
     batch = next(iter(dm.train_dataloader()))
     target = batch.action[..., :ACTION_DIM].reshape(-1, ACTION_DIM).cpu().numpy()
 
     with torch.no_grad():
+        # Seed again so the flow noise (torch.randn inside _sample_noise) is
+        # reproducible run-to-run.
+        torch.manual_seed(SEED)
         pred = policy.predict_action_chunk(batch)
     pred = pred[..., :ACTION_DIM].reshape(-1, ACTION_DIM).cpu().numpy()
 
