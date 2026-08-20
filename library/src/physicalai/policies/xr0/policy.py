@@ -1015,9 +1015,10 @@ class XR0(ExportablePolicyMixin, Policy):
             extra_args["openvino"] = OpenVINOExportParameters(
                 via_onnx=True,
                 export_tokenizer=True,
-                # Delta mode adds a second graph output: the current-frame state,
-                # renamed here so the manifest port lines up with ``STATE``.
-                outputs=["action", "state"] if cfg.action_mode == "delta" else ["action"],
+                # Delta mode adds a second graph output: the current-frame state.
+                # The Runtime postprocessor reads
+                # this exact ``state_passthrough`` key to invert the delta.
+                outputs=["action", "state_passthrough"] if cfg.action_mode == "delta" else ["action"],
                 # The NumPy preprocessor emits the prompt as a ``task`` string; a
                 # sibling OpenVINO tokenizer (``tokenizer.xml``) turns it into
                 # ``tokenized_prompt`` / ``tokenized_prompt_mask``.
