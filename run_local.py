@@ -4,7 +4,12 @@
 
 from __future__ import annotations
 
+import json
 import signal
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
 
 from physicalai.inference import InferenceModel
 from physicalai.runtime import (
@@ -17,6 +22,90 @@ from physicalai.runtime import (
 
 from physicalai.robot import SO101
 from physicalai.capture import UVCCamera
+
+
+class DiagRecorder:
+    """Capture ground-truth deploy data to locate the shaking source.
+
+    Records, with NO effect on control:
+      * per-inference: the raw model action chunk (BEFORE smoothing) -> tells us
+        whether the shaking is already in the model output or added by the
+        queue/smoother.
+      * per-tick: the live state fed to the model and the action actually SENT to
+        the robot -> the commanded signal; high-frequency wiggle here == shaking.
+      * the first few full observations (per-camera images + state) -> replay them
+        offline through the SAME InferenceModel to prove the model behaves on REAL
+        obs (and to eyeball which physical camera is which / orientation).
+
+    Dump to ``out_dir`` on ``stop()``; analyze offline.
+    """
+
+    def __init__(self, out_dir: str = "xr0_diag", n_obs: int = 3) -> None:
+        self.dir = Path(out_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.n_obs = n_obs
+        self._saved = 0
+        self.ticks: list[dict] = []
+        self.chunks: list[dict] = []
+
+    def on_inference(self, event: object) -> None:
+        chunk = np.asarray(getattr(event, "chunk"), dtype=np.float32)
+        self.chunks.append(
+            {
+                "t": float(getattr(event, "timestamp", 0.0)),
+                "latency_s": float(getattr(event, "latency_s", 0.0)),
+                "offset": int(getattr(event, "offset", 0)),
+                "chunk": chunk.tolist(),
+            }
+        )
+
+    def on_tick(self, event: object) -> None:
+        state = np.asarray(getattr(event.robot_state, "state", []), dtype=np.float32)
+        sent = getattr(event, "action_sent", None)
+        sent = None if sent is None else np.asarray(sent, dtype=np.float32).tolist()
+        self.ticks.append({"step": int(event.step), "state": state.tolist(), "action_sent": sent})
+
+        if self._saved < self.n_obs:
+            imgs = {name: np.asarray(frame.data) for name, frame in event.camera_frames.items()}
+            np.savez(
+                self.dir / f"obs_{event.step:05d}.npz",
+                state=state,
+                **{f"img__{k}": v for k, v in imgs.items()},
+            )
+            for name, arr in imgs.items():
+                try:
+                    Image.fromarray(arr.astype(np.uint8)).save(self.dir / f"obs_{event.step:05d}__{name}.png")
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            self._saved += 1
+
+    def stop(self) -> None:
+        np.savez(
+            self.dir / "ticks.npz",
+            steps=np.array([t["step"] for t in self.ticks], dtype=np.int64),
+            states=np.array([t["state"] for t in self.ticks], dtype=np.float32),
+            actions_sent=np.array(
+                [t["action_sent"] if t["action_sent"] is not None else [np.nan] * 6 for t in self.ticks],
+                dtype=np.float32,
+            ),
+        )
+        (self.dir / "chunks.json").write_text(json.dumps(self.chunks))
+        # Per-joint high-frequency wiggle of the COMMANDED signal (frame-to-frame
+        # |Δ|). Big values on some joints == that joint shakes; this localizes the
+        # bug (one joint => mapping/units; all joints => replan/timing/model).
+        sent = np.array(
+            [t["action_sent"] for t in self.ticks if t["action_sent"] is not None], dtype=np.float32
+        )
+        if len(sent) > 2:
+            jitter = np.abs(np.diff(sent, axis=0)).mean(axis=0)
+            print(f"[DIAG] mean |Δaction/frame| per joint: {np.round(jitter, 3)}")
+        # How much consecutive PLANS disagree on their immediate target (model-side
+        # oscillation, independent of the smoother).
+        if len(self.chunks) > 1:
+            firsts = np.array([c["chunk"][0][:6] for c in self.chunks], dtype=np.float32)
+            print(f"[DIAG] std of chunk[0] across replans per joint: {np.round(firsts.std(axis=0), 3)}")
+        print(f"[DIAG] wrote {len(self.ticks)} ticks, {len(self.chunks)} chunks, {self._saved} obs to {self.dir}/")
+
 
 
 MODEL_PATH = "/home/dupeljan/Projects/home_robot/models/act_hunh_40k"
@@ -67,7 +156,7 @@ def main() -> None:
         action_source=policy_source,
         cameras=cameras,
         fps=30,
-        #callbacks=callbacks,
+        callbacks=[recorder := DiagRecorder()],
     )
 
     duration_s = 120
@@ -88,6 +177,7 @@ def main() -> None:
         finally:
             # Runs on normal completion and on Ctrl+C (KeyboardInterrupt) while the
             # robot is still connected, so torque is actually released on the servos.
+            recorder.stop()
             print("Disabling torque...")
             robot.set_torque(enabled=False)
 
