@@ -40,10 +40,15 @@ class DiagRecorder:
     Dump to ``out_dir`` on ``stop()``; analyze offline.
     """
 
-    def __init__(self, out_dir: str = "xr0_diag", n_obs: int = 3) -> None:
+    def __init__(self, out_dir: str = "xr0_diag", n_png: int = 3, max_obs: int = 250) -> None:
         self.dir = Path(out_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.n_obs = n_obs
+        # ``n_png``: how many observations to also dump as human-viewable PNGs.
+        # ``max_obs``: how many CONSECUTIVE full observations (state + camera
+        # images) to persist as ``obs_*.npz`` so they can be replayed OFFLINE
+        # through several models. Bounded so disk stays sane (~1.8 MB/obs).
+        self.n_png = n_png
+        self.max_obs = max_obs
         self._saved = 0
         self.ticks: list[dict] = []
         self.chunks: list[dict] = []
@@ -65,18 +70,19 @@ class DiagRecorder:
         sent = None if sent is None else np.asarray(sent, dtype=np.float32).tolist()
         self.ticks.append({"step": int(event.step), "state": state.tolist(), "action_sent": sent})
 
-        if self._saved < self.n_obs:
+        if self._saved < self.max_obs:
             imgs = {name: np.asarray(frame.data) for name, frame in event.camera_frames.items()}
             np.savez(
                 self.dir / f"obs_{event.step:05d}.npz",
                 state=state,
                 **{f"img__{k}": v for k, v in imgs.items()},
             )
-            for name, arr in imgs.items():
-                try:
-                    Image.fromarray(arr.astype(np.uint8)).save(self.dir / f"obs_{event.step:05d}__{name}.png")
-                except Exception:  # noqa: BLE001, S110
-                    pass
+            if self._saved < self.n_png:
+                for name, arr in imgs.items():
+                    try:
+                        Image.fromarray(arr.astype(np.uint8)).save(self.dir / f"obs_{event.step:05d}__{name}.png")
+                    except Exception:  # noqa: BLE001, S110
+                        pass
             self._saved += 1
 
     def stop(self) -> None:
@@ -156,7 +162,7 @@ def main() -> None:
         action_source=policy_source,
         cameras=cameras,
         fps=30,
-        callbacks=[recorder := DiagRecorder()],
+        callbacks=[recorder := DiagRecorder(out_dir=f"diag_{Path(MODEL_PATH).parent.name or Path(MODEL_PATH).name}")],
     )
 
     duration_s = 120
