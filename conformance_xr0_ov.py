@@ -14,23 +14,39 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from lerobot.datasets.feature_utils import check_delta_timestamps, get_delta_indices
 
 from physicalai.data import LeRobotDataModule
 from physicalai.inference import InferenceModel
 from physicalai.inference.constants import IMAGES, STATE, TASK
-from physicalai.policies import XR0
-from physicalai.train.utils import reformat_dataset_to_match_policy
 
-CKPT = "experiments/xr0_Put-the-yellow-ball-to-the-black-box/checkpoints/last.ckpt"
 MODEL_PATH = "xr0_export_with_ov_tok"
 DATASET_ROOT = "/home/dlyakhov/datasets/Put-the-yellow-ball-to-the-black-box"
 EPISODE = 3
 ACTION_DIM = 6
+# Predicted action-chunk length the IR emits (XR0 action_shape[-2]); used to
+# expand the dataset target into a full chunk without loading the checkpoint.
+CHUNK_SIZE = 30
 DEVICE = "CPU"  # "GPU" + bf16 mirrors deployment; "CPU" is portable
 PRECISION_HINT = "f32"
 # Must match conformance_xr0.py so both scripts select the same shuffled frame
 # (identical reference target) for a fair comparison.
 SEED = 0
+
+
+def _set_action_chunk(dm: LeRobotDataModule, chunk_size: int) -> None:
+    """Expand the dataset ``action`` feature into a ``chunk_size`` chunk.
+
+    Mirrors ``reformat_dataset_to_match_policy`` for the action key only
+    (``action_delta_indices == range(chunk_size)`` for XR0) so the target is a
+    full chunk -- without needing to load the multi-GB checkpoint just to read
+    that one property.
+    """
+    dataset = dm.train_dataset
+    fps = dataset.fps
+    delta_timestamps = {"action": [i / fps for i in range(chunk_size)]}
+    check_delta_timestamps(delta_timestamps, fps, dataset.tolerance_s)
+    dataset.delta_indices = get_delta_indices(delta_timestamps, fps)
 
 
 def main() -> None:
@@ -42,11 +58,9 @@ def main() -> None:
         data_format="physicalai",
     )
     dm.setup("fit")
-    # Load the checkpoint on CPU only to expand the action target into a full
-    # chunk (reformat reads the policy's action_delta_indices); inference is the
-    # OV IR, not this policy.
-    policy = XR0.load_from_checkpoint(CKPT, dtype="float32", vlm_attn_implementation="sdpa", map_location="cpu")
-    reformat_dataset_to_match_policy(policy, dm)
+    # Expand the action target into a full chunk directly (no checkpoint needed;
+    # inference is the OV IR, not a Torch policy).
+    _set_action_chunk(dm, CHUNK_SIZE)
 
     # Seed the shuffled sampler so we pull the same frame as conformance_xr0.py.
     torch.manual_seed(SEED)
