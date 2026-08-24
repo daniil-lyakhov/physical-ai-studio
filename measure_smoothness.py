@@ -105,8 +105,15 @@ def lowpass_chunk(chunk: np.ndarray, cutoff_frac: float, transition_frac: float)
     """Zero-phase raised-cosine low-pass along the time axis of a chunk.
 
     Filtering happens on the whole predicted chunk before execution, so it is
-    non-causal (zero phase = no lag) yet deployable per chunk. A raised-cosine
-    rolloff avoids the Gibbs ringing a brick-wall FFT cutoff would introduce.
+    non-causal (zero phase = no lag) yet deployable per chunk.
+
+    The endpoint-to-endpoint *linear trend* is removed before the FFT and added
+    back afterwards. An action chunk is not periodic (the arm has moved, so
+    ``chunk[0] != chunk[-1]``); FFT filtering the raw chunk treats that gap as a
+    wrap-around discontinuity and produces Gibbs ringing that *inflates*
+    velocity/acceleration. Detrending makes the residual start and end near zero
+    so the periodic extension is smooth; the linear trend carries constant
+    velocity and zero jerk, so re-adding it introduces no roughness.
 
     Args:
         chunk: ``(T, D)`` action chunk.
@@ -117,7 +124,12 @@ def lowpass_chunk(chunk: np.ndarray, cutoff_frac: float, transition_frac: float)
         ``(T, D)`` smoothed chunk (same shape/units).
     """
     length = chunk.shape[0]
-    spectrum = np.fft.rfft(chunk, axis=0)
+    if length < 3:  # noqa: PLR2004
+        return chunk.copy()
+    ramp = np.linspace(0.0, 1.0, length)[:, None]
+    trend = chunk[:1] + (chunk[-1:] - chunk[:1]) * ramp
+    residual = chunk - trend
+    spectrum = np.fft.rfft(residual, axis=0)
     freqs = np.fft.rfftfreq(length)  # 0 .. 0.5 cycles/frame
     lo = cutoff_frac - transition_frac / 2.0
     hi = cutoff_frac + transition_frac / 2.0
@@ -125,7 +137,8 @@ def lowpass_chunk(chunk: np.ndarray, cutoff_frac: float, transition_frac: float)
     band = (freqs >= lo) & (freqs <= hi)
     gain[band] = 0.5 * (1.0 + np.cos(np.pi * (freqs[band] - lo) / max(hi - lo, 1e-8)))
     gain[freqs > hi] = 0.0
-    return np.fft.irfft(spectrum * gain[:, None], n=length, axis=0)
+    smoothed = np.fft.irfft(spectrum * gain[:, None], n=length, axis=0)
+    return smoothed + trend
 
 
 def _fmt(vec: np.ndarray) -> str:

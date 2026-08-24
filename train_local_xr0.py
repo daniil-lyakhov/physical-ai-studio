@@ -82,6 +82,11 @@ def main() -> None:
     # same space instead of fighting the prior with absolute joint targets.
     # `normalize_state=False` keeps the raw proprioceptive state that the delta
     # postprocessor re-adds at inference/export time.
+    # `enable_freq=False` drops the FFT frequency-domain loss term; on this small
+    # fine-tune it rewards high-frequency content the flow head can't reliably
+    # predict, producing jittery action chunks on the robot. `optimizer_lr` is
+    # lowered to 2.5e-5 (from the 1e-4 default) so fine-tuning perturbs the
+    # pretrained prior more gently and keeps the learned velocity field smooth.
     policy = XR0(
         pretrained_name_or_path=CHECKPOINT,
         vlm_attn_implementation="sdpa",
@@ -89,6 +94,8 @@ def main() -> None:
         normalization_mode="MEAN_STD",
         normalize_state=False,
         action_mode="delta",
+        enable_freq=False,
+        optimizer_lr=2.5e-5,
         # Align the cosine decay horizon with the full training length (the
         # config default decays over 30k steps, which under-decays a 40k run).
         scheduler_decay_steps=MAX_STEPS,
