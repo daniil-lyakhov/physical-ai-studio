@@ -170,6 +170,9 @@ def main() -> None:  # noqa: PLR0914
     gt_metrics: dict[str, list[np.ndarray]] = {"vel": [], "acc": [], "jerk": [], "hf": []}
     # Per-joint |pred_smooth - pred|: how far the filter moves the trajectory.
     shift_acc: list[np.ndarray] = []
+    # Per-joint per-chunk MAE vs GT, for raw and low-passed predictions.
+    mae_pred_acc: list[np.ndarray] = []
+    mae_smooth_acc: list[np.ndarray] = []
 
     n_frames = 0
     for batch in dm.train_dataloader():
@@ -187,6 +190,8 @@ def main() -> None:  # noqa: PLR0914
             store["hf"].append(high_freq_ratio(chunk, HF_CUTOFF_FRAC))
 
         shift_acc.append(np.abs(pred_sm - pred).mean(axis=0))
+        mae_pred_acc.append(np.abs(pred - gt).mean(axis=0))
+        mae_smooth_acc.append(np.abs(pred_sm - gt).mean(axis=0))
 
         n_frames += 1
         if MAX_FRAMES is not None and n_frames >= MAX_FRAMES:
@@ -220,6 +225,13 @@ def main() -> None:  # noqa: PLR0914
     shift = np.mean(np.stack(shift_acc, axis=0), axis=0)
     print(f"filter shift |pred+lp - pred| per joint: {_fmt(shift)}   overall {shift.mean():7.3f}")
     print("(how many action units the low-pass moves the trajectory; small = safe)\n")
+
+    mae_pred = np.mean(np.stack(mae_pred_acc, axis=0), axis=0)
+    mae_smooth = np.mean(np.stack(mae_smooth_acc, axis=0), axis=0)
+    print(f"{'MAE vs GT':<12}{'pred':<10}{_fmt(mae_pred)}   {mae_pred.mean():7.3f}")
+    print(f"{'':<12}{'pred+lp':<10}{_fmt(mae_smooth)}   {mae_smooth.mean():7.3f}")
+    print(f"{'':<12}{'delta':<10}{_fmt(mae_smooth - mae_pred)}   {mae_smooth.mean() - mae_pred.mean():+7.3f}")
+    print("(per-chunk mean |pred - gt|; delta>0 means the filter cost precision)\n")
 
     raw_jerk = agg(pred_metrics, "jerk").mean() / (agg(gt_metrics, "jerk").mean() + 1e-8)
     lp_jerk = agg(smooth_metrics, "jerk").mean() / (agg(gt_metrics, "jerk").mean() + 1e-8)
