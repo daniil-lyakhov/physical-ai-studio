@@ -48,7 +48,7 @@ from physicalai.data.observation import IMAGES, STATE, TASK
 from physicalai.inference import InferenceModel
 from physicalai.inference.constants import TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
 from physicalai.policies import XR0
-from physicalai.policies.xr0.patchify import patchify_image_grid
+from physicalai.policies.xr0.export_openvino import patchify_image_grid
 from physicalai.policies.xr0.pretrained_utils import extract_xr0_dataset_stats
 
 if TYPE_CHECKING:

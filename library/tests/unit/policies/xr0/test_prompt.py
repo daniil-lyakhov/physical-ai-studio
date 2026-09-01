@@ -47,7 +47,7 @@ def processor() -> object:
     try:
         return transformers.AutoProcessor.from_pretrained(_PROCESSOR_NAME)
     except Exception as exc:  # noqa: BLE001 - any load failure => skip
-        pytest.skip(f"Qwen3-VL processor unavailable offline: {exc}")
+        return pytest.skip(f"Qwen3-VL processor unavailable offline: {exc}")
 
 
 def _build_reference_messages(

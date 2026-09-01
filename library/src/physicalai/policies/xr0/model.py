@@ -121,7 +121,7 @@ class XR0FlowModel(nn.Module):
             Timestep tensor of shape ``(batch_size,)``.
         """
         if self.flow_sampling == "logit_normal":
-            u = self.logistic_normal.sample((batch_size,))[:, 0].to(device)
+            u = self.logistic_normal.sample((batch_size,))[:, 0].to(device)  # pyrefly: ignore[unsupported-operation]
         elif self.flow_sampling == "beta":
             u = self.beta.sample((batch_size,)).to(device)
             u = (1 - u) * 0.999

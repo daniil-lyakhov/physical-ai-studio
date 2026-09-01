@@ -35,7 +35,8 @@ from physicalai.data import Feature, FeatureType
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Observation
 
 from .io import ACTION_EPS, build_pixel_grid, resize_image
-from .prompt import _ASSISTANT_PRIMER, _MULTI_VIEW_HEADER, _TASK_TEMPLATE, view_title as _view_title
+from .prompt import _ASSISTANT_PRIMER, _MULTI_VIEW_HEADER, _TASK_TEMPLATE
+from .prompt import view_title as _view_title
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -44,6 +45,12 @@ logger = logging.getLogger(__name__)
 
 _TEMPORAL_STATE_NDIM = 3
 _TEMPORAL_IMAGE_NDIM = 5
+_BATCHED_ACTION_NDIM = 2
+
+# Pinned commit SHA for the default Qwen3-VL processor download. A concrete
+# revision keeps the fetched tokenizer/processor reproducible and avoids the
+# supply-chain risk of resolving to a moving HEAD (see library security rule 9).
+_PROCESSOR_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 
 
 def _to_pil(image: torch.Tensor) -> Image.Image:
@@ -219,7 +226,7 @@ class XR0Preprocessor(torch.nn.Module):
             except ImportError as exc:
                 msg = "XR0 preprocessing requires transformers. Install with: uv pip install transformers"
                 raise ImportError(msg) from exc
-            self._processor = AutoProcessor.from_pretrained(self.processor_name)
+            self._processor = AutoProcessor.from_pretrained(self.processor_name, revision=_PROCESSOR_REVISION)
             self._processor.tokenizer.padding_side = "right"
         return self._processor
 
@@ -340,11 +347,15 @@ class XR0Preprocessor(torch.nn.Module):
 
         Returns:
             A ``(action, mask)`` tuple of padded action and its validity mask.
+
+        Raises:
+            ValueError: If ``action_mode == 'delta'`` but no ``state`` is provided.
         """
-        action = action.to(torch.float32)
+        action = action.to(torch.float32).clone()  # Clone tensor to avoid mutating the input action
         if self.action_mode == "delta":
             if state is None:
-                raise ValueError("action_mode='delta' requires the current state to form the delta target.")
+                msg = "action_mode='delta' requires the current state to form the delta target."
+                raise ValueError(msg)
             raw_state = state
             if raw_state.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> current (last) frame
                 raw_state = raw_state[:, -1, :]
@@ -355,7 +366,7 @@ class XR0Preprocessor(torch.nn.Module):
                 head = action[..., :overlap] - current
                 action = torch.cat([head, action[..., overlap:]], dim=-1)
             else:
-                action = action - current
+                action -= current
         real_dim = min(action.shape[-1], self.max_action_dim)
         action = F.pad(action, (0, max(0, self.max_action_dim - action.shape[-1])))[..., : self.max_action_dim]
         # Mirror io.normalize_action: (action - mean) / (std + eps). In delta mode
@@ -481,6 +492,9 @@ class XR0Postprocessor(torch.nn.Module):
 
         Returns:
             Batch dict with the denormalized action.
+
+        Raises:
+            ValueError: If ``action_mode == 'delta'`` but no ``state`` is provided.
         """
         batch = dict(batch)
         if ACTION in batch and batch[ACTION] is not None:
@@ -492,8 +506,9 @@ class XR0Postprocessor(torch.nn.Module):
             if self.action_mode == "delta":
                 state = batch.get(STATE)
                 if state is None:
+                    msg = "action_mode='delta' requires the current state to invert the delta prediction."
                     raise ValueError(
-                        "action_mode='delta' requires the current state to invert the delta prediction."
+                        msg,
                     )
                 current = state.to(torch.float32).to(action.device)
                 if current.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> current (last) frame
@@ -504,7 +519,7 @@ class XR0Postprocessor(torch.nn.Module):
                     head = action[..., :overlap] + current
                     action = torch.cat([head, action[..., overlap:]], dim=-1)
                 else:
-                    action = action + current
+                    action += current
             if self.action_dim is not None:
                 action = action[..., : self.action_dim]
             batch[ACTION] = action
@@ -601,7 +616,7 @@ def make_xr0_preprocessors(
     return preprocessor, postprocessor
 
 
-def _delta_feature_tensor(value: Any) -> torch.Tensor:
+def _delta_feature_tensor(value: Any) -> torch.Tensor:  # noqa: ANN401
     """Coerce an observation field (tensor or single-entry dict) to a tensor.
 
     Returns:
@@ -678,7 +693,7 @@ def compute_delta_action_stats(
             state = state[:, -1, :]
         state = state[..., :action_dim]
 
-        if action.ndim == 2:  # (B, D) -> (B, 1, D)
+        if action.ndim == _BATCHED_ACTION_NDIM:  # (B, D) -> (B, 1, D)
             action = action.unsqueeze(1)
         if action.shape[1] != chunk_size:
             msg = f"action chunk has temporal dim {action.shape[1]}, expected chunk_size={chunk_size}"

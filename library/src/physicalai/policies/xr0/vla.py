@@ -156,7 +156,7 @@ class XR0Model(Model):
     # Framework Model interface                                          #
     # ------------------------------------------------------------------ #
 
-    def forward(self, batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, float]] | torch.Tensor:
+    def forward(self, batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]] | torch.Tensor:
         """Training: flow-matching loss. Eval: predicted action chunk.
 
         Returns:
@@ -166,7 +166,7 @@ class XR0Model(Model):
             return self.compute_loss(batch)
         return self.predict_action_chunk(batch)
 
-    def compute_loss(self, batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, float]]:
+    def compute_loss(self, batch: dict[str, Any]) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
         """Compute the rectified-flow training loss.
 
         Returns:
@@ -408,12 +408,12 @@ class XR0Model(Model):
     # Core orchestration                                                 #
     # ------------------------------------------------------------------ #
 
-    def _run(  # noqa: PLR0914
+    def _run(  # noqa: PLR0914, PLR0915
         self,
         batch: dict[str, Any],
         *,
         return_loss: bool,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
+    ) -> torch.Tensor | dict[str, torch.Tensor] | tuple[torch.Tensor, torch.Tensor]:
         """VLM encode -> MRoPE continuation -> rectified-flow train / inference.
 
         Returns:
@@ -655,7 +655,7 @@ class XR0Model(Model):
             # independent, so dropping padded channels after the transform is exact.
             freq = (torch.fft.rfft(pred, dim=1) - torch.fft.rfft(target, dim=1)).abs()
             weight_dct = weight.mean(dim=[1, 2])
-            freq = freq * weight_dct.unsqueeze(1).unsqueeze(2)
+            freq *= weight_dct.unsqueeze(1).unsqueeze(2)
             chan_mask = action_mask.any(dim=1, keepdim=True).to(freq.dtype)  # (B, 1, D)
             denom = (chan_mask.sum() * freq.shape[1]).clamp_min(1.0)
             loss_freq = (freq * chan_mask).sum() / denom

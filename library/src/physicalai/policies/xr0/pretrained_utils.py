@@ -153,6 +153,8 @@ def _torch_load_safe(path: Path) -> object:
             on arbitrary pickle contents; convert it to ``.safetensors`` instead.
     """
     try:
+        # reason: weights_only=True restricts unpickling to tensors + safe primitives; no arbitrary code runs.
+        # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
         return torch.load(str(path), map_location="cpu", weights_only=True)
     except (pickle.UnpicklingError, RuntimeError, AttributeError, ImportError, EOFError) as exc:
         msg = (
@@ -267,7 +269,7 @@ def resolve_pretrained_path(pretrained_name_or_path: str | Path, **kwargs: objec
     # Only allow safe (non-pickle) formats to be downloaded. ``.bin`` / ``.pt``
     # checkpoints are supported solely for pre-existing local paths, where the
     # user already controls the file. See ``_load_raw_state_dict``.
-    local = snapshot_download(
+    local = snapshot_download(  # pyrefly: ignore[no-matching-overload]
         repo_id=str(pretrained_name_or_path),
         allow_patterns=[
             "*.safetensors",

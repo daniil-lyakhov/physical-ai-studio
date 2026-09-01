@@ -119,7 +119,7 @@ def get_policy(policy_name: str, *, source: str = "physicalai", **kwargs) -> Pol
     raise ValueError(msg)
 
 
-def get_physicalai_policy_class(policy_name: str) -> type[Policy]:
+def get_physicalai_policy_class(policy_name: str) -> type[Policy]:  # noqa: PLR0911
     """Get policy class by name.
 
     Args:
@@ -145,5 +145,8 @@ def get_physicalai_policy_class(policy_name: str) -> type[Policy]:
         return Rldx1
     if policy_name == "smolvla":
         return SmolVLA
-    msg = f"Unknown physicalai policy: {policy_name}. Supported policies: act, dummy, groot, pi0, pi05, rldx1, smolvla, xr0"
+    if policy_name == "xr0":
+        return XR0
+    supported = "act, dummy, groot, pi0, pi05, rldx1, smolvla, xr0"
+    msg = f"Unknown physicalai policy: {policy_name}. Supported policies: {supported}"
     raise ValueError(msg)

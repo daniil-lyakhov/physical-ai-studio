@@ -24,14 +24,14 @@ from physicalai.export.backends import TorchExportParameters
 from physicalai.inference.data import InferenceFeatureType
 from physicalai.policies import get_physicalai_policy_class, get_policy
 from physicalai.policies.xr0 import XR0, XR0Config
-from physicalai.policies.xr0.export_openvino import ov_friendly_rmsnorm_forward
-from physicalai.policies.xr0.vlm import (
+from physicalai.policies.xr0.export_openvino import (
     export_add_deepstack_embeds,
     export_build_additive_causal_mask,
     export_fast_pos_embed_interpolate,
     export_rot_pos_emb,
     export_scatter_visual_embeds,
     export_vision_attn_forward,
+    ov_friendly_rmsnorm_forward,
 )
 
 
@@ -156,8 +156,8 @@ class TestXR0Factory:
 class TestXR0Export:
     """Torch export hooks (no model download)."""
 
-    def test_supported_backends_torch_only(self) -> None:
-        assert XR0.get_supported_export_backends() == [ExportBackend.TORCH]
+    def test_supported_backends_torch_and_openvino(self) -> None:
+        assert XR0.get_supported_export_backends() == [ExportBackend.TORCH, ExportBackend.OPENVINO]
 
     def test_schemas_none_before_init(self) -> None:
         policy = XR0()

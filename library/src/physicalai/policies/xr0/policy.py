@@ -439,7 +439,7 @@ class XR0(ExportablePolicyMixin, Policy):
             return self.model(processed)
         return self.predict_action_chunk(batch)
 
-    def compute_val_loss(self, batch: Observation) -> tuple[torch.Tensor, dict[str, float]]:
+    def compute_val_loss(self, batch: Observation) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
         """Compute the validation loss.
 
         Returns:
@@ -568,7 +568,13 @@ class XR0(ExportablePolicyMixin, Policy):
 
         Returns:
             The padded traced-input dict, without ``image_grid_thw``.
+
+        Raises:
+            ValueError: If the preprocessor is not initialized.
         """
+        if self._preprocessor is None or self.sample_input is None:
+            msg = "Preprocessor is not initialized"
+            raise ValueError(msg)
         processed = self._build_padded_export_sample()
         processed["pixel_values"] = torch.from_numpy(self._preprocessor.image_grid(self.sample_input))
         return {

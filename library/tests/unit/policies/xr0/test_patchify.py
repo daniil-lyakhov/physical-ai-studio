@@ -5,7 +5,7 @@
 
 Fast, self-contained tests with no model downloads. The full NumPy image path
 (:func:`~physicalai.policies.xr0.io.build_pixel_grid` + the baked
-:func:`~physicalai.policies.xr0.patchify.patchify_image_grid`) is checked for
+:func:`~physicalai.policies.xr0.export_openvino.patchify_image_grid`) is checked for
 parity against the *real* HuggingFace image processor (instantiated offline). That
 parity is what lets the native pipeline build the pre-patchify grid directly in
 NumPy instead of un-patchifying the processor's output.
@@ -18,7 +18,7 @@ import torch
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
 from physicalai.policies.xr0.io import build_pixel_grid
-from physicalai.policies.xr0.patchify import patchify_image_grid
+from physicalai.policies.xr0.export_openvino import patchify_image_grid
 
 # Qwen3-VL geometry (Qwen3-VL reuses the Qwen2-VL image processor with patch_size=16).
 TEMPORAL_PATCH_SIZE = 2

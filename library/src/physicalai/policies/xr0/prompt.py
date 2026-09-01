@@ -17,7 +17,10 @@ The parity with the real processor is asserted in
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 # --- prompt text (shared with the training preprocessor) -------------------
 _MULTI_VIEW_HEADER = "The following observations are captured from multiple views.\n"
@@ -95,9 +98,7 @@ def render_chat_prompt(views: Sequence[str], pad_counts: Sequence[int], instruct
 
     parts: list[str] = [_MULTI_VIEW_HEADER]
     for view, count in zip(views, pad_counts, strict=True):
-        parts.append(f"# {view_title(view)} View\n")
-        parts.append(_VISION_START + _IMAGE_PAD * count + _VISION_END)
-        parts.append("\n")
+        parts.extend((f"# {view_title(view)} View\n", _VISION_START + _IMAGE_PAD * count + _VISION_END, "\n"))
     parts.append(_TASK_TEMPLATE.format(instruction=instruction))
     user = "".join(parts)
     return f"{_IM_START}user\n{user}{_IM_END}\n{_IM_START}assistant\n{_ASSISTANT_PRIMER}{_IM_END}\n"
