@@ -3,8 +3,10 @@
 
 """Export backends enumeration and parameters."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import Literal
 
 #: Supported ExecuTorch delegate backends.
@@ -44,11 +46,30 @@ class ExportBackend(StrEnum):
 
 @dataclass
 class ExportParameters:
-    """Parameters for exporting a model."""
+    """Parameters for exporting a model.
+
+    Attributes:
+        exporter_kwargs: Extra keyword arguments forwarded to the backend exporter.
+        preprocessors_specs: Component specs describing the inference preprocessors
+            to record in the manifest.
+        postprocessors_specs: Component specs describing the inference postprocessors
+            to record in the manifest.
+        pre_export_hooks: Callables invoked in order right before the model is
+            traced/converted. Use them to mutate the model in place for export
+            (e.g. bake constants into the graph, swap ops for export-friendly
+            variants). Signature: ``() -> object`` (any return value is ignored).
+        post_export_hooks: Callables invoked in order after the model has been
+            written to disk. Each hook receives the path to the exported file
+            and may modify the file in place (e.g. to patch the graph for a
+            specific runtime). Signature: ``(export_path: str | Path) -> object``
+            (any return value is ignored).
+    """
 
     exporter_kwargs: dict = field(default_factory=dict)
     preprocessors_specs: list = field(default_factory=list)
     postprocessors_specs: list = field(default_factory=list)
+    pre_export_hooks: list[Callable[[], object]] = field(default_factory=list)
+    post_export_hooks: list[Callable[[str | Path], object]] = field(default_factory=list)
 
 
 @dataclass
@@ -60,12 +81,20 @@ class ONNXExportParameters(ExportParameters):
 
 @dataclass
 class OpenVINOExportParameters(ExportParameters):
-    """Parameters specific to OpenVINO export."""
+    """Parameters specific to OpenVINO export.
+
+    Attributes:
+        input_name_map: Optional mapping ``{traced_input_name: exported_name}`` used
+            to rename the converted graph's input tensors before saving. Useful to
+            align the graph ports with the keys emitted by preprocessor components
+            (e.g. an ``ov_tokenizer`` producing ``tokenized_prompt``).
+    """
 
     export_tokenizer: bool = False
     outputs: list[str] = field(default_factory=lambda: ["action"])
     compress_to_fp16: bool = False
     via_onnx: bool = False
+    input_name_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
