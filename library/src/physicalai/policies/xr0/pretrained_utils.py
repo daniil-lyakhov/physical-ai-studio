@@ -74,7 +74,7 @@ def remap_xr0_state_dict(state_dict: Mapping[str, torch.Tensor]) -> dict[str, to
     Strips the training-runner / DeepSpeed wrapper prefixes (``module.`` /
     ``model.``), drops recomputed buffers, and nests the DiT action-expert
     submodules under ``flow.`` to match
-    :class:`~physicalai.policies.xr0.vla.XR0Model`.
+    :class:`~physicalai.policies.xr0.model.XR0Model`.
 
     Args:
         state_dict: Raw source state dict (already unwrapped from any

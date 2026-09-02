@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
-from physicalai.policies.xr0.model import XR0FlowModel
+from physicalai.policies.xr0.dit import XR0FlowModel
 from physicalai.policies.xr0.preprocessor import make_xr0_preprocessors
 from physicalai.policies.xr0.pretrained_utils import (
     extract_xr0_dataset_stats,
@@ -125,6 +126,94 @@ class TestFileLoading:
         assert resolve_pretrained_path(tmp_path) == tmp_path
 
 
+class TestLoadPretrainedWeights:
+    """``load_xr0_pretrained_weights`` across every file / directory layout branch."""
+
+    @staticmethod
+    def _contiguous_source() -> dict[str, torch.Tensor]:
+        return {k: v.contiguous() for k, v in _source_layout_state_dict().items()}
+
+    def _assert_remapped(self, remapped: dict[str, torch.Tensor]) -> None:
+        assert {k for k in remapped if k.startswith("flow.")} == _expected_flow_keys()
+        assert "vlm.lm_head.weight" in remapped
+
+    def test_single_safetensors_file(self, tmp_path) -> None:  # noqa: ANN001
+        """A single ``*.safetensors`` *file* path (is_file + .safetensors branch)."""
+        file = tmp_path / "xr0.safetensors"
+        save_file(self._contiguous_source(), str(file))
+        self._assert_remapped(load_xr0_pretrained_weights(file))
+
+    def test_single_torch_file(self, tmp_path) -> None:  # noqa: ANN001
+        """A single ``.pt`` file of raw tensors (is_file + torch-load branch)."""
+        file = tmp_path / "xr0_pretrained.pt"
+        # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
+        torch.save(self._contiguous_source(), str(file))  # test fixture: tensor-only state dict
+        self._assert_remapped(load_xr0_pretrained_weights(file))
+
+    def test_deepspeed_container_file(self, tmp_path) -> None:  # noqa: ANN001
+        """A ``{"module": ...}`` DeepSpeed-wrapped file is unwrapped."""
+        file = tmp_path / "xr0.pt"
+        # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
+        torch.save({"module": self._contiguous_source()}, str(file))  # test fixture: tensor-only state dict
+        self._assert_remapped(load_xr0_pretrained_weights(file))
+
+    def test_lightning_container_file(self, tmp_path) -> None:  # noqa: ANN001
+        """A ``{"state_dict": ...}`` Lightning-wrapped file is unwrapped."""
+        file = tmp_path / "xr0.ckpt"
+        # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
+        torch.save({"state_dict": self._contiguous_source()}, str(file))  # test fixture: tensor-only state dict
+        self._assert_remapped(load_xr0_pretrained_weights(file))
+
+    def test_sharded_safetensors_dir(self, tmp_path) -> None:  # noqa: ANN001
+        """A sharded ``model.safetensors.index.json`` directory checkpoint."""
+        source = self._contiguous_source()
+        keys = list(source)
+        half = len(keys) // 2
+        shards = {"a.safetensors": keys[:half], "b.safetensors": keys[half:]}
+        for shard, shard_keys in shards.items():
+            save_file({k: source[k] for k in shard_keys}, str(tmp_path / shard))
+        weight_map = {k: shard for shard, shard_keys in shards.items() for k in shard_keys}
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+        self._assert_remapped(load_xr0_pretrained_weights(tmp_path))
+
+    def test_deepspeed_dir(self, tmp_path) -> None:  # noqa: ANN001
+        """A DeepSpeed ``last.ckpt/checkpoint/mp_rank_00_model_states.pt`` directory."""
+        ckpt = tmp_path / "last.ckpt" / "checkpoint"
+        ckpt.mkdir(parents=True)
+        # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
+        torch.save({"module": self._contiguous_source()}, str(ckpt / "mp_rank_00_model_states.pt"))  # test fixture
+        self._assert_remapped(load_xr0_pretrained_weights(tmp_path))
+
+    def test_sharded_bin_dir(self, tmp_path) -> None:  # noqa: ANN001
+        """A sharded ``pytorch_model.bin.index.json`` directory checkpoint."""
+        source = self._contiguous_source()
+        keys = list(source)
+        half = len(keys) // 2
+        shards = {"pytorch_model-00001.bin": keys[:half], "pytorch_model-00002.bin": keys[half:]}
+        for shard, shard_keys in shards.items():
+            # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
+            torch.save({k: source[k] for k in shard_keys}, str(tmp_path / shard))  # test fixture: tensor-only shard
+        weight_map = {k: shard for shard, shard_keys in shards.items() for k in shard_keys}
+        (tmp_path / "pytorch_model.bin.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+        self._assert_remapped(load_xr0_pretrained_weights(tmp_path))
+
+    def test_single_bin_candidate_dir(self, tmp_path) -> None:  # noqa: ANN001
+        """A single ``pytorch_model.bin`` directory checkpoint."""
+        # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
+        torch.save(self._contiguous_source(), str(tmp_path / "pytorch_model.bin"))  # test fixture: tensor-only
+        self._assert_remapped(load_xr0_pretrained_weights(tmp_path))
+
+    def test_missing_weights_raises(self, tmp_path) -> None:  # noqa: ANN001
+        """An empty directory (no recognized weights) raises ``FileNotFoundError``."""
+        with pytest.raises(FileNotFoundError, match="No recognized XR0 weights"):
+            load_xr0_pretrained_weights(tmp_path)
+
+
+
 def _write_preprocessor_config(tmp_path, mean_row, std_row, *, time_steps=10) -> None:  # noqa: ANN001
     """Write a LIBERO-style ``preprocessor_config.json`` with time-invariant stats."""
     config = {
@@ -159,6 +248,20 @@ class TestExtractStats:
         (tmp_path / "preprocessor_config.json").write_text(json.dumps({"foo": 1}), encoding="utf-8")
         assert extract_xr0_dataset_stats(tmp_path) is None
         assert extract_xr0_dataset_stats(tmp_path / "missing") is None
+
+    def test_flat_stats_pass_through(self, tmp_path) -> None:  # noqa: ANN001
+        """Already time-reduced 1D stats are used as-is (no reshape)."""
+        mean = [0.1, -0.2, 0.3, 0.0, 0.0, 0.0, -0.5] + [0.0] * 25
+        std = [0.3, 0.4, 0.44, 0.04, 0.06, 0.08, 0.99] + [1e-6] * 25
+        config = {"action_config": {"libero_all": {"mean": mean, "std": std}}}
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps(config), encoding="utf-8")
+
+        stats = extract_xr0_dataset_stats(tmp_path)
+        assert stats is not None
+        action = stats["action"]
+        assert action["shape"] == (7,)
+        assert action["mean"] == mean[:7]
+        assert action["std"] == std[:7]
 
     def test_stats_drive_postprocessor_action_dim(self, tmp_path) -> None:  # noqa: ANN001
         """Extracted stats make the postprocessor emit the true action size."""

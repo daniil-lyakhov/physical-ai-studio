@@ -9,21 +9,23 @@
   ``<|vision_start|><|image_pad|><|vision_end|>`` block per configured camera
   view) and tokenized with the stock ``Qwen3VLProcessor`` (via
   ``AutoProcessor``) Images are resized with
-  :func:`~physicalai.policies.xr0.io.resize_image` and passed
+  :func:`resize_image` and passed
   to the processor with ``do_resize=False``.
 * **State** -- padded into the 32-dim bimanual layout and shaped ``(B, 1, D)``,
   matching the source ``state.view(1, 1, -1)``.
 * **Action** -- normalized with the source ``normalize_action`` mean/std
-  convention (:func:`~physicalai.policies.xr0.io.normalize_action`), padded to
+  convention (:func:`normalize_action`), padded to
   ``max_action_dim``, with a validity ``action_mask``.
 
 The postprocessor inverts the action normalization
-(:func:`~physicalai.policies.xr0.io.denormalize_action`).
+(:func:`denormalize_action`).
 """
 
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -34,15 +36,15 @@ from PIL import Image
 from physicalai.data import Feature, FeatureType
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Observation
 
-from .io import ACTION_EPS, build_pixel_grid, resize_image
-from .prompt import _ASSISTANT_PRIMER, _MULTI_VIEW_HEADER, _TASK_TEMPLATE
-from .prompt import view_title as _view_title
-
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
+_MAX_ASPECT_RATIO = 200
+ACTION_DIM = 32
+STATE_DIM = 32
+ACTION_EPS = 1e-6
 _TEMPORAL_STATE_NDIM = 3
 _TEMPORAL_IMAGE_NDIM = 5
 _BATCHED_ACTION_NDIM = 2
@@ -51,6 +53,40 @@ _BATCHED_ACTION_NDIM = 2
 # revision keeps the fetched tokenizer/processor reproducible and avoids the
 # supply-chain risk of resolving to a moving HEAD (see library security rule 9).
 _PROCESSOR_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+
+
+# --------------------------------------------------------------------------- #
+# Qwen3-VL chat-prompt text                                                   #
+# --------------------------------------------------------------------------- #
+# Prompt text pieces used to assemble the structured chat message fed to the
+# real ``Qwen3VLProcessor`` (see ``_build_message``).
+_MULTI_VIEW_HEADER = "The following observations are captured from multiple views.\n"
+_TASK_TEMPLATE = "Generate robot actions for the task:\n{instruction} /no_cot"
+_ASSISTANT_PRIMER = "<cot></cot>"
+
+# View titles the model was trained with (Xiaomi reference server prompt in
+# deploy/server.py), e.g. "wrist_left" -> "Left-Wrist" so the prompt reads
+# "# Left-Wrist View". A plain capitalize would wrongly yield "Wrist Left".
+_VIEW_TITLES = {
+    "base": "Base",
+    "wrist_left": "Left-Wrist",
+    "wrist_right": "Right-Wrist",
+}
+
+
+def view_title(view: str) -> str:
+    """Human-readable view title matching the reference prompt.
+
+    Known views use the reference eval's exact titles (e.g. ``"wrist_left"`` ->
+    ``"Left-Wrist"``); unknown views fall back to a capitalized join.
+
+    Returns:
+        The human-readable view title.
+    """
+    key = view.replace("-", "_")
+    if key in _VIEW_TITLES:
+        return _VIEW_TITLES[key]
+    return " ".join(word.capitalize() for word in key.split("_"))
 
 
 def _to_pil(image: torch.Tensor) -> Image.Image:
@@ -69,6 +105,77 @@ def _to_pil(image: torch.Tensor) -> Image.Image:
     if np_img.shape[-1] == 1:
         np_img = np.repeat(np_img, 3, axis=-1)
     return Image.fromarray(np_img)
+
+
+def build_pixel_grid(
+    images: Sequence[Image.Image | np.ndarray],
+    image_mean: Sequence[float],
+    image_std: Sequence[float],
+    rescale_factor: float,
+) -> np.ndarray:
+    """Rescale + normalize already-resized images into a Qwen3-VL pixel grid.
+
+    Reproduces the Qwen3-VL image processor's rescale + normalize + channel-first
+    steps in pure NumPy (the images must already be resized to patch-aligned
+    dimensions) and stacks the views into the ``(num_images, C, H, W)`` normalized
+    grid the exported graph patchifies. This is the NumPy replacement for calling
+    the HuggingFace image processor and inverting its patchify.
+
+    Args:
+        images: Already-resized RGB images (PIL images or ``(H, W, C)`` arrays),
+            one per camera view, all the same size.
+        image_mean: Per-channel mean (the image processor's ``image_mean``).
+        image_std: Per-channel std (the image processor's ``image_std``).
+        rescale_factor: Pixel rescale factor (``1/255`` for Qwen3-VL).
+
+    Returns:
+        The normalized image grid of shape ``(num_images, C, H, W)`` as float32.
+    """
+    mean = np.asarray(image_mean, dtype=np.float32)
+    std = np.asarray(image_std, dtype=np.float32)
+    grid = [
+        np.transpose((np.asarray(image, dtype=np.float32) * np.float32(rescale_factor) - mean) / std, (2, 0, 1))
+        for image in images
+    ]
+    return np.stack(grid).astype(np.float32)
+
+
+def resize_image(
+    image: Image.Image,
+    factor: int = 32,
+    min_pixels: int = 32 * 32,
+    max_pixels: int = 90000,
+) -> Image.Image:
+    """Resize a PIL image to patch-aligned dimensions within an area budget.
+
+    Both sides are rounded to multiples of ``factor`` and the area is kept within
+    ``[min_pixels, max_pixels]``, preserving aspect ratio for the VLM vision encoder.
+
+    Returns:
+        The resized PIL image.
+
+    Raises:
+        ValueError: If the image aspect ratio exceeds ``_MAX_ASPECT_RATIO``.
+    """
+    width, height = image.size
+    ratio = max(height, width) / min(height, width)
+    if ratio > _MAX_ASPECT_RATIO:
+        msg = f"absolute aspect ratio must be smaller than 200, got {ratio}"
+        raise ValueError(msg)
+
+    new_height = max(factor, round(height / factor) * factor)
+    new_width = max(factor, round(width / factor) * factor)
+
+    if new_height * new_width > max_pixels:
+        scale = math.sqrt(height * width / max_pixels)
+        new_height = max(factor, math.floor(height / scale / factor) * factor)
+        new_width = max(factor, math.floor(width / scale / factor) * factor)
+    elif new_height * new_width < min_pixels:
+        scale = math.sqrt(min_pixels / (height * width))
+        new_height = max(factor, math.ceil(height * scale / factor) * factor)
+        new_width = max(factor, math.ceil(width * scale / factor) * factor)
+
+    return image.resize((new_width, new_height))
 
 
 class XR0Preprocessor(torch.nn.Module):
@@ -248,7 +355,7 @@ class XR0Preprocessor(torch.nn.Module):
         content: list[dict[str, Any]] = [{"type": "text", "text": _MULTI_VIEW_HEADER}]
         for view, image in zip(self.camera_views, images, strict=False):
             content.extend((
-                {"type": "text", "text": f"# {_view_title(view)} View\n"},
+                {"type": "text", "text": f"# {view_title(view)} View\n"},
                 {"type": "image", "image": image},
                 {"type": "text", "text": "\n"},
             ))
@@ -325,11 +432,9 @@ class XR0Preprocessor(torch.nn.Module):
         state = state.to(torch.float32)
         state = F.pad(state, (0, max(0, self.max_state_dim - state.shape[-1])))[:, : self.max_state_dim]
         if self.normalize_state:
-            # (state - mean) / (std + eps); padded dims use identity stats so
-            # they stay zero. Mirrors the action normalization convention.
             mean = self.state_mean.to(state.device)
             std = self.state_std.to(state.device)
-            state = (state - mean) / (std + ACTION_EPS)
+            state = normalize_action(state, mean, std)
         return state.unsqueeze(1).to(device)
 
     def _prepare_action(
@@ -369,9 +474,7 @@ class XR0Preprocessor(torch.nn.Module):
                 action -= current
         real_dim = min(action.shape[-1], self.max_action_dim)
         action = F.pad(action, (0, max(0, self.max_action_dim - action.shape[-1])))[..., : self.max_action_dim]
-        # Mirror io.normalize_action: (action - mean) / (std + eps). In delta mode
-        # action_mean/action_std are per-timestep (T, D) and broadcast over batch.
-        action = (action - self.action_mean) / (self.action_std + ACTION_EPS)
+        action = normalize_action(action, self.action_mean, self.action_std)
 
         mask = torch.zeros_like(action, dtype=torch.int32)
         mask[..., :real_dim] = 1
@@ -429,7 +532,7 @@ class XR0Postprocessor(torch.nn.Module):
     """Invert the XR0 action normalization.
 
     Denormalizes predicted actions with the source
-    :func:`~physicalai.policies.xr0.io.denormalize_action` convention and slices
+    :func:`denormalize_action` convention and slices
     back to the original (unpadded) action dimension when known.
 
     Args:
@@ -501,8 +604,7 @@ class XR0Postprocessor(torch.nn.Module):
             action = batch[ACTION].to(torch.float32)
             mean = self.action_mean.to(action.device)
             std = self.action_std.to(action.device)
-            # Mirror io.denormalize_action: action * (std + eps) + mean.
-            action = action * (std + ACTION_EPS) + mean
+            action = denormalize_action(action, mean, std)
             if self.action_mode == "delta":
                 state = batch.get(STATE)
                 if state is None:
@@ -616,105 +718,19 @@ def make_xr0_preprocessors(
     return preprocessor, postprocessor
 
 
-def _delta_feature_tensor(value: Any) -> torch.Tensor:  # noqa: ANN401
-    """Coerce an observation field (tensor or single-entry dict) to a tensor.
+def normalize_action(action: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """Standardize ``action`` to zero-mean/unit-scale using ``(action - mean) / (std + eps)``.
 
     Returns:
-        The underlying tensor for the field.
-
-    Raises:
-        TypeError: If no tensor can be extracted from ``value``.
+        The normalized action array.
     """
-    if isinstance(value, torch.Tensor):
-        return value
-    if isinstance(value, dict):
-        for sub in value.values():
-            if isinstance(sub, torch.Tensor):
-                return sub
-    msg = f"expected a tensor (or dict containing one), got {type(value)!r}"
-    raise TypeError(msg)
+    return (action - mean) / (std + ACTION_EPS)
 
 
-def compute_delta_action_stats(
-    datamodule: Any,  # noqa: ANN401
-    *,
-    chunk_size: int,
-    action_dim: int,
-    max_action_dim: int = 32,
-    max_batches: int | None = None,
-    setup_stage: str | None = "fit",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-timestep delta-action mean/std over a training dataset.
-
-    Iterates the datamodule's train dataloader once and, for every sample, forms
-    the delta action ``action[t] - state`` (the current-frame state broadcast over
-    the chunk, matching the XR0 delta target). Per-chunk-position mean and std are
-    accumulated in float64 and returned as ``(chunk_size, max_action_dim)`` buffers,
-    padded with identity stats (mean ``0``, std ``1``) on the unused columns so the
-    downstream normalization is a no-op there.
-
-    Args:
-        datamodule: A Lightning datamodule exposing ``train_dataloader()`` (and an
-            optional ``setup`` method) yielding batched observations with ``state``
-            and ``action`` fields.
-        chunk_size: Number of action steps per chunk (the temporal dimension).
-        action_dim: True (unpadded) action dimension used to compute deltas.
-        max_action_dim: Padded action dimension of the returned buffers.
-        max_batches: Optional cap on the number of batches to consume (for a quick
-            estimate). ``None`` consumes the full train set.
-        setup_stage: Stage passed to ``datamodule.setup(...)`` before iterating.
-            Pass ``None`` to skip setup (e.g. when already set up).
+def denormalize_action(action: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """Invert :func:`normalize_action`, mapping a normalized action back to raw units.
 
     Returns:
-        A ``(mean, std)`` tuple of ``(chunk_size, max_action_dim)`` float32 tensors.
-
-    Raises:
-        ValueError: If the dataset yields no samples, or an action chunk whose
-            temporal dimension does not match ``chunk_size``.
+        The denormalized action array.
     """
-    if setup_stage is not None and hasattr(datamodule, "setup"):
-        datamodule.setup(setup_stage)
-    loader = datamodule.train_dataloader()
-
-    sum_1 = torch.zeros(chunk_size, action_dim, dtype=torch.float64)
-    sum_2 = torch.zeros(chunk_size, action_dim, dtype=torch.float64)
-    count = 0
-
-    for index, batch in enumerate(loader):
-        if max_batches is not None and index >= max_batches:
-            break
-
-        state_field = batch.state if hasattr(batch, "state") else batch[STATE]
-        action_field = batch.action if hasattr(batch, "action") else batch[ACTION]
-        state = _delta_feature_tensor(state_field).to(torch.float64)
-        action = _delta_feature_tensor(action_field).to(torch.float64)
-
-        if state.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> current (last) frame
-            state = state[:, -1, :]
-        state = state[..., :action_dim]
-
-        if action.ndim == _BATCHED_ACTION_NDIM:  # (B, D) -> (B, 1, D)
-            action = action.unsqueeze(1)
-        if action.shape[1] != chunk_size:
-            msg = f"action chunk has temporal dim {action.shape[1]}, expected chunk_size={chunk_size}"
-            raise ValueError(msg)
-        action = action[..., :action_dim]
-
-        delta = action - state.unsqueeze(1)  # (B, T, action_dim)
-        sum_1 += delta.sum(dim=0)
-        sum_2 += (delta * delta).sum(dim=0)
-        count += delta.shape[0]
-
-    if count == 0:
-        msg = "no samples found while computing delta action stats"
-        raise ValueError(msg)
-
-    mean = sum_1 / count
-    var = (sum_2 / count - mean * mean).clamp_min(0.0)
-    std = var.sqrt()
-
-    mean_full = torch.zeros(chunk_size, max_action_dim, dtype=torch.float32)
-    std_full = torch.ones(chunk_size, max_action_dim, dtype=torch.float32)
-    mean_full[:, :action_dim] = mean.to(torch.float32)
-    std_full[:, :action_dim] = std.to(torch.float32)
-    return mean_full, std_full
+    return action * (std + ACTION_EPS) + mean

@@ -23,10 +23,10 @@ from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
 
 from .config import XR0Config
-from .export_openvino import install_ov_friendly_rmsnorm
+from .export_openvino import install_export_rmsnorm
+from .model import XR0Model
 from .preprocessor import make_xr0_preprocessors
 from .pretrained_utils import extract_xr0_dataset_stats, load_xr0_pretrained_weights, resolve_pretrained_path
-from .vla import XR0Model
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -506,7 +506,7 @@ class XR0(ExportablePolicyMixin, Policy):
             processed["attention_mask"],
             cast("torch.LongTensor", processed["image_grid_thw"]),
         )
-        install_ov_friendly_rmsnorm(self.model)
+        install_export_rmsnorm(self.model)
 
     def _build_padded_export_sample(self) -> dict[str, torch.Tensor]:
         """Preprocess the policy's sample input and right-pad it to the graph length.

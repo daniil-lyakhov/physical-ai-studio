@@ -264,7 +264,7 @@ project-excludes = [
     "src/physicalai/policies/rldx1/components/backbone/modeling_qwen3_vl.py",
     # xr0's Qwen3-VL backbone wrapper is dynamically typed (transformers modules
     # resolve to `Module | Tensor`); same rationale as pi_gemma / qwen3_vl above.
-    "src/physicalai/policies/xr0/vlm.py",
+    "src/physicalai/policies/xr0/qwen3_vlm.py",
 ]
 
 

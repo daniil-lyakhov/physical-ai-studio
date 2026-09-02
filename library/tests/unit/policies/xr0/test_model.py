@@ -1,198 +1,175 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the XR0 rectified-flow action model (``model``).
+"""Unit tests for the assembled XR0 VLA model (``model``).
 
 Fast, self-contained tests with no external dependencies (no HuggingFace model
-downloads). A small ``XR0FlowModel`` exercises the rectified-flow math, the
-``dit_forward`` orchestration, and the Euler ``_flow_generate`` loop for
-structural invariants and a pinned reference output. Exact numerical parity
-against the source implementation is proven separately by the golden fixtures
-(``G20``, ``G21``, ``G30``, ``G31``).
+downloads). A tiny synthetic Qwen3-VL shim is injected so the full
+VLM -> MRoPE-continuation -> DiT -> rectified-flow pipeline runs end to end on
+CPU in fp32. The tests exercise the framework ``Model`` contract (training loss,
+inference chunk, delta-index properties) and pin the inference output against
+reference data. The VLM numerics and the flow/DiT math are proven separately by
+the ``vlm`` tests and the golden fixtures.
 """
 
 from __future__ import annotations
 
-import pytest
 import torch
+from transformers.models.qwen3_vl.configuration_qwen3_vl import (
+    Qwen3VLConfig,
+    Qwen3VLTextConfig,
+    Qwen3VLVisionConfig,
+)
 
-from physicalai.policies.xr0.model import XR0FlowModel
+from physicalai.policies.xr0.model import XR0Model
+from physicalai.policies.xr0.vlm import XR0Qwen3VL
 
-# Small structural config shared across tests.
-HIDDEN = 128
-HEAD_DIM = 128  # DiT default; hidden must be divisible by it.
-KV_HEADS = 1
-LAYERS = 2
+IMAGE_TOKEN_ID = 151
+VIDEO_TOKEN_ID = 152
+VISION_START_TOKEN_ID = 150
+IMAGE_GRID = (2, 4, 4)
+SPATIAL_MERGE = 2
+N_IMAGE_TOKENS = (IMAGE_GRID[0] * IMAGE_GRID[1] * IMAGE_GRID[2]) // SPATIAL_MERGE**2
+
+# Tiny model dims. The DiT head_dim / kv_heads / layer count must match the VLM
+# so the DiT can consume the VLM KV-cache.
 STATE_LEN = 1
-ACTION_LEN = 4
 STATE_DIM = 8
+ACTION_LEN = 4
 ACTION_DIM = 8
-BATCH = 2
-CACHE = 3
+DIT_HIDDEN = 64
+DIT_HEAD_DIM = 16
+DIT_KV_HEADS = 2
+DIT_LAYERS = 2
 NUM_STEPS = 3
 
-# Tolerance for pinned reference outputs.
-TOL = {"atol": 1e-4, "rtol": 1e-4}
+# Reference first action token of the denoised chunk for the seeded tiny model.
+REFERENCE_ACTION = torch.tensor([0.4187, 2.1285, -1.0810, 0.1513, 0.3321, -0.3464, 1.1061, 0.6040])
 
 
-def _build_model() -> XR0FlowModel:
-    """Build a small fp32 flow model matching the shared config."""
-    return XR0FlowModel(
+def _config() -> Qwen3VLConfig:
+    """Tiny Qwen3-VL config whose head_dim / kv_heads match the DiT."""
+    vision = Qwen3VLVisionConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=2,
+        depth=2,
+        out_hidden_size=64,
+        patch_size=16,
+        temporal_patch_size=2,
+        spatial_merge_size=SPATIAL_MERGE,
+        in_channels=3,
+        deepstack_visual_indexes=[0],
+    )
+    text = Qwen3VLTextConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=DIT_LAYERS,
+        num_attention_heads=4,
+        num_key_value_heads=DIT_KV_HEADS,
+        head_dim=DIT_HEAD_DIM,
+        vocab_size=200,
+        rope_scaling={"type": "default", "mrope_section": [2, 1, 1], "mrope_interleaved": False},
+    )
+    return Qwen3VLConfig(
+        text_config=text.to_dict(),
+        vision_config=vision.to_dict(),
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+    )
+
+
+def _build_model() -> XR0Model:
+    """Build the assembled model on a tiny injected VLM (no download)."""
+    torch.manual_seed(0)
+    vlm = XR0Qwen3VL(_config())
+    return XR0Model(
+        vlm=vlm,
         state_shape=(STATE_LEN, STATE_DIM),
         action_shape=(ACTION_LEN, ACTION_DIM),
-        dit_num_layers=LAYERS,
-        dit_hidden_size=HIDDEN,
-        dit_kv_heads=KV_HEADS,
+        dit_num_layers=DIT_LAYERS,
+        dit_hidden_size=DIT_HIDDEN,
+        dit_head_dim=DIT_HEAD_DIM,
+        dit_kv_heads=DIT_KV_HEADS,
         num_steps=NUM_STEPS,
+        training_repeat=1,
         dtype=torch.float32,
     )
 
 
-def _dit_inputs() -> dict:
-    """Build small inputs for ``dit_forward`` / ``_flow_generate``."""
-    q_len = 1 + STATE_LEN + ACTION_LEN  # sink + state + action
-    ang = torch.randn(BATCH, q_len, HEAD_DIM)
-    q_causal = torch.tril(torch.ones(q_len, q_len, dtype=torch.bool))
-    cache_ones = torch.ones(q_len, CACHE, dtype=torch.bool)
-    mask = torch.cat([cache_ones, q_causal], dim=-1)[None, None].expand(BATCH, 1, q_len, CACHE + q_len)
+def _batch() -> dict:
+    """Build a deterministic multimodal batch with action / state targets."""
+    grid = torch.tensor([list(IMAGE_GRID)])
+    num_patches = int(grid.prod(-1).item())
+    patch_dim = 3 * 2 * 16 * 16
+    torch.manual_seed(0)
+    pixel_values = torch.randn(num_patches, patch_dim)
+    input_ids = torch.tensor([[5, 6, VISION_START_TOKEN_ID, *([IMAGE_TOKEN_ID] * N_IMAGE_TOKENS), 7, 8, 9]])
+    attention_mask = torch.ones_like(input_ids)
     return {
-        "noisy_action": torch.randn(BATCH, ACTION_LEN, ACTION_DIM),
-        "t": torch.ones(BATCH, 1, 1) * 0.3,
-        "action_mask": torch.ones(BATCH, ACTION_LEN, ACTION_DIM),
-        "state_embed": torch.randn(BATCH, STATE_LEN, HIDDEN),
-        "cos": torch.cos(ang),
-        "sin": torch.sin(ang),
-        "past_key_values": [
-            (torch.randn(BATCH, KV_HEADS, CACHE, HEAD_DIM), torch.randn(BATCH, KV_HEADS, CACHE, HEAD_DIM))
-            for _ in range(LAYERS)
-        ],
-        "attn_mask": mask.contiguous(),
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values": pixel_values,
+        "image_grid_thw": grid,
+        "action": torch.randn(1, ACTION_LEN, ACTION_DIM),
+        "action_mask": torch.ones(1, ACTION_LEN, ACTION_DIM, dtype=torch.int32),
+        "state": torch.randn(1, STATE_LEN, STATE_DIM),
     }
 
 
-def _dit_kwargs(i: dict) -> dict:
-    """Assemble the ``dit_forward`` keyword args from an input bundle."""
-    return {
-        "action_mask": i["action_mask"],
-        "state_embed": i["state_embed"],
-        "position_embeds": (i["cos"], i["sin"]),
-        "past_key_values": i["past_key_values"],
-        "attn_mask": i["attn_mask"],
-        "prefix_length": 0,
-    }
+class TestDeltaIndices:
+    """Framework Model delta-index properties."""
 
-
-# ============================================================================ #
-# Rectified flow math                                                          #
-# ============================================================================ #
-
-
-class TestFlowMath:
-    """Tests for the pure rectified-flow helpers."""
-
-    def test_interpolate_endpoints(self) -> None:
-        """t=0 returns x0 and t=1 returns x1."""
+    def test_indices(self) -> None:
         model = _build_model()
-        x0 = torch.randn(BATCH, ACTION_LEN, ACTION_DIM)
-        x1 = torch.randn(BATCH, ACTION_LEN, ACTION_DIM)
-        torch.testing.assert_close(model._flow_interpolate(x0, x1, torch.zeros(BATCH, 1, 1)), x0)
-        torch.testing.assert_close(model._flow_interpolate(x0, x1, torch.ones(BATCH, 1, 1)), x1)
+        assert model.reward_delta_indices is None
+        assert model.observation_delta_indices is None
+        assert model.action_delta_indices == list(range(ACTION_LEN))
 
-    @pytest.mark.parametrize(
-        "reference",
-        [torch.tensor([0.39629608, -0.72900736, -0.29863209, -0.36008668, 0.27356121])],
-    )
-    def test_interpolate_formula(self, reference: torch.Tensor) -> None:
-        """A seeded interpolation pins a slice of z_t = (1 - t)*x0 + t*x1."""
+
+class TestCompanionLoss:
+    """Training path returns a differentiable flow-matching loss."""
+
+    def test_compute_loss_shapes(self) -> None:
+        model = _build_model().train()
         torch.manual_seed(0)
-        model = _build_model()
-        x0 = torch.randn(BATCH, ACTION_LEN, ACTION_DIM)
-        x1 = torch.randn(BATCH, ACTION_LEN, ACTION_DIM)
-        t = torch.rand(BATCH, 1, 1)
-        out = model._flow_interpolate(x0, x1, t)[0, 0, :5]
-        assert torch.allclose(out, reference, **TOL), out.tolist()
+        loss, loss_dict = model.compute_loss(_batch())
+        assert loss.ndim == 0
+        assert loss.requires_grad
+        assert set(loss_dict) == {"loss", "loss_mse", "loss_freq"}
+        assert all(isinstance(v, float) for v in loss_dict.values())
 
-    @pytest.mark.parametrize(
-        "reference",
-        [torch.tensor([0.48739055, -0.00960857, -0.06220679, -1.28131175, 2.19818282])],
-    )
-    def test_velocity_target(self, reference: torch.Tensor) -> None:
-        """A seeded velocity target pins a slice of v = x1 - x0."""
+    def test_loss_backward_populates_grads(self) -> None:
+        model = _build_model().train()
         torch.manual_seed(0)
-        model = _build_model()
-        x0 = torch.randn(BATCH, ACTION_LEN, ACTION_DIM)
-        x1 = torch.randn(BATCH, ACTION_LEN, ACTION_DIM)
-        out = model._flow_velocity_target(x0, x1)[0, 0, :5]
-        assert torch.allclose(out, reference, **TOL), out.tolist()
-
-    def test_sample_timestep_beta_range(self) -> None:
-        """Beta sampling yields shape (batch,) values in (0, 0.999]."""
-        t = _build_model()._sample_timestep(16, dtype=torch.float32)
-        assert t.shape == (16,)
-        assert torch.all(t > 0) and torch.all(t <= 0.999)
-
-    def test_sample_timestep_uniform_fallback(self) -> None:
-        """A non-beta/logit sampler falls back to Uniform(0, 1)."""
-        model = _build_model()
-        model.flow_sampling = "uniform"
-        t = model._sample_timestep(16, dtype=torch.float32)
-        assert torch.all(t >= 0) and torch.all(t < 1)
+        loss, _ = model.compute_loss(_batch())
+        loss.backward()
+        grads = [p.grad for p in model.flow.dit.parameters() if p.requires_grad]
+        assert any(g is not None and torch.any(g != 0) for g in grads)
 
 
-# ============================================================================ #
-# dit_forward                                                                  #
-# ============================================================================ #
+class TestInference:
+    """Eval path denoises an action chunk of the right shape and value."""
 
-
-class TestDitForward:
-    """Tests for a single DiT velocity prediction."""
-
-    def test_output_shape(self) -> None:
-        """dit_forward returns (B, action_len, action_dim)."""
-        model = _build_model()
-        i = _dit_inputs()
-        out = model.dit_forward(i["noisy_action"], i["t"], **_dit_kwargs(i))
-        assert out.shape == (BATCH, ACTION_LEN, ACTION_DIM)
-
-    def test_prefix_length_zeroes_leading_actions(self) -> None:
-        """A positive prefix_length forces the leading action tokens to zero."""
-        model = _build_model()
-        i = _dit_inputs()
-        kwargs = _dit_kwargs(i)
-        kwargs["prefix_length"] = 2
-        out = model.dit_forward(i["noisy_action"], i["t"], **kwargs)
-        torch.testing.assert_close(out[:, :2], torch.zeros(BATCH, 2, ACTION_DIM))
-
-    @pytest.mark.parametrize(
-        "reference",
-        [torch.tensor([0.15467618, 0.23847848, 0.09961469, -0.11562672, 0.05315172])],
-    )
-    def test_reference(self, reference: torch.Tensor) -> None:
-        """A seeded dit_forward pins a slice of its velocity output."""
+    def test_predict_action_chunk_shape(self) -> None:
+        model = _build_model().eval()
         torch.manual_seed(0)
-        model = _build_model()
-        i = _dit_inputs()
-        out = model.dit_forward(i["noisy_action"], i["t"], **_dit_kwargs(i))[0, 0, :5]
-        assert torch.allclose(out, reference, **TOL), out.tolist()
+        with torch.no_grad():
+            out = model.predict_action_chunk(_batch())
+        assert out.shape == (1, ACTION_LEN, ACTION_DIM)
 
-
-# ============================================================================ #
-# _flow_generate                                                               #
-# ============================================================================ #
-
-
-class TestFlowGenerate:
-    """Tests for the Euler integration inference loop."""
-
-    @pytest.mark.parametrize(
-        "reference",
-        [torch.tensor([-1.96027327, -0.91721338, 0.38879472, -0.24504544, 0.8044914])],
-    )
-    def test_reference(self, reference: torch.Tensor) -> None:
-        """A seeded _flow_generate pins a slice of its Euler-integrated output."""
+    def test_forward_eval_dispatches_to_predict(self) -> None:
+        model = _build_model().eval()
         torch.manual_seed(0)
-        model = _build_model()
-        i = _dit_inputs()
-        x0 = torch.randn(BATCH, ACTION_LEN, ACTION_DIM)
-        out = model._flow_generate(x0, _dit_kwargs(i))[0, 0, :5]
-        assert torch.allclose(out, reference, **TOL), out.tolist()
+        with torch.no_grad():
+            out = model(_batch())
+        assert isinstance(out, torch.Tensor)
+        assert out.shape == (1, ACTION_LEN, ACTION_DIM)
+
+    def test_predict_reference(self) -> None:
+        model = _build_model().eval()
+        torch.manual_seed(0)
+        with torch.no_grad():
+            out = model.predict_action_chunk(_batch())[0, 0]
+        assert torch.allclose(out, REFERENCE_ACTION, atol=1e-4, rtol=1e-4), out.tolist()

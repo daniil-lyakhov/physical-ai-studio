@@ -3,39 +3,7 @@
 
 """OpenVINO export workarounds for the XR0 self-contained IR.
 
-Two OpenVINO-specific fixes the XR0 export needs:
-
-**RMSNorm (pre-export, :func:`install_ov_friendly_rmsnorm`).** Every RMSNorm in
-the model reduces over a negative axis (``mean(-1)``). The OpenVINO PyTorch
-frontend mis-materializes that into a garbage ``ReduceMean`` axis, so the IR
-fails to load ("Axis <huge> out of the tensor rank range"). The fix reduces over
-the concrete positive ``dim() - 1`` instead; the math is otherwise identical.
-The installer rebinds ``forward`` on every RMSNorm *instance* in the module tree
-(pass the top-level ``XR0Model`` to cover both the VLM and DiT head). Swapping a
-subclass is not enough: the VLM's ``Qwen3VLTextRMSNorm`` modules are built inside
-``transformers`` via ``from_pretrained``, so there is no call site to swap.
-
-**GatherND (post-export, :func:`rewrite_openvino_gpu_friendly`).** The Qwen3-VL
-attention-mask builder lowers to a ``GatherND`` on a boolean (``u8``) tensor,
-which the Intel GPU plugin has no kernel for (CPU is fine). The rewrite runs the
-gather on ``i32`` and casts back to ``boolean`` (numerically identical, mask is
-0/1). It re-saves via a temp file because ``read_model`` mmaps the ``.bin`` and
-writing over it directly would corrupt the source (SIGBUS).
-
-**Patchify (in-graph, :func:`patchify_image_grid`).** The Qwen3-VL image
-processor turns a normalized image grid into the flat ``pixel_values`` patch
-tensor via a static temporal duplication + reshape/transpose. Because the grid
-geometry is fixed at export time, that op is a constant reshape/transpose and is
-baked *into* the exported graph, so the graph's ``pixel_values`` input is the
-pre-patchify normalized image grid ``(num_images, C, H, W)`` and the Runtime
-preprocessor does not have to reproduce the HuggingFace patchify.
-
-**Export-op reimplementations (in-graph, ``export_*`` functions).** The stock
-Qwen3-VL ops use ``.tolist()`` on lifted tensor inputs, ``masked_scatter`` and
-boolean ``GatherND``-style indexing that ``torch.export`` / OpenVINO cannot
-convert. Each ``export_*`` function is a numerically-identical reimplementation
-that keeps shapes concrete and uses convertible ops;
-``XR0Qwen3VL._ensure_export_patch`` installs them onto the backbone.
+Two OpenVINO-specific fixes the XR0 export needs
 """
 
 from __future__ import annotations
@@ -60,7 +28,7 @@ class _RMSNormLike(Protocol):
     variance_epsilon: float
 
 
-def ov_friendly_rmsnorm_forward(self: _RMSNormLike, hidden_states: torch.Tensor) -> torch.Tensor:
+def export_rmsnorm_forward(self: _RMSNormLike, hidden_states: torch.Tensor) -> torch.Tensor:
     """RMSNorm forward that reduces over a positive, static axis.
 
     Drop-in replacement for the stock ``Qwen2RMSNorm`` / ``Qwen3VLTextRMSNorm``
@@ -99,12 +67,12 @@ def _is_rmsnorm(module: torch.nn.Module) -> bool:
     )
 
 
-def install_ov_friendly_rmsnorm(module: torch.nn.Module) -> int:
+def install_export_rmsnorm(module: torch.nn.Module) -> int:
     """Swap every RMSNorm instance in ``module`` to the OpenVINO-friendly forward.
 
     Walks the whole submodule tree and, for each RMSNorm instance, rebinds its
     ``forward`` to :func:`ov_friendly_rmsnorm_forward`. Pass the top-level
-    :class:`~physicalai.policies.xr0.vla.XR0Model` to cover both the Qwen3-VL text
+    :class:`~physicalai.policies.xr0.model.XR0Model` to cover both the Qwen3-VL text
     backbone and the DiT action head in a single call. Idempotent: modules already
     patched are skipped, so it is safe to call more than once.
 
@@ -118,7 +86,7 @@ def install_ov_friendly_rmsnorm(module: torch.nn.Module) -> int:
     for submodule in module.modules():
         if not _is_rmsnorm(submodule) or getattr(submodule, _PATCHED_FLAG, False):
             continue
-        submodule.forward = types.MethodType(ov_friendly_rmsnorm_forward, submodule)
+        submodule.forward = types.MethodType(export_rmsnorm_forward, submodule)
         submodule.__dict__[_PATCHED_FLAG] = True
         patched += 1
     return patched
@@ -401,7 +369,7 @@ def export_scatter_visual_embeds(
 ) -> torch.Tensor:
     """Merge visual embeds into token embeddings by integer index.
 
-    OpenVINO-friendly replacement for the stock image/text merge, which uses
+    Export-friendly replacement for the stock image/text merge, which uses
     ``masked_scatter`` (-> an unconvertible ``Where`` whose operand shapes
     disagree). The integer-index ``index_copy`` (-> ``ScatterND``) is numerically
     identical for a single-batch sequence.
@@ -425,7 +393,7 @@ def export_add_deepstack_embeds(
 ) -> torch.Tensor:
     """Add deepstack visual features at the image-token positions by index.
 
-    OpenVINO-friendly replacement for the stock ``_deepstack_process``, which adds
+    Export-friendly replacement for the stock ``_deepstack_process``, which adds
     ``visual_embeds`` into ``hidden_states`` via boolean-mask assignment (-> an
     unconvertible ``Where``). The ``index_select`` + ``index_copy`` variant
     (-> ``Gather`` / ``ScatterND``) is numerically identical for a single-batch
@@ -448,7 +416,7 @@ def export_add_deepstack_embeds(
 def export_build_additive_causal_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Build a 4-D additive causal mask from a 2-D padding mask.
 
-    OpenVINO-friendly replacement for the text model's default SDPA mask builder.
+    Export-friendly replacement for the text model's default SDPA mask builder.
     The stock builder combines the causal and padding masks with a vmapped
     advanced index (``padding_mask[batch_idx, kv_idx]``), which lowers to a
     boolean ``GatherND`` the Intel GPU plugin has no kernel for. Passing an
