@@ -762,7 +762,6 @@ class TestDefaultExportInputSample:
         assert wrapper._get_default_export_input_sample() is None
 
 
-
 class TestPostExportHooks:
     """Tests for post_export_hooks in export() and compress_weights_openvino_int8_sym hook."""
 
