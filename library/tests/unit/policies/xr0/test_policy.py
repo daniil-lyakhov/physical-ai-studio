@@ -21,7 +21,7 @@ from physicalai.data import Feature, FeatureType, Observation
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK
 from physicalai.export import ExportBackend
 from physicalai.export.backends import TorchExportParameters
-from physicalai.inference.data import InferenceFeatureType
+from physicalai.inference.data import InferenceFeatureDtype, InferenceFeatureType
 from physicalai.policies import get_physicalai_policy_class, get_policy
 from physicalai.policies.xr0 import XR0, XR0Config
 
@@ -216,4 +216,75 @@ class TestXR0Export:
         names = {feature.name for feature in policy.inputs_schema or []}
         # Two cameras -> per-view names (no single-camera IMAGES collapse).
         assert names == {STATE, f"{IMAGES}.base", f"{IMAGES}.wrist_left", TASK}
+
+
+class TestXR0DeltaMode:
+    """Delta vs absolute ``action_mode`` wiring matches across the policy surface.
+
+    Parametrized over both modes so the download-free surface is checked to line up for each.
+    The OpenVINO ``extra_export_args`` / ``_bake_ingraph_export`` sides of the
+    delta contract need the real model/preprocessor and are covered by the
+    export tests; the pass-through toggle itself lives in ``test_export_openvino``.
+    """
+
+    @pytest.mark.parametrize("action_mode", ["absolute", "delta"])
+    def test_config_action_mode(self, action_mode: str) -> None:
+        # The mode round-trips into the resolved config for both values.
+        assert XR0(action_mode=action_mode).config.action_mode == action_mode
+
+    @pytest.mark.parametrize(
+        ("action_mode", "expected_names"),
+        [("absolute", [ACTION]), ("delta", [ACTION, STATE])],
+    )
+    def test_outputs_schema_matches_mode(self, action_mode: str, expected_names: list[str]) -> None:
+        policy = XR0(chunk_size=30, action_mode=action_mode)
+        # Sentinel model bypasses the lazy-init guard; delta reads ``state_shape``.
+        policy.model = types.SimpleNamespace(state_shape=(1, 8))  # type: ignore[assignment]
+        policy._input_features, policy._output_features = XR0._stats_to_features(_minimal_export_stats())
+
+        schema = policy.outputs_schema
+        assert schema is not None
+        assert [feature.name for feature in schema] == expected_names
+        # The action output is identical across modes.
+        assert schema[0].ftype is InferenceFeatureType.ACTION
+        assert schema[0].shape == (30, 6)
+        assert schema[0].dtype is InferenceFeatureDtype.FLOAT32
+        # Delta mode adds the current-frame state pass-through as a second output.
+        if action_mode == "delta":
+            state_out = schema[1]
+            assert state_out.ftype is InferenceFeatureType.STATE
+            assert state_out.name == STATE
+            assert state_out.shape == (1, 8)
+            assert state_out.dtype is InferenceFeatureDtype.FLOAT32
+
+    @pytest.mark.parametrize(
+        ("mean", "std", "expect_stats"),
+        [
+            (None, None, False),
+            ([[0.0] * 6] * 30, [[1.0] * 6] * 30, True),
+        ],
+    )
+    def test_delta_stats_wiring(
+        self,
+        mean: list[list[float]] | None,
+        std: list[list[float]] | None,
+        expect_stats: bool,
+    ) -> None:
+        policy = XR0(action_mode="delta", action_delta_mean=mean, action_delta_std=std)
+        if expect_stats:
+            # Stored as float32 tensors for the preprocessor and mirrored into
+            # hparams as plain lists so they round-trip through checkpoints.
+            assert isinstance(policy._action_delta_mean, torch.Tensor)
+            assert isinstance(policy._action_delta_std, torch.Tensor)
+            assert policy._action_delta_mean.dtype is torch.float32
+            assert policy._action_delta_std.dtype is torch.float32
+            assert policy.hparams["action_delta_mean"] == mean
+            assert policy.hparams["action_delta_std"] == std
+        else:
+            assert policy._action_delta_mean is None
+            assert policy._action_delta_std is None
+            # ``save_hyperparameters`` still captures the init args, but they are
+            # left as ``None`` (not overwritten with the mirrored lists).
+            assert policy.hparams["action_delta_mean"] is None
+            assert policy.hparams["action_delta_std"] is None
 

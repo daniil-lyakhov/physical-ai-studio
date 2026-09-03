@@ -23,7 +23,7 @@ from physicalai.policies.xr0.export_openvino import (
 import numpy as np
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
-from physicalai.policies.xr0.io import build_pixel_grid
+from physicalai.policies.xr0.preprocessor import build_pixel_grid
 from physicalai.policies.xr0.export_openvino import patchify_image_grid
 
 # Qwen3-VL geometry (Qwen3-VL reuses the Qwen2-VL image processor with patch_size=16).
@@ -261,16 +261,21 @@ class TestExportPatchParity:
             # Randomize the weight so the weight-scaling path is exercised.
             norm.weight.copy_(torch.randn(hidden))
         x = torch.randn(*shape, dtype=dtype)
+        x_before = x.clone()
 
         with torch.no_grad():
-            # Clone per call: the export forward reduces over ``dim() - 1`` in
-            # place on its float32 copy, which for a float32 input would alias x.
-            stock = norm(x.clone())
-            exported = export_rmsnorm_forward(norm, x.clone())
+            # Feed the exact same tensor to both: the export forward must not
+            # mutate its input (it reduces over ``dim() - 1`` on an internal
+            # float32 copy), so it stays a faithful drop-in even for a float32
+            # input where ``.to(float32)`` would otherwise alias ``x``.
+            stock = norm(x)
+            exported = export_rmsnorm_forward(norm, x)
 
         assert exported.shape == stock.shape
         assert exported.dtype == stock.dtype
         assert torch.equal(exported, stock)
+        # The input must be left untouched (guards the in-place aliasing bug).
+        assert torch.equal(x, x_before)
 
 
 class TestBakeIngraphExport:

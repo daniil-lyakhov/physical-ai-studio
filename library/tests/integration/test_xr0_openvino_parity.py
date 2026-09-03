@@ -1,29 +1,20 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Integration tests: native PyTorch XR0 vs OpenVINO export numerical and closed-loop parity.
+"""Integration tests: native PyTorch XR0 vs OpenVINO export parity.
 
-Loads the published ``XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`` checkpoint via
-``physicalai.policies.XR0(pretrained_name_or_path=...)``, exports it to a
-self-contained OpenVINO IR, and validates that the export reproduces the native
-model's behaviour:
+Loads the published ``XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`` checkpoint,
+exports it to a self-contained OpenVINO IR, and validates:
 
-  1. **Numerical**: ``model.predict_action_chunk`` max-abs-diff and cosine
-     similarity on the representative sample observation. XR0's rectified-flow
-     sampler draws Gaussian starting noise, so the exported IR's internal
-     ``RandomUniform`` noise is exposed as an extra output and *replayed*
-     through the eager model for an apples-to-apples comparison (mirrors
-     ``xr0_orig_vs_export.py``).
-  2. **Closed-loop**: LIBERO success-rate delta between the native policy and
-     the exported ``InferenceModel`` on a single short task.
-  3. **Tokenizer**: the exported OpenVINO tokenizer (``tokenizer.xml``) fed the
-     NumPy preprocessor's rendered ``task`` prompt reproduces the full Qwen3-VL
-     processor's ``input_ids`` (the graph's prompt ports are renamed to
-     ``tokenized_prompt`` / ``tokenized_prompt_mask`` to consume it directly).
+  1. **Numerical**: ``predict_action_chunk`` max-abs-diff and cosine similarity
+     on the sample observation. The exported IR's internal noise is exposed as
+     an extra output and replayed through the eager model for an apples-to-apples
+     comparison.
+  2. **Tokenizer**: the exported ``tokenizer.xml`` reproduces the full Qwen3-VL
+     processor's ``input_ids`` for the NumPy preprocessor's rendered prompt.
 
-Both tests are marked ``@pytest.mark.slow`` because they require downloading a
-multi-GB checkpoint, exporting a large VLM, and running many environment steps.
-Run them explicitly with::
+Marked ``@pytest.mark.slow`` (multi-GB checkpoint download + large VLM export).
+Run with::
 
     pytest -m slow tests/integration/test_xr0_openvino_parity.py
 """
@@ -31,9 +22,8 @@ Run them explicitly with::
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import openvino as ov
@@ -42,17 +32,11 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from openvino.preprocess import PrePostProcessor
 
-os.environ.setdefault("MUJOCO_GL", "egl")
-
 from physicalai.data.observation import IMAGES, STATE, TASK
-from physicalai.inference import InferenceModel
 from physicalai.inference.constants import TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
 from physicalai.policies import XR0
 from physicalai.policies.xr0.export_openvino import patchify_image_grid
 from physicalai.policies.xr0.pretrained_utils import extract_xr0_dataset_stats
-
-if TYPE_CHECKING:
-    from physicalai.benchmark.gyms import LiberoBenchmark
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -85,13 +69,6 @@ _MIN_COSINE_SIMILARITY = 0.99
 # path exactly as the exported graph patchifies it in-graph (matches
 # ``tests/unit/policies/xr0/test_patchify.py``).
 _TEMPORAL_PATCH_SIZE = 2
-# Closed-loop LIBERO configuration. XR0 samples noise stochastically and the two
-# backends cannot be forced onto the same noise through the benchmark, so the
-# success-rate delta tolerance is generous.
-_TASK_SUITE = "libero_10"
-_TASK_IDS = [0]
-_NUM_EPISODES = 5
-_SUCCESS_RATE_DIFF_TOLERANCE_PCT = 40.0
 
 
 # ---------------------------------------------------------------------------
@@ -334,34 +311,12 @@ def export_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     A separate policy instance is exported (and then discarded) because XR0's
     in-graph export bakes constants and rebinds module forwards in place, which
-    would leave ``native_policy`` unusable for the eager and closed-loop runs.
+    would leave ``native_policy`` unusable for the eager run.
     """
     export_path = tmp_path_factory.mktemp("xr0_openvino_export")
     policy = _build_native_policy()
     policy.export(export_path, backend="openvino")
     return export_path
-
-
-@pytest.fixture(scope="module")
-def exported_model(export_dir: Path) -> InferenceModel:
-    """Load the exported OpenVINO XR0 model through the Runtime ``InferenceModel``."""
-    return InferenceModel(str(export_dir), device="CPU")
-
-
-@pytest.fixture(scope="module")
-def libero_benchmark() -> LiberoBenchmark:
-    """Create the LIBERO benchmark for a single short task once per module."""
-    pytest.importorskip("libero", reason="LIBERO not installed")
-    pytest.importorskip("robosuite", reason="robosuite not installed")
-
-    from physicalai.benchmark.gyms import LiberoBenchmark
-
-    return LiberoBenchmark(
-        task_suite=_TASK_SUITE,
-        task_ids=_TASK_IDS,
-        num_episodes=_NUM_EPISODES,
-        seed=_SEED,
-    )
 
 
 @pytest.fixture(scope="module")
@@ -461,36 +416,6 @@ class TestXR0OpenVINONumericalParity:
         )
         assert cosine >= _MIN_COSINE_SIMILARITY, (
             f"Cosine similarity {cosine:.6f} is below {_MIN_COSINE_SIMILARITY}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Closed-loop parity test
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.slow
-@pytest.mark.skip()
-class TestXR0OpenVINOClosedLoopParity:
-    """Verify closed-loop LIBERO success rates are comparable between backends."""
-
-    def test_success_rate_difference_within_tolerance(
-        self,
-        native_policy: XR0,
-        exported_model: InferenceModel,
-        libero_benchmark: LiberoBenchmark,
-    ) -> None:
-        """Absolute success-rate difference must be within tolerance."""
-        native_results = libero_benchmark.evaluate(native_policy)
-        exported_results = libero_benchmark.evaluate(exported_model)
-
-        native_rate = native_results.overall_success_rate
-        exported_rate = exported_results.overall_success_rate
-        diff = abs(native_rate - exported_rate)
-
-        assert diff <= _SUCCESS_RATE_DIFF_TOLERANCE_PCT, (
-            f"Success-rate diff {diff:.1f}pp exceeds tolerance {_SUCCESS_RATE_DIFF_TOLERANCE_PCT}pp "
-            f"(native={native_rate:.1f}%, openvino={exported_rate:.1f}%)"
         )
 
 

@@ -23,7 +23,6 @@ from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
 
 from .config import XR0Config
-from .export_openvino import install_export_rmsnorm
 from .model import XR0Model
 from .preprocessor import make_xr0_preprocessors
 from .pretrained_utils import extract_xr0_dataset_stats, load_xr0_pretrained_weights, resolve_pretrained_path
@@ -60,7 +59,9 @@ class XR0(ExportablePolicyMixin, Policy):
         vlm_model_id: HuggingFace id of the Qwen3-VL backbone.
         vlm_attn_implementation: Attention backend for the VLM.
         dtype: Model precision (``"bfloat16"``, ``"float16"`` or ``"float32"``).
-        n_obs_steps: Number of observation steps.
+        n_obs_steps: Number of observation steps. Unused: XR0 always conditions
+            on the single current observation (``observation_delta_indices`` is
+            fixed to ``None``); kept only for config parity with other policies.
         chunk_size: Number of action steps to predict.
         n_action_steps: Number of action steps to execute.
         max_state_dim: Padded state dimension.
@@ -477,20 +478,6 @@ class XR0(ExportablePolicyMixin, Policy):
     def prepare_ingraph_export(self, processed: dict[str, torch.Tensor]) -> None:
         """Bake the fixed image geometry into the VLM for a self-contained export.
 
-        Enables in-graph export mode on the Qwen3-VL shim (see
-        :meth:`~physicalai.policies.xr0.vlm.XR0Qwen3VL.prepare_ingraph_export`) so
-        the exported graph runs the vision tower, injects the 3D MRoPE
-        ``position_ids`` and scatters the visual embeddings -- all inside the
-        graph. Call with a representative (right-padded) processed batch from the
-        preprocessor; the graph is then valid for any prompt padded to the same
-        length.
-
-        Also installs the OpenVINO-friendly RMSNorm forward on every RMSNorm
-        instance in the model (see
-        :func:`~physicalai.policies.xr0.export_openvino.install_ov_friendly_rmsnorm`)
-        so the exported IR loads instead of failing on a mis-materialized negative
-        ``ReduceMean`` axis.
-
         Args:
             processed: A preprocessor output dict containing ``input_ids``,
                 ``attention_mask`` and ``image_grid_thw``.
@@ -501,21 +488,14 @@ class XR0(ExportablePolicyMixin, Policy):
         if self.model is None:
             msg = "Model is not initialized"
             raise ValueError(msg)
-        self.model.vlm.prepare_ingraph_export(
+        self.model.prepare_ingraph_export(
             cast("torch.LongTensor", processed["input_ids"]),
             processed["attention_mask"],
             cast("torch.LongTensor", processed["image_grid_thw"]),
         )
-        install_export_rmsnorm(self.model)
 
     def _build_padded_export_sample(self) -> dict[str, torch.Tensor]:
         """Preprocess the policy's sample input and right-pad it to the graph length.
-
-        Runs :attr:`sample_input` through the preprocessor and right-pads
-        ``input_ids``/``attention_mask`` to ``config.tokenizer_max_length`` -- the
-        same fixed length the manifest's ``xr0`` preprocessor pads to at
-        inference time -- so the exported static graph and the native pipeline
-        agree.
 
         Returns:
             The padded ``processed`` dict (``input_ids``, ``attention_mask``,
@@ -545,11 +525,9 @@ class XR0(ExportablePolicyMixin, Policy):
     def _bake_ingraph_export(self) -> None:
         """Pre-export hook: bake the vision geometry and OpenVINO-friendly RMSNorm.
 
-        Registered as a ``pre_export_hooks`` entry for the OpenVINO backend (see
-        :attr:`extra_export_args`) so the base
-        :meth:`ExportablePolicyMixin.to_openvino` runs it in place before tracing.
-        In ``action_mode="delta"`` it also enables the model's state pass-through
-        so the traced graph emits the current-frame ``state`` as a second output.
+        Registered as a ``pre_export_hooks`` entry for the OpenVINO backend
+        so the base :meth:`ExportablePolicyMixin.to_openvino` runs it in place
+        before tracing.
         """
         if self.model is not None:
             self.model.export_state_passthrough = self.config.action_mode == "delta"
@@ -559,12 +537,7 @@ class XR0(ExportablePolicyMixin, Policy):
         """Return the traced input sample for the self-contained OpenVINO graph.
 
         Overrides the base helper: the exported graph consumes the *padded*
-        preprocessor tensors and excludes ``image_grid_thw`` (the shim supplies it
-        as a baked constant; keeping it would reintroduce the non-traceable
-        ``tensor.tolist()`` vision geometry). ``pixel_values`` is emitted as the
-        pre-patchify normalized image grid ``(num_images, C, H, W)`` -- the graph
-        bakes the Qwen3-VL temporal-duplication + patchify. The graph consumes
-        ``{input_ids, attention_mask, pixel_values, state} -> action``.
+        preprocessor tensors and excludes ``image_grid_thw``
 
         Returns:
             The padded traced-input dict, without ``image_grid_thw``.
@@ -598,10 +571,6 @@ class XR0(ExportablePolicyMixin, Policy):
 
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure the AdamW optimizer and cosine-decay-with-warmup scheduler.
-
-        Mirrors Xiaomi's XR0 training recipe: weight decay is disabled for bias,
-        normalization, rotary-embedding, and AdaLN parameters, and applied to the
-        rest.
 
         Returns:
             Dict with optimizer and lr_scheduler config.
@@ -664,11 +633,6 @@ class XR0(ExportablePolicyMixin, Policy):
     @staticmethod
     def get_supported_export_backends() -> list[str | ExportBackend]:
         """Get the list of export backends supported by the policy.
-
-        XR0 supports the tracing-free Torch backend and a self-contained OpenVINO
-        graph. The OpenVINO path bakes the vision geometry, rebuilds the MRoPE
-        ``position_ids`` in-graph and applies the export workarounds inside
-        :meth:`to_openvino`. ONNX/ExecuTorch are not supported.
 
         Returns:
             list[str | ExportBackend]: The supported export backends.
@@ -938,20 +902,6 @@ class XR0(ExportablePolicyMixin, Policy):
     def extra_export_args(self) -> dict[str, ExportParameters]:
         """Additional export arguments for model conversion.
 
-        For the Torch backend the reconstructed policy runs its own
-        preprocessor/postprocessor, so only lightweight input casting and
-        optional action trimming are declared. For the self-contained OpenVINO
-        graph the whole XR0 pipeline is declared instead -- a lightweight,
-        torch-free Runtime ``xr0`` preprocessor
-        (image resize + ``pixel_values`` grid + state padding + rendered ``task``
-        prompt), a sibling OpenVINO ``ov_tokenizer`` (``task`` ->
-        ``tokenized_prompt`` / ``tokenized_prompt_mask``) and an ``xr0_denormalize``
-        postprocessor
-        (action denormalization) -- so the Runtime ``InferenceModel`` can run the
-        exported model natively from ``manifest.json``. The OpenVINO entry is only
-        emitted once the model/postprocessor are initialized (their action
-        normalization stats are required to build the postprocessor spec).
-
         Returns:
             dict[str, ExportParameters]: A mapping from backend name to its export
             parameters.
@@ -1003,12 +953,6 @@ class XR0(ExportablePolicyMixin, Policy):
                 type="xr0_denormalize",
                 # In ``action_mode="delta"`` the baked ``action_mean``/``action_std``
                 # are per-timestep ``(chunk_size, max_action_dim)`` delta stats and
-                # the denormalized prediction is a delta. The graph additionally
-                # emits the current-frame ``state`` as a second output (see
-                # ``outputs`` below), so the Runtime ``xr0_denormalize`` step must,
-                # when ``action_mode == "delta"``, re-add it to the denormalized
-                # delta (``action[..., :action_dim] += state``) before returning
-                # the absolute action, mirroring ``XR0Postprocessor.forward``.
                 action_mode=self._postprocessor.action_mode,
                 action_mean=self._postprocessor.action_mean.tolist(),
                 action_std=self._postprocessor.action_std.tolist(),
@@ -1022,8 +966,6 @@ class XR0(ExportablePolicyMixin, Policy):
                 via_onnx=True,
                 export_tokenizer=True,
                 # Delta mode adds a second graph output: the current-frame state.
-                # The Runtime postprocessor reads
-                # this exact ``state_passthrough`` key to invert the delta.
                 outputs=["action", "state_passthrough"] if cfg.action_mode == "delta" else ["action"],
                 # The NumPy preprocessor emits the prompt as a ``task`` string; a
                 # sibling OpenVINO tokenizer (``tokenizer.xml``) turns it into
@@ -1034,8 +976,7 @@ class XR0(ExportablePolicyMixin, Policy):
                 ],
                 postprocessors_specs=ov_postproc_specs,
                 # Rename the traced graph inputs to the tokenizer's output keys so
-                # the exported ``ov_tokenizer`` step feeds them directly (matches
-                # ``physicalai.inference.preprocessors.ov_tokenizer.OVTokenizer``).
+                # the exported ``ov_tokenizer`` step feeds them directly.
                 input_name_map={
                     "input_ids": "tokenized_prompt",
                     "attention_mask": "tokenized_prompt_mask",

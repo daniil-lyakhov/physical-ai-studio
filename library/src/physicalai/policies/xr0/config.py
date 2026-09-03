@@ -31,7 +31,9 @@ class XR0Config(Config):
             ``"float16"`` when exporting to OpenVINO for Intel GPU: the GPU
             plugin cannot build the OpenCL kernel for bf16 attention permutes,
             while the f16 kernel builds correctly.
-        n_obs_steps: Number of observation steps to use. Defaults to 1.
+        n_obs_steps: Number of observation steps to use. Defaults to 1. Unused:
+            XR0 always conditions on the single current observation; kept only
+            for config parity with other policies.
         chunk_size: Number of action steps to predict (action horizon).
             Defaults to 30.
         n_action_steps: Number of action steps to execute. Defaults to 30.

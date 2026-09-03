@@ -3,15 +3,13 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Assembled XR0 Vision-Language-Action model on the framework ``Model`` base.
+"""Assembled XR0 Vision-Language-Action model on the framework base ``Model``.
 
-``XR0Model`` owns the glue between them (faithfully ported from the source
-``xr0/mibot/models/VLA/XR0.py`` ``XR0.forward``): it continues the VLM's MRoPE
-sequence into the DiT tokens, assembles the joint ``[VLM-cache | local-causal]``
-attention mask, applies the training-time token repeat / prefix logic, and
-computes the flow-matching loss. It exposes the framework
-:class:`~physicalai.policies.base.Model` contract (``forward`` /
-``compute_loss`` / ``predict_action_chunk`` and the delta-index properties).
+``XR0Model`` is the XR0 implementation: it wires the Qwen3-VL
+backbone to the DiT action expert (ported from the source
+``xr0/mibot/models/VLA/XR0.py`` ``XR0.forward``) -- continuing the VLM's MRoPE
+sequence into the DiT tokens, building the joint ``[VLM-cache | local-causal]``
+attention mask, and computing the flow-matching loss.
 """
 
 from __future__ import annotations
@@ -27,6 +25,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextRotaryEmbe
 from physicalai.policies.base import Model
 
 from .dit import XR0FlowModel
+from .export_openvino import install_export_rmsnorm
 from .qwen3_vlm import XR0Qwen3VL
 
 logger = logging.getLogger(__name__)
@@ -110,7 +109,7 @@ class XR0Model(Model):
         # When True (set only during ``action_mode="delta"`` OpenVINO export) the
         # traced eval graph emits the current-frame ``state`` as a second output
         # so the Runtime ``xr0_denormalize`` step can re-add it to the predicted
-        # delta. Off for training and normal inference.
+        # delta.
         self.export_state_passthrough = False
 
         # VLM backbone (surfaces the 3D MRoPE position_ids for the DiT).
@@ -182,6 +181,22 @@ class XR0Model(Model):
             Predicted action tensor ``(B, action_len, action_dim)``.
         """
         return cast("torch.Tensor", self._run(batch, return_loss=False))
+
+    def prepare_ingraph_export(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        image_grid_thw: torch.LongTensor,
+    ) -> None:
+        """Bake the fixed vision geometry into the VLM for a self-contained export.
+
+        Args:
+            input_ids: Token ids of the representative padded prompt ``(1, L)``.
+            attention_mask: Attention mask of the same prompt ``(1, L)``.
+            image_grid_thw: The fixed vision geometry ``(num_images, 3)``.
+        """
+        self.vlm.prepare_ingraph_export(input_ids, attention_mask, image_grid_thw)
+        install_export_rmsnorm(self)
 
     @property
     def reward_delta_indices(self) -> None:
@@ -354,13 +369,11 @@ class XR0Model(Model):
         else:
             action = torch.zeros((1, *self.action_shape), device=device, dtype=self._dtype)
             action_mask = torch.ones_like(action, dtype=torch.int32)
-        # Always use the real current state when the batch provides it (both
-        # training and inference/export do). The DiT conditions on this state and
-        # -- critically for ``action_mode="delta"`` -- the OpenVINO export echoes
-        # it as the ``state_passthrough`` output the postprocessor adds back to
-        # reconstruct the absolute action. Zero-filling here (the old inference
-        # path) baked a constant-zero passthrough, so the exported delta was never
-        # inverted (the t=0 prediction collapsed to ~0 instead of ~state).
+        # Use the real current state whenever the batch provides it. The DiT
+        # conditions on it, and for ``action_mode="delta"`` the OpenVINO export
+        # echoes it as the ``state_passthrough`` output the postprocessor adds
+        # back to recover the absolute action. (Zero-filling here would bake a
+        # constant-zero passthrough, leaving the exported delta un-inverted.)
         if "state" in batch:
             state = batch.pop("state").to(self._dtype)
         else:
@@ -377,8 +390,7 @@ class XR0Model(Model):
 
         At inference the noise is drawn in float32 and cast to the action dtype.
         The model runs in bf16, but the Intel GPU OpenVINO plugin has no layout
-        for a bf16 ``RandomUniform``, so a bf16 draw makes the exported graph
-        fail to compile on GPU; an f32 draw exports to a GPU-compatible
+        for a bf16 ``RandomUniform``;  an f32 draw exports to a GPU-compatible
         ``RandomUniform`` + cast and is numerically equivalent. Training keeps the
         native ``randn_like`` draw so its RNG stream is unchanged.
 
@@ -453,7 +465,7 @@ class XR0Model(Model):
         # Joint attention mask: [VLM-cache | local-causal DiT block].
         cache_mask = batch["attention_mask"][:, None, :].expand(-1, q_len, -1)
         # Deployed inference uses a full causal DiT mask; the banded local window
-        # (local_window) is a training-only attention scheme (see XR0.py).
+        # (local_window) is a training-only attention scheme.
         causal_mask = self._make_local_causal_mask(
             action_bs,
             state_length,
@@ -647,12 +659,11 @@ class XR0Model(Model):
         loss_mse = (F.mse_loss(pred, target, reduction="none") * weight)[action_mask].mean()
 
         if self.freq_coefficient > 0.0:
-            # Frequency-domain (chunk-axis FFT) term, restricted to valid action
-            # channels. On padded channels the target is ``action - noise = -noise``
-            # (fresh Gaussian), which is unpredictable: including them added a large
-            # irreducible floor *and* diluted the real-channel gradient by averaging
-            # over all ``max_action_dim`` channels. The FFT along time is per-channel
-            # independent, so dropping padded channels after the transform is exact.
+            # Frequency-domain (chunk-axis FFT) term over valid action channels
+            # only. Padded channels have target ``-noise`` (fresh Gaussian), which
+            # is unpredictable and would add an irreducible floor while diluting
+            # the real-channel gradient. The time-axis FFT is per-channel, so
+            # dropping padded channels afterwards is exact.
             freq = (torch.fft.rfft(pred, dim=1) - torch.fft.rfft(target, dim=1)).abs()
             weight_dct = weight.mean(dim=[1, 2])
             freq *= weight_dct.unsqueeze(1).unsqueeze(2)

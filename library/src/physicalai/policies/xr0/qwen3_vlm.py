@@ -72,9 +72,6 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         underlying ``get_rope_index`` uses data-dependent Python control flow
         (``tensor.tolist()`` / :func:`itertools.groupby`), so this **must** run
         eagerly on concrete tensors -- it cannot be captured by ``torch.export``.
-        Callers that trace the model (e.g. ONNX/OpenVINO export) should compute
-        the ids up front (in the preprocessor) and pass them into
-        :meth:`forward` so the data-dependent path is skipped.
 
         Returns:
             The 3D MRoPE ``position_ids`` tensor (shape ``(3, batch, seq)``).
@@ -112,16 +109,7 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         positions and the MRoPE ``position_ids`` of the fixed prefix (system
         prompt + image grid) are deterministic. This precomputes them once from a
         representative (right-padded) sample and stores them as non-persistent
-        constant buffers, then enables in-graph export mode. During :meth:`forward`
-        (export mode) the real vision tower runs on ``pixel_values`` with the
-        constant ``image_grid_thw`` (so its ``tensor.tolist()`` geometry folds),
-        the ``position_ids`` are rebuilt for the runtime prompt length (the fixed
-        prefix reused verbatim, the variable-length post-image task text
-        recomputed from ``attention_mask`` -- see
-        :meth:`_runtime_export_position_ids` -- skipping the non-traceable
-        rope-index builder), and the merge / deepstack scatters use the constant
-        integer index (``index_copy`` -> ``ScatterND``) instead of the
-        OpenVINO-hostile ``masked_scatter``.
+        constant buffers, then enables in-graph export mode.
 
         Args:
             input_ids: Token ids of the representative padded prompt ``(1, L)``.
@@ -142,42 +130,31 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
             if hasattr(self, name):
                 delattr(self, name)
             self.register_buffer(name, tensor.detach().clone(), persistent=False)
-        # Everything up to (and including) the last image token -- the fixed
-        # system-prompt text and the fixed image grid -- has deterministic MRoPE
-        # positions, so it stays baked. The *task text* after the image varies in
-        # length between prompts, so its positions must be recomputed at inference
-        # from the runtime ``attention_mask`` (see :meth:`_runtime_export_position_ids`);
-        # otherwise a prompt longer than this sample would leave its trailing
-        # tokens with the sample's padding position id (0), corrupting RoPE. The
-        # post-image text is plain 1D sequential (all three MRoPE axes equal), so
+        # The fixed system-prompt text and the fixed image grid
+        # (Everything up to and including the last image token)
+        # has deterministic MRoPE  positions, so it stays baked.
+        #
+        # The *task text* after the image varies in  length between prompts,
+        # so its positions must be recomputed at inference from the runtime ``attention_mask``;
+        #
+        # The post-image text is plain 1D sequential (all three MRoPE axes equal), so
         # we only need where it starts and its first position value.
         post_image_start = int(image_token_indices.max().item()) + 1
         self._export_post_image_start = post_image_start
         self._export_post_image_base = int(position_ids[0, 0, post_image_start].item())
-        # Keep the vision geometry as a *Python* constant too. ``torch.export``
-        # lifts registered buffers as tensor inputs, so ``grid_thw.tolist()`` in
-        # the vision tower would yield unbacked symints; the export-time tower
+        # Keep the vision geometry as a *Python* constant too for the ``torch.export``:
+        #
+        # Torch.export lifts registered buffers as tensor inputs, so ``grid_thw.tolist()`` in
+        # the vision tower would yield unbacked symints; the export-time
         # patch consumes these concrete ints instead (see :meth:`_ensure_export_patch`).
         self._export_grid_list = [[int(dim) for dim in row] for row in image_grid_thw.tolist()]
         # Per-window token counts for the vision attention. Stock builds these
-        # from ``cu_seqlens`` and calls ``lengths.tolist()`` (unbacked symints
-        # under export); the attention patch splits by these constant ints instead.
+        # from ``cu_seqlens`` and calls ``lengths.tolist()``
         self._export_vision_seqlens = [h * w for t, h, w in self._export_grid_list for _ in range(t)]
         self._ingraph_export = True
 
     def _runtime_export_position_ids(self, attention_mask: torch.Tensor) -> torch.Tensor:
         """Rebuild the export MRoPE ``position_ids`` for the runtime prompt length.
-
-        The baked ``_export_position_ids`` are only correct for prompts whose
-        valid length matches the export sample: a longer prompt's trailing task
-        tokens would inherit the sample's padding position id (0). The prefix
-        (system-prompt text + fixed image grid, up to ``_export_post_image_start``)
-        is identical for every prompt, so it is reused verbatim; the post-image
-        task text is plain 1D sequential (all three MRoPE axes equal), so its
-        positions are recomputed as ``base + cumulative_valid_index`` from the
-        runtime ``attention_mask``. All ops are trace-friendly (``ScatterND``-free
-        elementwise / ``cumsum`` / ``where``), unlike the data-dependent
-        ``get_rope_index`` builder.
 
         Args:
             attention_mask: The runtime attention mask ``(1, L)``.
@@ -201,16 +178,6 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
     def image_token_positions(self, input_ids: torch.LongTensor) -> torch.Tensor:
         """Return the integer sequence positions of the image tokens.
 
-        The stock Qwen3-VL merge / deepstack code scatters the visual embeddings
-        into the language-model hidden states with *boolean-mask* assignment
-        (``masked_scatter`` / ``hidden[mask] = ...``). Under ``torch.export`` those
-        lower to an OpenVINO-hostile ``Where`` whose operand shapes disagree
-        (``[1, seq, hidden]`` vs ``[num_visual, hidden]``). The export path instead
-        scatters by *integer index* (:func:`torch.Tensor.index_copy` ->
-        ``ScatterND``, which OpenVINO supports); those indices are data-dependent
-        (:func:`torch.nonzero`), so they are computed here eagerly (in the
-        preprocessor) and passed into :meth:`forward`.
-
         Returns:
             A ``(num_visual_tokens,)`` long tensor of image-token positions in the
             (single-batch) sequence.
@@ -221,10 +188,8 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         """Swap the stock Qwen3-VL ops for their export-friendly equivalents.
 
         Installs the module-level ``export_*`` reimplementations onto the vision
-        tower and language model (vision attention / rotary / position-embed
-        geometry, and the image-merge / deepstack scatters). Each is numerically
-        identical to stock but OpenVINO-convertible; see those functions for why.
-        Idempotent, and only takes effect once export constants are baked.
+        tower and language model.  Each is numerically identical to stock
+        but OpenVINO-convertible;
         """
         if getattr(self, "_export_patched", False):
             return
@@ -236,15 +201,6 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
         orig_deepstack_process = text_model._deepstack_process  # noqa: SLF001
 
         def _make_vision_attn_forward(attn: torch.nn.Module) -> object:
-            """Build an export-friendly ``forward`` for one vision attention block.
-
-            Thin wrapper binding one attention module and the baked per-window
-            token counts to :func:`export_vision_attn_forward`.
-
-            Returns:
-                The export-friendly ``forward`` callable for the block.
-            """
-
             def _forward(
                 hidden_states: torch.Tensor,
                 cu_seqlens: torch.Tensor | None = None,  # noqa: ARG001
@@ -298,8 +254,8 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
             if inputs_embeds is None:
                 inputs_embeds = inner.get_input_embeddings()(input_ids)
             # Run the tower directly (not ``get_image_features``) so its
-            # ``split_sizes.tolist()`` -- another unbacked-symint source -- is
-            # skipped; the two patched geometry helpers above already consume the
+            # ``split_sizes.tolist()`` is skipped;
+            # The two patched geometry helpers above already consume the
             # constant grid, and a freshly built *constant* grid tensor keeps the
             # tower's inline ``cu_seqlens`` (tensor ops on ``grid_thw``) concrete.
             grid_const = torch.tensor(
@@ -407,9 +363,18 @@ class XR0Qwen3VL(Qwen3VLForConditionalGeneration):
     ) -> Qwen3VLCausalLMOutputWithPast:
         """Run the stock forward and attach the 3D MRoPE ``position_ids``.
 
-        Normal (eager) inference runs the fully stock path: the vision tower, the
-        3D MRoPE ``position_ids`` (:meth:`~transformers.Qwen3VLModel.compute_3d_position_ids`)
-        and the boolean-mask visual scatter all run unchanged.
+        On the normal eager path this derives ``mm_token_type_ids`` /
+        ``position_ids`` (when absent) and delegates to the stock forward,
+        re-exposing the 3D grid on the output.
+
+        When in-graph export mode is active (after
+        :meth:`prepare_ingraph_export`), the fixed image geometry and the prefix
+        MRoPE positions are taken from the baked constant buffers, the
+        ``position_ids`` are rebuilt for the runtime prompt length via
+        :meth:`_runtime_export_position_ids`, and the stock ops are swapped for
+        their OpenVINO-convertible ``export_*`` equivalents (see
+        :meth:`_ensure_export_patch`). This keeps the traced graph free of the
+        data-dependent Python control flow that ``torch.export`` cannot capture.
 
         Returns:
             The stock Qwen3-VL output with the 3D MRoPE ``position_ids`` attached.

@@ -1,16 +1,14 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the XR0 Qwen3-VL backbone shim (``vlm``).
+"""Unit tests for the XR0 Qwen3-VL backbone shim (``qwen3_vlm``).
 
-Fast, self-contained tests with no external dependencies (no HuggingFace model
-downloads). A tiny synthetic Qwen3-VL is instantiated to exercise the *only*
-behaviour the shim introduces on top of stock ``transformers``: computing the 3D
-MRoPE ``position_ids`` (deriving ``mm_token_type_ids`` from ``input_ids`` when
-absent) and surfacing them on the output. The stock VLM numerics are inherited
-unchanged and are not re-tested here. The introduced logic is pinned against
-reference data; ``position_ids`` are pure index math, so they are reproducible
-and weight-independent.
+Fast, self-contained tests on a tiny synthetic Qwen3-VL (no HuggingFace
+downloads). They cover the two behaviours the shim adds on top of stock
+``transformers``: surfacing the 3D MRoPE ``position_ids`` (pinned against
+weight-independent reference index math) and the in-graph export op swaps
+(pinned to leave eager logits unchanged). Stock VLM numerics are inherited and
+not re-tested.
 """
 
 from __future__ import annotations
@@ -22,7 +20,8 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLVisionConfig,
 )
 
-from physicalai.policies.xr0.vlm import XR0Qwen3VL
+from physicalai.policies.xr0.export_openvino import patchify_image_grid
+from physicalai.policies.xr0.qwen3_vlm import XR0Qwen3VL
 
 # Special token ids for the tiny vocabulary.
 IMAGE_TOKEN_ID = 151
@@ -32,7 +31,14 @@ VISION_START_TOKEN_ID = 150
 # One image: grid (t, h, w) -> (t*h*w) / merge**2 merged image tokens.
 IMAGE_GRID = (2, 4, 4)
 SPATIAL_MERGE = 2
+PATCH_SIZE = 16
+TEMPORAL_PATCH_SIZE = 2
 N_IMAGE_TOKENS = (IMAGE_GRID[0] * IMAGE_GRID[1] * IMAGE_GRID[2]) // SPATIAL_MERGE**2
+
+# In-graph export parity uses a still image (grid_t == 1) so ``patchify_image_grid``
+# can reproduce the exact flat ``pixel_values`` the vision tower consumes.
+EXPORT_GRID = (1, 4, 4)
+N_EXPORT_TOKENS = (EXPORT_GRID[0] * EXPORT_GRID[1] * EXPORT_GRID[2]) // SPATIAL_MERGE**2
 
 
 def _config() -> Qwen3VLConfig:
@@ -138,3 +144,61 @@ class TestPositionIds:
         with torch.no_grad():
             out = shim(**batch, position_ids=position_ids, use_cache=True)
         assert torch.equal(out.position_ids, position_ids)
+
+
+def _export_batch() -> tuple[dict, torch.Tensor]:
+    """Build a still-image batch, returning ``(eager_batch, raw_image_grid)``.
+
+    The eager batch carries the flat patchified ``pixel_values`` the tower
+    consumes; the raw ``(num_images, C, H, W)`` grid is what the in-graph export
+    forward patchifies internally, so both paths see the identical image.
+    """
+    grid = torch.tensor([list(EXPORT_GRID)])
+    height = EXPORT_GRID[1] * PATCH_SIZE
+    width = EXPORT_GRID[2] * PATCH_SIZE
+    torch.manual_seed(0)
+    raw_image = torch.randn(1, 3, height, width)
+    pixel_values = patchify_image_grid(
+        raw_image,
+        [list(EXPORT_GRID)],
+        temporal_patch_size=TEMPORAL_PATCH_SIZE,
+        patch_size=PATCH_SIZE,
+        merge_size=SPATIAL_MERGE,
+    )
+    input_ids = torch.tensor([[5, 6, VISION_START_TOKEN_ID, *([IMAGE_TOKEN_ID] * N_EXPORT_TOKENS), 7, 8, 9]])
+    attention_mask = torch.ones_like(input_ids)
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values": pixel_values,
+        "image_grid_thw": grid,
+    }
+    return batch, raw_image
+
+
+class TestIngraphExportParity:
+    """``prepare_ingraph_export`` swaps stock ops for export-friendly equivalents.
+
+    Each swapped op is numerically identical to stock, so enabling in-graph
+    export mode must not materially change the logits for the same inputs.
+    """
+
+    def test_export_logits_match_eager(self) -> None:
+        shim = _build_shim()
+        batch, raw_image = _export_batch()
+        with torch.no_grad():
+            eager = shim(**batch, use_cache=True)
+        shim.prepare_ingraph_export(
+            batch["input_ids"],
+            batch["attention_mask"],
+            batch["image_grid_thw"],
+        )
+        with torch.no_grad():
+            exported = shim(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                pixel_values=raw_image,
+                use_cache=True,
+            )
+        assert exported.logits.shape == eager.logits.shape
+        assert torch.allclose(exported.logits, eager.logits, atol=1e-3, rtol=1e-3)

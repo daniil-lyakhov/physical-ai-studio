@@ -45,7 +45,7 @@ def export_rmsnorm_forward(self: _RMSNormLike, hidden_states: torch.Tensor) -> t
         The RMS-normalized, weight-scaled activations in the input dtype.
     """
     input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
+    hidden_states = hidden_states.to(torch.float32).clone()
     axis = hidden_states.dim() - 1  # concrete positive int -> clean ReduceMean axis
     variance = hidden_states.pow(2).mean(axis, keepdim=True)
     hidden_states *= torch.rsqrt(variance + self.variance_epsilon)
