@@ -487,9 +487,6 @@ class ExportablePolicyMixin:
 
             self.model.eval()
 
-            for pre_hook in extra_model_args.pre_export_hooks:
-                pre_hook()
-
             if extra_model_args.via_onnx:
                 with tempfile.NamedTemporaryFile(suffix=".onnx") as tmp:
                     self._onnx_core_export_step(
@@ -540,9 +537,6 @@ class ExportablePolicyMixin:
             input_features=self._to_component_specs(self.inputs_schema or []),
             output_features=self._to_component_specs(self.outputs_schema or []),
         )
-
-        for post_hook in extra_model_args.post_export_hooks:
-            post_hook(model_path)
 
     @torch.no_grad()
     def to_executorch(
@@ -723,7 +717,8 @@ class ExportablePolicyMixin:
         output_path: PathLike | str,
         backend: ExportBackend | str,
         input_sample: dict[str, torch.Tensor] | None = None,
-        post_export_hooks: list[Callable[[str], None]] | None = None,
+        pre_export_hooks: list[Callable[[], object]] | None = None,
+        post_export_hooks: list[Callable[[str | Path], object]] | None = None,
         **export_kwargs: dict,
     ) -> None:
         """Export the model to the specified backend format.
@@ -740,9 +735,13 @@ class ExportablePolicyMixin:
                 input tensor dictionary for model tracing.
                 If None, attempts to use the policy's `sample_input` property.
                 Defaults to None.
-            post_export_hooks: Optional list of callables to run after export completes.
-                Each hook receives the exported model file path (str) and can perform
-                post-processing such as quantization or compression.
+            pre_export_hooks: Optional list of callables to run before export starts,
+                after any policy-declared pre-export hooks. Each hook takes no
+                arguments and may mutate the model in place. Any return value is ignored.
+            post_export_hooks: Optional list of callables to run after export completes,
+                after any policy-declared post-export hooks. Each hook receives the
+                exported model file path and can perform post-processing.
+                Any return value is ignored.
             **export_kwargs (dict): Additional keyword arguments to pass to the
                 backend-specific export method.
 
@@ -750,6 +749,13 @@ class ExportablePolicyMixin:
             ValueError: If an unsupported backend is specified.
         """
         backend = ExportBackend(backend)
+
+        extra_model_args = self._get_export_extra_args(backend)
+        pre_hooks = [*extra_model_args.pre_export_hooks, *(pre_export_hooks or [])]
+        post_hooks = [*extra_model_args.post_export_hooks, *(post_export_hooks or [])]
+
+        for pre_hook in pre_hooks:
+            pre_hook()
 
         if backend == ExportBackend.ONNX:
             self.to_onnx(output_path, input_sample, **export_kwargs)
@@ -763,9 +769,9 @@ class ExportablePolicyMixin:
             msg = f"Unsupported export backend: {backend}"
             raise ValueError(msg)
 
-        if post_export_hooks:
+        if post_hooks:
             model_path = self._prepare_export_path(output_path, backend.extension)
-            for hook in post_export_hooks:
+            for hook in post_hooks:
                 hook(str(model_path))
 
     @_quiet_onnx_export_logs()

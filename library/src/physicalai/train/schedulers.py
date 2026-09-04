@@ -25,7 +25,6 @@ def cosine_decay_with_warmup_scheduler(
     num_warmup_steps: int,
     num_decay_steps: int,
     num_training_steps: int | None = None,
-    decay_from_warmup_end: bool = False,
 ) -> LambdaLR:
     """Create a cosine decay scheduler with linear warmup.
 
@@ -47,12 +46,6 @@ def cosine_decay_with_warmup_scheduler(
         num_training_steps: Total number of training steps. When provided
             and less than ``num_decay_steps``, warmup and decay are scaled
             proportionally to fit.
-        decay_from_warmup_end: When ``True``, the cosine phase measures its
-            progress from the end of warmup (spanning
-            ``num_warmup_steps -> num_decay_steps``) instead of from step 0.
-            This matches Xiaomi's XR0 ``get_cosine_schedule_with_warmup`` and
-            removes the small LR drop right after warmup. Defaults to ``False``
-            to preserve the Pi0/Pi05/SmolVLA schedule.
 
     Returns:
         A ``LambdaLR`` scheduler instance.
@@ -88,12 +81,7 @@ def cosine_decay_with_warmup_scheduler(
             frac = 1.0 - current_step / actual_warmup_steps
             return (1.0 / (actual_warmup_steps + 1) - 1.0) * frac + 1.0
         step = min(current_step, actual_decay_steps)
-        if decay_from_warmup_end:
-            denom = max(1, actual_decay_steps - actual_warmup_steps)
-            progress = (step - actual_warmup_steps) / denom
-        else:
-            progress = step / actual_decay_steps
-        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * step / actual_decay_steps))
         return (1.0 - alpha) * cosine_decay + alpha
 
     return LambdaLR(optimizer, lr_lambda)

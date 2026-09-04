@@ -608,7 +608,6 @@ class XR0(ExportablePolicyMixin, Policy):
             num_warmup_steps=self.config.scheduler_warmup_steps,
             num_decay_steps=num_decay_steps,
             num_training_steps=num_training_steps,
-            decay_from_warmup_end=True,
         )
         return {
             "optimizer": optimizer,

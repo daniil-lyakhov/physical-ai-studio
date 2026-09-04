@@ -472,7 +472,7 @@ class TestToOpenVINO:
 
 
 class TestExportHooks:
-    """Tests for the pre/post export hooks wired into the OpenVINO backend."""
+    """Tests for policy-declared pre/post export hooks run through ``export()``."""
 
     def test_hooks_invoked_around_conversion_in_order(self, tmp_path):
         """Pre hooks run before conversion, post hooks after, all in order."""
@@ -511,7 +511,7 @@ class TestExportHooks:
             return original_convert(*args, **kwargs)
 
         with patch("openvino.convert_model", side_effect=tracking_convert):
-            wrapper.to_openvino(output_path)
+            wrapper.export(output_path, backend="openvino")
 
         assert calls == ["pre_one", "pre_two", "convert", "post_one", "post_two"]
         assert output_path.exists()
@@ -529,9 +529,9 @@ class TestExportHooks:
         }
 
         output_path = tmp_path / "model.xml"
-        wrapper.to_openvino(output_path)
+        wrapper.export(output_path, backend="openvino")
 
-        assert recorded_paths == [output_path]
+        assert recorded_paths == [str(output_path)]
         assert output_path.exists()
 
     def test_pre_hook_can_mutate_model_before_conversion(self, tmp_path):
@@ -551,7 +551,7 @@ class TestExportHooks:
         }
 
         output_path = tmp_path / "model.xml"
-        wrapper.to_openvino(output_path)
+        wrapper.export(output_path, backend="openvino")
 
         core = openvino.Core()
         compiled = core.compile_model(str(output_path), "CPU")
@@ -978,3 +978,68 @@ class TestPostExportHooks:
         wrapper.export(backend="openvino", output_path=output_path)
 
         assert output_path.exists()
+
+    def test_export_invokes_global_pre_export_hooks(self, tmp_path):
+        """export() runs caller-supplied pre_export_hooks before backend dispatch."""
+        model = ModelWithSampleInput(input_dim=10, output_dim=5)
+        wrapper = ExportWrapper(model)
+
+        calls = []
+        pre_hook = MagicMock(side_effect=lambda: calls.append("pre"))
+        post_hook = MagicMock(side_effect=lambda _path: calls.append("post"))
+
+        output_path = tmp_path / "model.xml"
+        wrapper.export(
+            backend="openvino",
+            output_path=output_path,
+            pre_export_hooks=[pre_hook],
+            post_export_hooks=[post_hook],
+        )
+
+        pre_hook.assert_called_once_with()
+        # Pre-hook runs before the post-hook (i.e. before the artifact is written).
+        assert calls == ["pre", "post"]
+
+    def test_export_runs_policy_declared_hooks(self, tmp_path):
+        """Policy-declared pre/post hooks in extra_export_args run through export()."""
+        model = ModelWithSampleInput(input_dim=10, output_dim=5)
+        wrapper = ExportWrapper(model)
+
+        pre_hook = MagicMock()
+        post_hook = MagicMock()
+        wrapper._extra_export_args[ExportBackend.OPENVINO] = OpenVINOExportParameters(
+            pre_export_hooks=[pre_hook],
+            post_export_hooks=[post_hook],
+        )
+
+        output_path = tmp_path / "model.xml"
+        wrapper.export(backend="openvino", output_path=output_path)
+
+        pre_hook.assert_called_once_with()
+        post_hook.assert_called_once_with(str(output_path))
+
+    def test_export_runs_policy_hooks_before_caller_hooks(self, tmp_path):
+        """Policy-declared hooks run before caller-supplied hooks; pre before post."""
+        model = ModelWithSampleInput(input_dim=10, output_dim=5)
+        wrapper = ExportWrapper(model)
+
+        order = []
+        policy_pre = MagicMock(side_effect=lambda: order.append("policy_pre"))
+        caller_pre = MagicMock(side_effect=lambda: order.append("caller_pre"))
+        policy_post = MagicMock(side_effect=lambda _path: order.append("policy_post"))
+        caller_post = MagicMock(side_effect=lambda _path: order.append("caller_post"))
+
+        wrapper._extra_export_args[ExportBackend.OPENVINO] = OpenVINOExportParameters(
+            pre_export_hooks=[policy_pre],
+            post_export_hooks=[policy_post],
+        )
+
+        output_path = tmp_path / "model.xml"
+        wrapper.export(
+            backend="openvino",
+            output_path=output_path,
+            pre_export_hooks=[caller_pre],
+            post_export_hooks=[caller_post],
+        )
+
+        assert order == ["policy_pre", "caller_pre", "policy_post", "caller_post"]

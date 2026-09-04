@@ -16,20 +16,23 @@ from .rldx1 import Rldx1, Rldx1Config, Rldx1Model
 from .smolvla import SmolVLA, SmolVLAConfig, SmolVLAModel
 from .xr0 import XR0, XR0Config, XR0Model
 
-__all__ = [
+__all__ = [  # noqa: RUF022  # grouped by policy family, not isort-sorted
+    # ACT
     "ACT",
-    "XR0",
     "ACTConfig",
     "ACTModel",
+    # Groot
     "Groot",
     "GrootConfig",
     "GrootModel",
+    # Pi0
     "Pi0",
     "Pi0Config",
     "Pi0Model",
     "Pi05",
     "Pi05Config",
     "Pi05Model",
+    # Base
     "Policy",
     # RLDX
     "Rldx1",
@@ -39,8 +42,11 @@ __all__ = [
     "SmolVLA",
     "SmolVLAConfig",
     "SmolVLAModel",
+    # XR0
+    "XR0",
     "XR0Config",
     "XR0Model",
+    # Utils
     "get_physicalai_policy_class",
     "get_policy",
     "lerobot",
