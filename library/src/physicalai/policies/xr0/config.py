@@ -27,10 +27,7 @@ class XR0Config(Config):
         vlm_attn_implementation: Attention backend for the VLM. Defaults to
             ``"flash_attention_2"``.
         dtype: Precision for model weights. Options: ``"bfloat16"``,
-            ``"float16"``, ``"float32"``. Defaults to ``"bfloat16"``. Use
-            ``"float16"`` when exporting to OpenVINO for Intel GPU: the GPU
-            plugin cannot build the OpenCL kernel for bf16 attention permutes,
-            while the f16 kernel builds correctly.
+            ``"float16"``, ``"float32"``. Defaults to ``"bfloat16"``.
         n_obs_steps: Number of observation steps to use. Defaults to 1. Unused:
             XR0 always conditions on the single current observation; kept only
             for config parity with other policies.

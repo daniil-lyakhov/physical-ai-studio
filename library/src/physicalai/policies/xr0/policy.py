@@ -28,7 +28,7 @@ from .preprocessor import make_xr0_preprocessors
 from .pretrained_utils import extract_xr0_dataset_stats, load_xr0_pretrained_weights, resolve_pretrained_path
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Sequence
     from os import PathLike
     from pathlib import Path
 
@@ -59,8 +59,6 @@ class XR0ExportablePolicyMixin(ExportablePolicyMixin):
         self,
         output_path: PathLike | str,
         input_sample: dict[str, torch.Tensor] | None = None,
-        pre_export_hooks: list[Callable[[], object]] | None = None,
-        post_export_hooks: list[Callable[[Path], object]] | None = None,
         **export_kwargs: dict,
     ) -> None:
         """Bake the self-contained export graph, then run the base OpenVINO export.
@@ -69,9 +67,6 @@ class XR0ExportablePolicyMixin(ExportablePolicyMixin):
             output_path: Directory or file path where the OpenVINO model is saved.
             input_sample: Optional sample input for tracing; falls back to
                 :meth:`_get_default_export_input_sample` when ``None``.
-            pre_export_hooks: Optional caller-supplied hooks run before conversion.
-            post_export_hooks: Optional caller-supplied hooks run after the artifact
-                is written.
             **export_kwargs: Additional keyword arguments forwarded to the OpenVINO
                 conversion process.
         """
@@ -79,8 +74,6 @@ class XR0ExportablePolicyMixin(ExportablePolicyMixin):
         super().to_openvino(
             output_path,
             input_sample,
-            pre_export_hooks=pre_export_hooks,
-            post_export_hooks=post_export_hooks,
             **export_kwargs,
         )
 

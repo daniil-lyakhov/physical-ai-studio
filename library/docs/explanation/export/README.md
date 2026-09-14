@@ -122,13 +122,12 @@ policy.to_executorch("model.pte")
 - Lightweight runtime
 - Optimized for resource-constrained environments
 
-## Export Hooks
+## Post-Export Hooks
 
-`export(...)` accepts `pre_export_hooks` and `post_export_hooks`. Pre-hooks run
-before tracing/conversion (mutate the model in place); post-hooks run after the
-artifact is written (rewrite it in place), enabling backend-specific
-optimization passes without changing the export methods themselves. They run for
-every backend.
+`export(...)` accepts `post_export_hooks`, a list of callables run after the
+artifact is written. Each hook receives the exported model path and can rewrite
+it in place, enabling backend-specific optimization passes without changing the
+export methods themselves.
 
 The built-in `compress_weights_openvino_int8_sym` hook uses
 [NNCF](https://github.com/openvinotoolkit/nncf) to compress an OpenVINO IR to
