@@ -621,6 +621,8 @@ class ExportablePolicyMixin:
 
             aten_dialect = compress_weights_executorch_openvino_int8_sym(aten_dialect, (input_sample,))
 
+        torch.export.save(aten_dialect, str(model_path).split(".")[0] + "not_stripped.pte" )
+
         if partitioner is not None:
             edge_program = to_edge_transform_and_lower(aten_dialect, partitioner=[partitioner])
         else:
