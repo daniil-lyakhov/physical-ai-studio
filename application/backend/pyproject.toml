@@ -36,7 +36,7 @@ dependencies = [
   "sse-starlette>=2.0.0",
   "huggingface-hub>=0.27",
   "psutil~=7.2",
-  "physicalai-studio-plugin",
+  "physicalai-studio-plugin>=0.2.0",
   "asyncssh~=2.24",
   "packaging>=24.0",
   "sigstore>=4.0,<5",
@@ -124,8 +124,7 @@ explicit = false
 
 [tool.uv.sources]
 physicalai-train = { path = "../../library", editable = true }
-physicalai = { git = "https://github.com/openvinotoolkit/physicalai.git", rev = "8e4021703ef43387a835c6647b993cecc069ca85" }
-physicalai-studio-plugin = { path = "../plugin", editable = true }
+physicalai = { git = "https://github.com/openvinotoolkit/physicalai.git", rev = "a3f522f9554034d2d35e97bd2b0f72feae8b3067" }
 # Keep torchao on PyPI for all extras.
 # The XPU index publishes `torchao` local-version wheels (e.g. `+xpu`) that can
 # be selected via unsafe-best-match even for non-XPU installs (like `--extra cuda`),
@@ -167,7 +166,8 @@ all = [
 package = true
 default-groups = ["all"]
 exclude-newer = "7 days"
-exclude-newer-package = { pyrealsense2 = "1 days", markupsafe = false }
+# FIXME: lightning: disable cutoff so the CVE-2026-58659 fix (2.6.6) resolves despite being <7 days old
+exclude-newer-package = {pyrealsense2 = "1 days", markupsafe = false, physicalai-rebot-b601-plugin = false, physicalai-stararm-plugin = false, physicalai-bimanual-so101-plugin = false, physicalai-lerobot-plugin = false, physicalai-studio-plugin = false, lightning = false}
 # The pytorch-xpu index is non-explicit (explicit = false) because
 # transitive deps like triton-xpu only exist on the XPU index.
 # unsafe-best-match is required because PyTorch indexes can host stale
@@ -184,6 +184,8 @@ override-dependencies = [
     "pytest>=9.0.3",
     # lerobot==0.5.1 caps diffusers at <0.36.0, 0.38.0 contains CVE-2026-44827 fix
     "diffusers>=0.38.0",
+    # LeRobot pulls in setuptools with no upper bound; 83.0.0 fixes CVE-2026-59890
+    "setuptools>=83.0.0",
 ]
 conflicts = [
     [

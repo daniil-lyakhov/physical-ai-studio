@@ -71,6 +71,7 @@ def _context(
     payload: TrainJobPayload,
     *,
     base_model: Model | None = None,
+    model_policy: str = "act",
     model: Model | None = None,
 ) -> TrainingContext:
     model_dir = tmp_path / "models" / str(uuid4())
@@ -80,7 +81,7 @@ def _context(
     cache_dir.mkdir(parents=True, exist_ok=True)
     return TrainingContext(
         job=MagicMock(),
-        model=model if model is not None else _model(model_dir),
+        model=model if model is not None else _model(model_dir, policy=model_policy),
         snapshot=Snapshot(id=uuid4(), dataset_id=uuid4(), path=str(snap_dir)),
         payload=payload,
         base_model=base_model,
@@ -126,6 +127,26 @@ class TestBuildSpec:
         spec = build_spec(_context(tmp_path, _payload()))
 
         assert (spec.device_type, spec.device_index) == (None, None)
+
+    @pytest.mark.parametrize("augment_images", [True, False])
+    def test_image_augmentation_choice_is_forwarded(self, tmp_path, augment_images):
+        spec = build_spec(_context(tmp_path, _payload(augment_images=augment_images)))
+
+        assert spec.augment_images is augment_images
+
+    def test_lora_fields_are_forwarded(self, tmp_path):
+        payload = _payload(
+            policy="pi05",
+            lora_enabled=True,
+            lora_rank=16,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            lora_use_dora=True,
+        )
+        spec = build_spec(_context(tmp_path, payload, model_policy="pi05"))
+
+        assert (spec.lora_enabled, spec.lora_rank, spec.lora_alpha) == (True, 16, 32)
+        assert (spec.lora_dropout, spec.lora_use_dora) == (0.1, True)
 
     def test_resumed_run_trains_the_base_model_policy(self, tmp_path):
         """A resumed run's architecture comes from the checkpoint, not the request."""

@@ -80,8 +80,9 @@ PRETRAINED_BASE_CHECKPOINTS: dict[str, str] = {
 _WEIGHTS_ONLY_RESUME_POLICIES = frozenset({"pi0"})
 """Policies whose checkpoints must be reloaded with ``weights_only=True``."""
 
-_COMPILED_EXPORT_RELOAD_POLICIES = frozenset({"act", "smolvla"})
-"""Policies that cannot be exported while ``torch.compile``d, so are reloaded first."""
+PEFT_POLICIES = frozenset({"pi05", "pi0"})
+"""Policies whose ``Config`` mixes in ``physicalai.policies.mixins.peft.PeftConfigMixin`` and
+support LoRA/DoRA fine-tuning."""
 
 
 class RunOptions(BaseModel):
@@ -126,6 +127,10 @@ class TrainingJobSpec(BaseModel):
     val_split: float = Field(default=0.1, ge=0.0, lt=1.0, description="Fraction of episodes held out for validation.")
     precision: str = Field(default="bf16-mixed", description="Lightning precision, e.g. '32-true' or 'bf16-mixed'.")
     compile_model: bool = Field(default=False, description="Whether to torch.compile the policy forward pass.")
+    augment_images: bool = Field(
+        default=False,
+        description="Whether to augment training images with the default pipeline.",
+    )
     auto_scale_batch_size: bool = Field(default=False, description="Whether to search for the largest fitting batch.")
     snapflow_start_epoch: int | None = Field(
         default=None,
@@ -141,7 +146,47 @@ class TrainingJobSpec(BaseModel):
         ge=0,
         description="Zero-based index of the accelerator to train on. None lets Lightning pick one.",
     )
+    lora_enabled: bool = Field(
+        default=False,
+        description=(
+            "Fine-tune with LoRA/DoRA instead of full fine-tuning: freezes the base model and "
+            f"trains small low-rank adapters. Only available for {sorted(PEFT_POLICIES)}."
+        ),
+    )
+    lora_rank: int = Field(default=32, ge=1, le=256, description="LoRA rank. Ignored unless lora_enabled.")
+    lora_alpha: int | None = Field(
+        default=None,
+        ge=1,
+        description="LoRA scaling numerator (scaling = lora_alpha / lora_rank). None defaults to lora_rank.",
+    )
+    lora_dropout: float = Field(default=0.05, ge=0.0, lt=1.0, description="Dropout applied to LoRA adapter inputs.")
+    lora_use_dora: bool = Field(
+        default=False,
+        description="Use DoRA (Weight-Decomposed LoRA) instead of plain LoRA. Ignored unless lora_enabled.",
+    )
     run_options: RunOptions = Field(default_factory=RunOptions)
+
+    @model_validator(mode="after")
+    def validate_lora(self) -> TrainingJobSpec:
+        """Reject a LoRA request the run cannot honour, and DoRA requested without LoRA."""
+        if self.lora_use_dora and not self.lora_enabled:
+            msg = "lora_use_dora requires lora_enabled; DoRA is a variant of LoRA, not a standalone mode."
+            raise ValueError(msg)
+        if not self.lora_enabled:
+            return self
+        if self.policy_source != "physicalai":
+            msg = (
+                f"LoRA/DoRA fine-tuning requires policy_source='physicalai', got {self.policy_source!r}: "
+                "lerobot-wrapped policies do not accept lora_* constructor arguments."
+            )
+            raise ValueError(msg)
+        if self.policy.lower() not in PEFT_POLICIES:
+            msg = (
+                f"LoRA/DoRA fine-tuning is not available for policy {self.policy!r}; "
+                f"supported policies are {sorted(PEFT_POLICIES)}."
+            )
+            raise ValueError(msg)
+        return self
 
     @model_validator(mode="after")
     def validate_snapflow(self) -> TrainingJobSpec:
@@ -196,6 +241,14 @@ def build_policy(spec: TrainingJobSpec, *, resume_from: Path | str | None = None
         pretrained = PRETRAINED_BASE_CHECKPOINTS.get(spec.policy.lower())
         if pretrained is not None:
             kwargs["pretrained_name_or_path"] = pretrained
+    if spec.lora_enabled:
+        kwargs.update(
+            lora_enabled=True,
+            lora_rank=spec.lora_rank,
+            lora_alpha=spec.lora_alpha,
+            lora_dropout=spec.lora_dropout,
+            lora_use_dora=spec.lora_use_dora,
+        )
     return get_policy(spec.policy, source=spec.policy_source, **kwargs)
 
 
@@ -276,6 +329,7 @@ def run_training_job(
     from physicalai.data import LeRobotDataModule
     from physicalai.train.callbacks import ProgressReportingCallback
     from physicalai.train.trainer import Trainer
+    from physicalai.transforms import DefaultImageAugmentations
 
     from training.device import resolve_accelerator, resolve_devices, resolve_strategy
 
@@ -290,6 +344,9 @@ def run_training_job(
             train_batch_size=spec.batch_size,
             num_workers=spec.num_workers,
             val_split=spec.val_split,
+            # Applied to the train split only; the datamodule leaves validation
+            # images untouched so eval loss stays comparable across runs.
+            image_transforms=DefaultImageAugmentations() if spec.augment_images else None,
         )
         policy = build_policy(spec, resume_from=spec.run_options.resume_from)
 
@@ -327,7 +384,7 @@ def run_training_job(
         _publish(cache_dir, output_dir)
 
         export_policy = _export_policy(spec, policy, output_dir)
-        _detach_trainer(export_policy, trainer)
+        _detach_trainer(policy, trainer)
         del trainer, datamodule, policy
         _release_memory()
         _export(export_policy, output_dir, report)
@@ -451,8 +508,9 @@ def resolve_checkpoint(model_dir: Path | str) -> Path:
 def _export_policy(spec: TrainingJobSpec, policy: Policy, output_dir: Path) -> Policy:
     """Return the policy to export: reloaded from disk when that changes what gets exported.
 
-    Reloads are needed in two cases, and are always uncompiled since some
-    export backends cannot trace a ``torch.compile``d forward pass.
+    For SnapFlow runs, export reloads the distilled checkpoint so the exported
+    artifact matches what ``resolve_checkpoint`` (and therefore resume/download)
+    picks, rather than the final-epoch weights left in memory.
 
     Falls back to the trained policy if the reload fails — a failed export is
     better than a failed job.
@@ -461,43 +519,39 @@ def _export_policy(spec: TrainingJobSpec, policy: Policy, output_dir: Path) -> P
         The policy instance to hand to the export backends.
     """
     resolved = resolve_checkpoint(output_dir)
-    used_snapflow_checkpoint = resolved.name == SNAPFLOW_CHECKPOINT_NAME
-    needs_compiled_reload = spec.compile_model and spec.policy.lower() in _COMPILED_EXPORT_RELOAD_POLICIES
-    if not used_snapflow_checkpoint and not needs_compiled_reload:
+    if resolved.name != SNAPFLOW_CHECKPOINT_NAME:
         return policy
-    reload_from = resolved
 
     try:
-        logger.info("Reloading policy from %s for export", reload_from.name)
+        logger.info("Reloading policy from %s for export", resolved.name)
         uncompiled = spec.model_copy(update={"compile_model": False})
-        return _load_policy_from_checkpoint(uncompiled, reload_from)
+        return _load_policy_from_checkpoint(uncompiled, resolved)
     except Exception:  # reload is best-effort; the trained policy is a valid fallback
         logger.warning("Failed to reload policy for export; using trained policy", exc_info=True)
         return policy
 
 
-def _detach_trainer(export_policy: Policy, trainer: Any) -> None:
+def _detach_trainer(policy: Policy, trainer: Any) -> None:
     """Break the trainer<->policy<->datamodule reference cycle before export.
 
     Lightning wires ``policy._trainer = trainer``, ``trainer.datamodule =
     datamodule``, and ``trainer.strategy._lightning_module = policy`` during
-    ``fit``, and never undoes it. When ``export_policy`` is the very policy
-    that was just trained (the common case: no ``torch.compile`` reload), it
-    still holds that ``_trainer`` reference, which keeps the trainer — and
-    everything it holds: optimizer state, dataloaders, the strategy — alive
+    ``fit``, and never undoes it. ``policy`` is the object that was just trained,
+    so it holds that ``_trainer`` reference, which keeps the trainer, and
+    everything it holds (optimizer state, dataloaders, the strategy), alive
     and reachable no matter how many local names ``run_training_job`` deletes.
     ``gc.collect()`` only reclaims *unreachable* cycles, so without this the
-    memory release below is a no-op on the export object it matters most for.
+    memory release below is a no-op on the object it matters most for.
 
     Best-effort: a failure here must not abort the job.
     """
     try:
-        export_policy._trainer = None
+        policy._trainer = None
         if getattr(trainer, "strategy", None) is not None:
             trainer.strategy._lightning_module = None
         trainer.datamodule = None
-    except Exception as exc:
-        logger.warning("Could not detach trainer from policy: %s", exc)
+    except Exception:
+        logger.warning("Failed to detach trainer before export; continuing anyway", exc_info=True)
 
 
 def _release_memory() -> None:
