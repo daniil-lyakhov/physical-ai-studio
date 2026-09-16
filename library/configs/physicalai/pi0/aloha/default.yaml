@@ -1,7 +1,7 @@
 # Pi0 Policy Training Configuration
 #
 # Usage:
-#   physicalai fit --config configs/physicalai/pi0.yaml
+#   physicalai fit --config configs/physicalai/pi0/aloha/default.yaml
 
 model:
   class_path: physicalai.policies.Pi0

@@ -19,7 +19,7 @@
 # The vision tower (SigLIP backbone) is still left frozen by default.
 #
 # Usage:
-#   physicalai fit --config configs/physicalai/pi05_lora.yaml
+#   physicalai fit --config configs/physicalai/pi05/aloha/lora.yaml
 
 model:
   class_path: physicalai.policies.Pi05

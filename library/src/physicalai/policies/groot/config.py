@@ -11,9 +11,9 @@ The configuration inherits from the base `Config` class, enabling:
 - Checkpoint compatibility with weights_only=True
 - jsonargparse integration for CLI usage
 
-For CLI usage, use the YAML config in `configs/groot/groot.yaml`:
+For CLI usage, use the YAML config in `configs/physicalai/groot/aloha/default.yaml`:
 
-    physicalai fit --config configs/physicalai/groot.yaml
+    physicalai fit --config configs/physicalai/groot/aloha/default.yaml
 
 Example (API):
     >>> from physicalai.policies.groot import GrootConfig

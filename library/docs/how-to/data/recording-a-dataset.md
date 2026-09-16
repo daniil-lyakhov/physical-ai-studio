@@ -178,10 +178,10 @@ total_steps      = epochs * steps_per_epoch
 
 ```bash
 # Train with a policy config, overriding epochs directly
-physicalai fit --config configs/physicalai/pi05.yaml --trainer.max_epochs 10
+physicalai fit --config configs/physicalai/pi05/aloha/default.yaml --trainer.max_epochs 10
 
 # Or specify a raw step budget instead
-physicalai fit --config configs/physicalai/act.yaml --trainer.max_steps 40000
+physicalai fit --config configs/physicalai/act/pusht/default.yaml --trainer.max_steps 40000
 ```
 
 See [CLI Training](../training/cli.md) for the full set of override flags

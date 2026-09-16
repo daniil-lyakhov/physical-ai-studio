@@ -52,10 +52,10 @@ phase boundary and rebuilds the optimizer over the now-trainable parameters. No
 checkpoint handoff, no second command.
 
 A complete worked config ships at
-[`configs/physicalai/pi05_finetune_and_snapflow_distillation.yaml`](../../../configs/physicalai/pi05_finetune_and_snapflow_distillation.yaml):
+[`configs/physicalai/pi05/so101/snapflow.yaml`](../../../configs/physicalai/pi05/so101/snapflow.yaml):
 
 ```bash
-physicalai fit --config configs/physicalai/pi05_finetune_and_snapflow_distillation.yaml
+physicalai fit --config configs/physicalai/pi05/so101/snapflow.yaml
 ```
 
 The parts that matter:
@@ -212,15 +212,15 @@ Exactly one of the two must be set:
 
 ```bash
 # Smoke-test the wiring without training anything
-physicalai fit --config configs/physicalai/pi05_finetune_and_snapflow_distillation.yaml \
+physicalai fit --config configs/physicalai/pi05/so101/snapflow.yaml \
     --trainer.fast_dev_run 1
 
 # Smaller GPU
-physicalai fit --config configs/physicalai/pi05_finetune_and_snapflow_distillation.yaml \
+physicalai fit --config configs/physicalai/pi05/so101/snapflow.yaml \
     --data.train_batch_size 8 --trainer.accumulate_grad_batches 2
 
 # Longer total budget
-physicalai fit --config configs/physicalai/pi05_finetune_and_snapflow_distillation.yaml \
+physicalai fit --config configs/physicalai/pi05/so101/snapflow.yaml \
     --trainer.max_epochs 20
 ```
 
@@ -246,18 +246,18 @@ job). Note that `--fit.ckpt_path` is a full Lightning resume, so this does
 
 ```bash
 # Phase 1 — standard flow-matching training
-physicalai fit --config configs/physicalai/pi05.yaml
+physicalai fit --config configs/physicalai/pi05/aloha/default.yaml
 
 # Phase 2 — SnapFlow distillation, VLM frozen, weights-only warm start from phase 1
 physicalai fit \
-    --config configs/physicalai/pi05_snapflow_distillation.yaml \
+    --config configs/physicalai/pi05/aloha/snapflow.yaml \
     --weights_from ./experiments/lightning_logs/version_0/checkpoints/last.ckpt
 ```
 
 Substitute `pi05` with `smolvla` for the SmolVLA policy. Phase-2 templates:
 
-- `configs/physicalai/pi05_snapflow_distillation.yaml`
-- `configs/physicalai/smolvla_snapflow_distillation.yaml`
+- `configs/physicalai/pi05/aloha/snapflow.yaml`
+- `configs/physicalai/smolvla/pusht/snapflow.yaml`
 
 Both set `snapflow_enabled: true`, `train_expert_only: true`, and the paper
 defaults (`snapflow_alpha: 0.5`, `snapflow_lambda: 0.1`,

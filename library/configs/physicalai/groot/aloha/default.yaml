@@ -6,15 +6,15 @@
 # Default settings optimized for 24GB GPUs (RTX 3090, RTX 4090).
 #
 # Usage:
-#   physicalai fit --config configs/physicalai/groot.yaml
+#   physicalai fit --config configs/physicalai/groot/aloha/default.yaml
 #
 # Override examples:
 #   # Intel XPU
-#   physicalai fit --config configs/physicalai/groot.yaml \
+#   physicalai fit --config configs/physicalai/groot/aloha/default.yaml \
 #       --trainer.accelerator xpu
 #
 #   # Change dataset
-#   physicalai fit --config configs/physicalai/groot.yaml \
+#   physicalai fit --config configs/physicalai/groot/aloha/default.yaml \
 #       --data.repo_id lerobot/pusht
 #
 # =============================================================================
@@ -159,11 +159,11 @@ trainer:
 # Default config is optimized for 24GB GPUs.
 #
 # Intel XPU:
-#   physicalai fit --config configs/physicalai/groot.yaml \
+#   physicalai fit --config configs/physicalai/groot/aloha/default.yaml \
 #       --trainer.accelerator xpu
 #
 # 48GB GPU - enable DiT fine-tuning:
-#   physicalai fit --config configs/physicalai/groot.yaml \
+#   physicalai fit --config configs/physicalai/groot/aloha/default.yaml \
 #       --model.tune_diffusion_model true \
 #       --data.train_batch_size 2 \
 #       --trainer.accumulate_grad_batches 8

@@ -7,7 +7,7 @@ This module provides dataclass configurations for the Pi05 flow matching
 vision-language-action model.
 
 Example (CLI):
-    physicalai fit --config configs/physicalai/pi05.yaml
+    physicalai fit --config configs/physicalai/pi05/aloha/default.yaml
 
 Example (API):
     >>> from physicalai.policies.pi05 import Pi05Config

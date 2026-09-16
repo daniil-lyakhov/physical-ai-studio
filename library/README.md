@@ -108,7 +108,7 @@ trainer.fit(model=model, datamodule=datamodule)
 
 ```bash
 # Train with config file
-physicalai fit --config configs/physicalai/act.yaml
+physicalai fit --config configs/physicalai/act/pusht/default.yaml
 
 # Train with CLI arguments
 physicalai fit \
@@ -118,7 +118,7 @@ physicalai fit \
 
 # Override config values
 physicalai fit \
-    --config configs/physicalai/act.yaml \
+    --config configs/physicalai/act/pusht/default.yaml \
     --trainer.max_epochs 200 \
     --data.train_batch_size 64
 ```

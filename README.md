@@ -187,7 +187,7 @@ while not done:
 
 ```bash
 # Train
-physicalai fit --config configs/physicalai/act.yaml
+physicalai fit --config configs/physicalai/act/pusht/default.yaml
 
 # Evaluate
 physicalai benchmark --config configs/benchmark/libero.yaml --ckpt_path model.ckpt

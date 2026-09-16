@@ -10,7 +10,7 @@
 #                          (~10% of parameters) toward 1-NFE inference.
 #
 # Run:
-#   physicalai fit --config configs/physicalai/pi05_finetune_and_snapflow_distillation.yaml
+#   physicalai fit --config configs/physicalai/pi05/so101/snapflow.yaml
 #
 # Handy overrides:
 #   --data.train_batch_size 8                       # if you hit OOM

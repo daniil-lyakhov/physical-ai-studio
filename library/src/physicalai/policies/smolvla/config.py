@@ -5,8 +5,9 @@
 
 This module provides dataclass configurations for the SmolVLA flow matching
 vision-language-action model.
-For CLI usage, use the YAML config in `configs/physicalai/smolvla.yaml`:
-    physicalai fit --config configs/physicalai/smolvla.yaml
+For CLI usage, use the YAML config in
+`configs/physicalai/smolvla/pusht/default.yaml`:
+    physicalai fit --config configs/physicalai/smolvla/pusht/default.yaml
 The YAML config is set up for minimum hardware (~8GB VRAM) with clear
 comments on how to adjust for different GPU sizes.
 Example (API):

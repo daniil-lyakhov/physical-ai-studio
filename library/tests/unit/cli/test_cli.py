@@ -42,7 +42,7 @@ def _library_root() -> Path:
 
 
 def _act_config_path() -> Path:
-    return _library_root() / "configs" / "physicalai" / "act.yaml"
+    return _library_root() / "configs" / "physicalai" / "act" / "pusht" / "default.yaml"
 
 
 def _libero_config_path() -> Path:
@@ -50,7 +50,7 @@ def _libero_config_path() -> Path:
 
 
 def _pi05_snapflow_config_path() -> Path:
-    return _library_root() / "configs" / "physicalai" / "pi05_snapflow_distillation.yaml"
+    return _library_root() / "configs" / "physicalai" / "pi05" / "aloha" / "snapflow.yaml"
 
 
 class TestRegister:
