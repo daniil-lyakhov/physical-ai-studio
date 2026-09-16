@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import logging
-import pickle  # noqa: S403  # only referenced for pickle.UnpicklingError in except; never used to deserialize
+
+# Only referenced for pickle.UnpicklingError in an except clause; never used to deserialize.
+import pickle  # noqa: S403  # nosec B403
 from pathlib import Path
 from typing import TYPE_CHECKING
 

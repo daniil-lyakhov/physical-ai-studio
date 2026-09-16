@@ -457,9 +457,10 @@ class XR0Model(Model):
         prefix_length = self._normalize_prefix_length(prefix_length, action_length)
 
         if self.training:
+            # Training-time augmentation sampling only; not security-sensitive.
             prefix_length = 0
-            if self.async_train and random.random() < _ASYNC_PREFIX_PROB:  # noqa: S311
-                prefix_length = random.randint(1, min(6, action_length))  # noqa: S311
+            if self.async_train and random.random() < _ASYNC_PREFIX_PROB:  # noqa: S311  # nosec B311
+                prefix_length = random.randint(1, min(6, action_length))  # noqa: S311  # nosec B311
         prefix = action[:, :prefix_length]
 
         # Continue the VLM MRoPE sequence into the DiT tokens.
