@@ -27,8 +27,9 @@ IMAGE_TOKEN_ID = 151
 VIDEO_TOKEN_ID = 152
 VISION_START_TOKEN_ID = 150
 
-# One image: grid (t, h, w) -> (t*h*w) / merge**2 merged image tokens.
-IMAGE_GRID = (2, 4, 4)
+# One image: grid (t, h, w) -> (t*h*w) / merge**2 merged image tokens. The
+# Qwen3-VL processor always emits ``grid_t == 1`` for images.
+IMAGE_GRID = (1, 4, 4)
 SPATIAL_MERGE = 2
 PATCH_SIZE = 16
 TEMPORAL_PATCH_SIZE = 2
@@ -80,9 +81,9 @@ def _config() -> Qwen3VLConfig:
 # holds the temporal/height/width grid before text resumes.
 REFERENCE_POSITION_IDS = torch.tensor(
     [
-        [[0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 5, 6, 7]],
-        [[0, 1, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 6, 7]],
-        [[0, 1, 2, 3, 4, 3, 4, 3, 4, 3, 4, 5, 6, 7]],
+        [[0, 1, 2, 3, 3, 3, 3, 5, 6, 7]],
+        [[0, 1, 2, 3, 3, 4, 4, 5, 6, 7]],
+        [[0, 1, 2, 3, 4, 3, 4, 5, 6, 7]],
     ]
 )
 

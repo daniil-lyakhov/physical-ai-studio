@@ -25,7 +25,8 @@ from physicalai.policies.xr0.qwen3_vlm import XR0Qwen3VL
 IMAGE_TOKEN_ID = 151
 VIDEO_TOKEN_ID = 152
 VISION_START_TOKEN_ID = 150
-IMAGE_GRID = (2, 4, 4)
+# Still image: the Qwen3-VL processor always emits ``grid_t == 1`` for images.
+IMAGE_GRID = (1, 4, 4)
 SPATIAL_MERGE = 2
 N_IMAGE_TOKENS = (IMAGE_GRID[0] * IMAGE_GRID[1] * IMAGE_GRID[2]) // SPATIAL_MERGE**2
 
@@ -418,19 +419,23 @@ class TestRun:
     _TRAIN_SEED = 0
 
     # Fill from a trusted run.
-    _LOSS_REF = {"loss": 0.8410, "loss_mse": 1.6821, "loss_freq": 0.0}
+    _LOSS_REF = {"loss": 1.3814, "loss_mse": 2.7627, "loss_freq": 0.0}
 
     @pytest.mark.parametrize(
         "expected_action",
         # Fill from a trusted run.
-        [torch.tensor([[[ 0.0448, -0.6232,  0.6625, -1.5139, -0.2641,  1.2134, -0.2071,
-          -0.4787],
-         [ 0.2335,  0.8937, -0.7311, -0.6636, -0.2807, -1.6301,  0.5070,
-          -0.6718],
-         [ 1.0003, -0.0866, -0.0545, -2.2477, -0.2620,  1.2205, -0.6802,
-          -0.6978],
-         [ 0.1304, -1.6699,  0.4045,  0.0757, -1.5303,  0.7214, -0.5941,
-           1.3126]]])],
+        [
+            torch.tensor(
+                [
+                    [
+                        [-0.0303, -0.5551, 0.6183, -1.5316, -0.2355, 1.2756, -0.2093, -0.4844],
+                        [0.2297, 0.8901, -0.7395, -0.6601, -0.2797, -1.6343, 0.5094, -0.6606],
+                        [0.9797, -0.0669, -0.0731, -2.2343, -0.2521, 1.2262, -0.6808, -0.7015],
+                        [0.1285, -1.6674, 0.4005, 0.0770, -1.5267, 0.7201, -0.5919, 1.3120],
+                    ]
+                ]
+            )
+        ],
     )
     def test_eval_returns_reference_action(self, model: XR0Model, expected_action: torch.Tensor) -> None:
         model.eval()
@@ -465,7 +470,7 @@ class TestRun:
 
     @pytest.mark.parametrize(
         "expected_loss",
-        [3.0285],
+        [4.0486],
     )
     def test_training_freq_term_active(self, model: XR0Model, expected_loss: float) -> None:
         # freq_coefficient > 0 adds the frequency-domain term to the total loss.
