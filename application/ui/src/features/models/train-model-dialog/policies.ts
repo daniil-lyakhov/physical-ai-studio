@@ -37,4 +37,10 @@ export const MODELS: ReadonlyArray<{
         description: 'Enhanced Pi0 with discrete state encoding and longer context',
         minVRAM: 40 * GB,
     },
+    {
+        id: 'xr0',
+        name: 'XR0',
+        description: 'Vision-Language-Action model with a Qwen3-VL backbone and flow-matching action expert',
+        minVRAM: 60 * GB,
+    },
 ];
