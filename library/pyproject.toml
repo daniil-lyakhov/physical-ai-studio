@@ -104,6 +104,14 @@ smolvla = [
     "safetensors>=0.4.3,<1.0.0",
 ]
 
+# MolmoAct2
+# Supports LoRA fine-tuning for efficient adaptation
+molmoact2 = [
+    "transformers>=5.15.1,<5.16.0",
+    "peft>=0.13.0,<1.0.0",
+    "safetensors>=0.4.3,<1.0.0",
+]
+
 # RLWRLD RLDX-1
 rldx1 = [
     "transformers>=5.15.1,<5.16.0",
@@ -137,6 +145,7 @@ policies = [
     "physicalai-train[pi05]",
     "physicalai-train[groot]",
     "physicalai-train[smolvla]",
+    "physicalai-train[molmoact2]",
     "physicalai-train[rldx1]",
     "physicalai-train[xr0]",
 ]
@@ -177,6 +186,7 @@ dev = [
     "pyrefly>=0.18.0",
     "ruff>=0.14.14",
     "diffusers>=0.38.0",
+    "peft>=0.13.0,<1.0.0",
 ]
 
 
@@ -228,7 +238,7 @@ explicit = false
 
 # PyTorch sources configuration
 [tool.uv.sources]
-physicalai = { git = "https://github.com/openvinotoolkit/physicalai.git", rev = "a3f522f9554034d2d35e97bd2b0f72feae8b3067" }
+physicalai = { git = "https://github.com/openvinotoolkit/physicalai.git", rev = "de49e1fda4e38e0a5342b0a59a4cad11a1ee8de0" }
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "cu128" },
