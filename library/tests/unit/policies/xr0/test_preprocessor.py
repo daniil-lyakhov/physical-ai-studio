@@ -24,11 +24,11 @@ from physicalai.policies.xr0.preprocessor import (
     ACTION_EPS,
     XR0Postprocessor,
     XR0Preprocessor,
-    resize_image,
+    _resize_batch,
     normalize_action,
     denormalize_action,
     make_xr0_preprocessors,
-    view_title,
+    _view_title,
 )
 
 STATE_DIM = 8
@@ -124,15 +124,15 @@ class TestViewTitle:
     """Human-readable camera-view titles embedded in the chat prompt."""
 
     def test_known_views_use_reference_titles(self) -> None:
-        assert view_title("base") == "Base"
-        assert view_title("wrist_left") == "Left-Wrist"
-        assert view_title("wrist_right") == "Right-Wrist"
+        assert _view_title("base") == "Base"
+        assert _view_title("wrist_left") == "Left-Wrist"
+        assert _view_title("wrist_right") == "Right-Wrist"
 
     def test_hyphenated_key_is_normalized(self) -> None:
-        assert view_title("wrist-left") == "Left-Wrist"
+        assert _view_title("wrist-left") == "Left-Wrist"
 
     def test_unknown_view_falls_back_to_capitalized_join(self) -> None:
-        assert view_title("front_cam") == "Front Cam"
+        assert _view_title("front_cam") == "Front Cam"
 
 class TestNumpyActionNormalization:
     """Action normalize/denormalize round-trip."""
@@ -151,11 +151,21 @@ class TestResizeImage:
     """VLM image resize keeps factor alignment within the pixel budget."""
 
     def test_factor_aligned_within_budget(self):
-        img = Image.fromarray(np.zeros((200, 300, 3), dtype=np.uint8))
-        out = resize_image(img, factor=32, min_pixels=1024, max_pixels=90000)
-        w, h = out.size
+        images = torch.zeros(2, 3, 200, 300, dtype=torch.uint8)
+        out = _resize_batch(images, factor=32, max_pixels=90000)
+        b, c, h, w = out.shape
+        assert (b, c) == (2, 3)
+        assert out.dtype == torch.uint8
         assert w % 32 == 0 and h % 32 == 0
         assert w * h <= 90000
+
+    def test_channels_last_and_float_input(self):
+        # (B, H, W, C) float images in [0, 1] are permuted and rescaled to uint8.
+        images = torch.ones(1, 64, 64, 3)
+        out = _resize_batch(images, factor=32, max_pixels=90000)
+        assert out.shape == (1, 3, 64, 64)
+        assert out.dtype == torch.uint8
+        assert int(out.max()) == 255
 
 
 class TestExtractViewImages:
@@ -168,12 +178,12 @@ class TestExtractViewImages:
             "images.wrist_left": torch.ones(1, 3, 32, 32),
         }
         views, images = pre._extract_view_images(batch)  # noqa: SLF001
-        grid = torch.stack([torch.from_numpy(np.asarray(img)) for img in images[0]])
+        grid = torch.stack(images[0])
 
         # base -> 0, wrist_left -> 255 (rescaled uint8), each 32x32 RGB, in view order.
         expected = torch.stack([
-            torch.zeros(32, 32, 3, dtype=torch.uint8),
-            torch.full((32, 32, 3), 255, dtype=torch.uint8),
+            torch.zeros(3, 32, 32, dtype=torch.uint8),
+            torch.full((3, 32, 32), 255, dtype=torch.uint8),
         ])
         assert views == ["base", "wrist_left"]
         assert len(images) == 1  # one sample
@@ -192,8 +202,8 @@ class TestExtractViewImages:
         sample = images[0]
         # First image is wrist_left (255), second is base (0).
         assert views == ["wrist_left", "base"]
-        assert np.asarray(sample[0]).max() == 255
-        assert np.asarray(sample[1]).max() == 0
+        assert int(sample[0].max()) == 255
+        assert int(sample[1].max()) == 0
 
 
 class TestPrepareAction:

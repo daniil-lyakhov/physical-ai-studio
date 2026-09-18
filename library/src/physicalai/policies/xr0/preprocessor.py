@@ -8,9 +8,9 @@
 * **Prompt & vision** -- a Qwen3-VL multi-view chat prompt is assembled (one
   ``<|vision_start|><|image_pad|><|vision_end|>`` block per camera view present
   in the observation) and tokenized with the stock ``Qwen3VLProcessor`` (via
-  ``AutoProcessor``) Images are resized with
-  :func:`resize_image` and passed
-  to the processor with ``do_resize=False``.
+  ``AutoProcessor``) Images are resized with :func:`_resize_batch` -- a batched
+  ``torch.nn.functional.interpolate`` that runs on the observation's device --
+  and passed to the processor as ``uint8`` tensors with ``do_resize=False``.
 * **State** -- padded into the 32-dim bimanual layout and shaped ``(B, 1, D)``,
   matching the source ``state.view(1, 1, -1)``.
 * **Action** -- normalized with the source ``normalize_action`` mean/std
@@ -28,10 +28,8 @@ import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from PIL import Image
 
 from physicalai.data import Feature, FeatureType
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Observation
@@ -47,6 +45,7 @@ STATE_DIM = 32
 ACTION_EPS = 1e-6
 _TEMPORAL_STATE_NDIM = 3
 _TEMPORAL_IMAGE_NDIM = 5
+_BATCHED_IMAGE_NDIM = 4
 _BATCHED_ACTION_NDIM = 2
 
 # Pinned commit SHA for the default Qwen3-VL processor download. A concrete
@@ -74,7 +73,7 @@ _VIEW_TITLES = {
 }
 
 
-def view_title(view: str) -> str:
+def _view_title(view: str) -> str:
     """Human-readable view title matching the reference prompt.
 
     Known views use the reference eval's exact titles (e.g. ``"wrist_left"`` ->
@@ -89,42 +88,44 @@ def view_title(view: str) -> str:
     return " ".join(word.capitalize() for word in key.split("_"))
 
 
-def _to_pil(image: torch.Tensor) -> Image.Image:
-    """Convert a single ``(C, H, W)`` or ``(H, W, C)`` image tensor to a PIL image.
+def _to_chw_float(images: torch.Tensor) -> torch.Tensor:
+    """Normalize a batched image tensor to ``(B, 3, H, W)`` float in ``[0, 255]``.
+
+    Channels-last input is permuted, single-channel input is expanded to RGB and
+    floating-point input is assumed to be in ``[0, 1]``. The device is preserved
+    so the subsequent resize stays where the observation already lives.
 
     Returns:
-        The image as a PIL ``Image``.
+        A ``(B, 3, H, W)`` float tensor with values in ``[0, 255]``.
+
+    Raises:
+        ValueError: If ``images`` is not a 4D batched image tensor.
     """
-    array = image.detach().cpu()
-    if array.ndim == _TEMPORAL_STATE_NDIM and array.shape[0] in {1, 3}:  # channels-first
-        array = array.permute(1, 2, 0)
-    np_img = array.numpy()
-    if np_img.dtype != np.uint8:
-        np_img = np.clip(np_img, 0.0, 1.0) * 255.0
-        np_img = np_img.round().astype(np.uint8)
-    if np_img.shape[-1] == 1:
-        np_img = np.repeat(np_img, 3, axis=-1)
-    return Image.fromarray(np_img)
+    if images.ndim != _BATCHED_IMAGE_NDIM:
+        msg = f"expected a batched (B, C, H, W) or (B, H, W, C) image tensor, got shape {tuple(images.shape)}"
+        raise ValueError(msg)
+    images = images.detach()
+    if images.shape[1] not in {1, 3} and images.shape[-1] in {1, 3}:  # channels-last
+        images = images.permute(0, 3, 1, 2)
+    images = images.float() if images.dtype == torch.uint8 else images.float().clamp(0.0, 1.0) * 255.0
+    if images.shape[1] == 1:
+        images = images.expand(-1, 3, -1, -1)
+    return images
 
 
-def resize_image(
-    image: Image.Image,
-    factor: int = 32,
-    min_pixels: int = 32 * 32,
-    max_pixels: int = 90000,
-) -> Image.Image:
-    """Resize a PIL image to patch-aligned dimensions within an area budget.
+def _target_size(height: int, width: int, factor: int, max_pixels: int) -> tuple[int, int]:
+    """Compute the patch-aligned ``(height, width)`` within the area budget.
 
-    Both sides are rounded to multiples of ``factor`` and the area is kept within
-    ``[min_pixels, max_pixels]``, preserving aspect ratio for the VLM vision encoder.
+    Both sides are rounded up to a multiple of ``factor`` (so the area is never
+    below ``factor ** 2``, i.e. one merged vision patch) and the total area is
+    capped at ``max_pixels``, preserving aspect ratio for the VLM vision encoder.
 
     Returns:
-        The resized PIL image.
+        The target ``(height, width)``.
 
     Raises:
         ValueError: If the image aspect ratio exceeds ``_MAX_ASPECT_RATIO``.
     """
-    width, height = image.size
     ratio = max(height, width) / min(height, width)
     if ratio > _MAX_ASPECT_RATIO:
         msg = f"absolute aspect ratio must be smaller than 200, got {ratio}"
@@ -137,12 +138,33 @@ def resize_image(
         scale = math.sqrt(height * width / max_pixels)
         new_height = max(factor, math.floor(height / scale / factor) * factor)
         new_width = max(factor, math.floor(width / scale / factor) * factor)
-    elif new_height * new_width < min_pixels:
-        scale = math.sqrt(min_pixels / (height * width))
-        new_height = max(factor, math.ceil(height * scale / factor) * factor)
-        new_width = max(factor, math.ceil(width * scale / factor) * factor)
 
-    return image.resize((new_width, new_height))
+    return new_height, new_width
+
+
+def _resize_batch(images: torch.Tensor, factor: int, max_pixels: int) -> torch.Tensor:
+    """Resize a batch of images to patch-aligned dimensions within an area budget.
+
+    The whole ``(B, C, H, W)`` view is resized in a single
+    ``torch.nn.functional.interpolate`` call on the input device, so large
+    training batches never round-trip through per-image CPU resizing. ``bicubic``
+    + ``antialias`` matches PIL's default ``Image.resize`` filter.
+
+    Returns:
+        A ``(B, 3, new_height, new_width)`` ``uint8`` tensor on the input device.
+    """
+    images = _to_chw_float(images)
+    height, width = int(images.shape[-2]), int(images.shape[-1])
+    new_height, new_width = _target_size(height, width, factor, max_pixels)
+    if (new_height, new_width) != (height, width):
+        images = F.interpolate(
+            images,
+            size=(new_height, new_width),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+    return images.clamp(0.0, 255.0).round().to(torch.uint8)
 
 
 class XR0Preprocessor(torch.nn.Module):
@@ -158,8 +180,8 @@ class XR0Preprocessor(torch.nn.Module):
         features: Optional feature map (from dataset stats) used to normalize the
             action with the source mean/std convention. When ``None`` the action
             is passed through unnormalized.
-        image_factor: Patch-alignment factor for :func:`resize_image`.
-        image_max_pixels: Maximum image area for :func:`resize_image`.
+        image_factor: Patch-alignment factor for :func:`_resize_batch`.
+        image_max_pixels: Maximum image area for :func:`_resize_batch`.
         processor_name: HuggingFace id of the Qwen3-VL processor.
         max_token_len: Fixed prompt length the OpenVINO tokenizer pads to at export
             (matches the graph's baked ``tokenizer_max_length``).
@@ -313,7 +335,7 @@ class XR0Preprocessor(torch.nn.Module):
     def _build_message(
         instruction: str,
         views: list[str],
-        images: list[Image.Image],
+        images: Sequence[torch.Tensor],
     ) -> list[dict[str, Any]]:
         """Assemble the Qwen3-VL multi-view chat message for one sample.
 
@@ -323,7 +345,7 @@ class XR0Preprocessor(torch.nn.Module):
         content: list[dict[str, Any]] = [{"type": "text", "text": _MULTI_VIEW_HEADER}]
         for view, image in zip(views, images, strict=False):
             content.extend((
-                {"type": "text", "text": f"# {view_title(view)} View\n"},
+                {"type": "text", "text": f"# {_view_title(view)} View\n"},
                 {"type": "image", "image": image},
                 {"type": "text", "text": "\n"},
             ))
@@ -333,12 +355,12 @@ class XR0Preprocessor(torch.nn.Module):
             {"role": "assistant", "content": [{"type": "text", "text": _ASSISTANT_PRIMER}]},
         ]
 
-    def _extract_view_images(self, batch: dict[str, Any]) -> tuple[list[str], list[list[Image.Image]]]:
-        """Return the ordered view names and, per sample, the resized PIL images.
+    def _extract_view_images(self, batch: dict[str, Any]) -> tuple[list[str], list[list[torch.Tensor]]]:
+        """Return the ordered view names and, per sample, the resized images.
 
         Returns:
             A ``(views, images)`` tuple: the ordered view names and, per sample,
-            the list of resized PIL images (one per view).
+            the list of resized ``(3, H, W)`` ``uint8`` tensors (one per view).
 
         Raises:
             ValueError: If the batch contains no image observation.
@@ -354,16 +376,19 @@ class XR0Preprocessor(torch.nn.Module):
             tensor = batch[key]
             if tensor.ndim == _TEMPORAL_IMAGE_NDIM:  # (B, T, C, H, W) -> last frame
                 tensor = tensor[:, -1]
-            per_view.append(tensor)
+            # One batched resize per view, on the observation's device. The tensors
+            # stay there: the Qwen-VL image processor is torchvision-backed, so its
+            # rescale / normalize / patchify run on the same device.
+            per_view.append(
+                _resize_batch(
+                    tensor,
+                    factor=self.image_factor,
+                    max_pixels=self.image_max_pixels,
+                ),
+            )
 
         batch_size = per_view[0].shape[0]
-        images: list[list[Image.Image]] = []
-        for sample in range(batch_size):
-            sample_images = [
-                resize_image(_to_pil(view[sample]), factor=self.image_factor, max_pixels=self.image_max_pixels)
-                for view in per_view
-            ]
-            images.append(sample_images)
+        images = [[view[sample] for view in per_view] for sample in range(batch_size)]
         return views, images
 
     def _prepare_state(self, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
