@@ -167,6 +167,24 @@ def _resize_batch(images: torch.Tensor, factor: int, max_pixels: int) -> torch.T
     return images.clamp(0.0, 255.0).round().to(torch.uint8)
 
 
+def _normalize_action(action: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """Standardize ``action`` to zero-mean/unit-scale using ``(action - mean) / (std + eps)``.
+
+    Returns:
+        The normalized action array.
+    """
+    return (action - mean) / (std + ACTION_EPS)
+
+
+def _denormalize_action(action: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    """Invert :func:`normalize_action`, mapping a normalized action back to raw units.
+
+    Returns:
+        The denormalized action array.
+    """
+    return action * (std + ACTION_EPS) + mean
+
+
 class XR0Preprocessor(torch.nn.Module):
     """Transform framework observations into the XR0 model batch.
 
@@ -405,7 +423,7 @@ class XR0Preprocessor(torch.nn.Module):
         if self.normalize_state:
             mean = self.state_mean.to(state.device)
             std = self.state_std.to(state.device)
-            state = normalize_action(state, mean, std)
+            state = _normalize_action(state, mean, std)
         return state.unsqueeze(1).to(device)
 
     def _prepare_action(
@@ -445,7 +463,7 @@ class XR0Preprocessor(torch.nn.Module):
                 action -= current
         real_dim = min(action.shape[-1], self.max_action_dim)
         action = F.pad(action, (0, max(0, self.max_action_dim - action.shape[-1])))[..., : self.max_action_dim]
-        action = normalize_action(action, self.action_mean, self.action_std)
+        action = _normalize_action(action, self.action_mean, self.action_std)
 
         mask = torch.zeros_like(action, dtype=torch.int32)
         mask[..., :real_dim] = 1
@@ -575,7 +593,7 @@ class XR0Postprocessor(torch.nn.Module):
             action = batch[ACTION].to(torch.float32)
             mean = self.action_mean.to(action.device)
             std = self.action_std.to(action.device)
-            action = denormalize_action(action, mean, std)
+            action = _denormalize_action(action, mean, std)
             if self.action_mode == "delta":
                 state = batch.get(STATE)
                 if state is None:
@@ -684,21 +702,3 @@ def make_xr0_preprocessors(
         action_std=override_std,
     )
     return preprocessor, postprocessor
-
-
-def normalize_action(action: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    """Standardize ``action`` to zero-mean/unit-scale using ``(action - mean) / (std + eps)``.
-
-    Returns:
-        The normalized action array.
-    """
-    return (action - mean) / (std + ACTION_EPS)
-
-
-def denormalize_action(action: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    """Invert :func:`normalize_action`, mapping a normalized action back to raw units.
-
-    Returns:
-        The denormalized action array.
-    """
-    return action * (std + ACTION_EPS) + mean

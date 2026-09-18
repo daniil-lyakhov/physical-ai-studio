@@ -25,8 +25,8 @@ from physicalai.policies.xr0.preprocessor import (
     XR0Postprocessor,
     XR0Preprocessor,
     _resize_batch,
-    normalize_action,
-    denormalize_action,
+    _normalize_action,
+    _denormalize_action,
     make_xr0_preprocessors,
     _view_title,
 )
@@ -142,8 +142,8 @@ class TestNumpyActionNormalization:
         action = rng.standard_normal((4, ACTION_DIM)).astype(np.float32)
         mean = rng.standard_normal((4, ACTION_DIM)).astype(np.float32)
         std = np.abs(rng.standard_normal((4, ACTION_DIM)).astype(np.float32)) + 0.1
-        normalized = normalize_action(action, mean, std)
-        roundtrip = denormalize_action(normalized, mean, std)
+        normalized = _normalize_action(action, mean, std)
+        roundtrip = _denormalize_action(normalized, mean, std)
         np.testing.assert_allclose(roundtrip, action, atol=1e-5, rtol=1e-5)
 
 
