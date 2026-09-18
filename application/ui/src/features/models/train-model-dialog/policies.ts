@@ -40,7 +40,7 @@ export const MODELS: ReadonlyArray<{
     {
         id: 'xr0',
         name: 'XR0',
-        description: 'Xiaomi-Robotics-0 Vision-Language-Action model with a Qwen3-VL backbone and flow-matching action expert',
+        description: 'Xiaomi-Robotics-0 Vision-Language-Action model with a Qwen3-VL backbone and flow-matching action expert (Apache 2.0 license)',
         minVRAM: 60 * GB,
     },
 ];
