@@ -44,15 +44,7 @@ class ExportBackend(StrEnum):
 
 @dataclass
 class ExportParameters:
-    """Parameters for exporting a model.
-
-    Attributes:
-        exporter_kwargs: Extra keyword arguments forwarded to the backend exporter.
-        preprocessors_specs: Component specs describing the inference preprocessors
-            to record in the manifest.
-        postprocessors_specs: Component specs describing the inference postprocessors
-            to record in the manifest.
-    """
+    """Parameters for exporting a model."""
 
     exporter_kwargs: dict = field(default_factory=dict)
     preprocessors_specs: list = field(default_factory=list)
@@ -61,30 +53,14 @@ class ExportParameters:
 
 @dataclass
 class ONNXExportParameters(ExportParameters):
-    """Parameters specific to ONNX export.
-
-    Attributes:
-        export_tokenizer: When ``True``, request tokenizer export. Not supported for
-            the ONNX backend; setting it raises at export time.
-    """
+    """Parameters specific to ONNX export."""
 
     export_tokenizer: bool = False
 
 
 @dataclass
 class OpenVINOExportParameters(ExportParameters):
-    """Parameters specific to OpenVINO export.
-
-    Attributes:
-        export_tokenizer: When ``True``, convert the preprocessor's tokenizer to an
-            OpenVINO tokenizer and save it alongside the model as ``tokenizer.xml``.
-        outputs: Ordered names to assign to the converted model's output tensors.
-        compress_to_fp16: When ``True``, compress the saved model's floating-point
-            constants to FP16. When ``False``, weights are kept at their original
-            precision.
-        via_onnx: When ``True``, export to a temporary ONNX file first and convert
-            that to OpenVINO, instead of converting the torch model directly.
-    """
+    """Parameters specific to OpenVINO export."""
 
     export_tokenizer: bool = False
     inputs: list[str] = field(default_factory=list)
@@ -95,12 +71,7 @@ class OpenVINOExportParameters(ExportParameters):
 
 @dataclass
 class TorchExportParameters(ExportParameters):
-    """Parameters specific to torch export.
-
-    Attributes:
-        input_names: Names of the model inputs recorded in the manifest for inference.
-        output_names: Names of the model outputs recorded in the manifest for inference.
-    """
+    """Parameters specific to torch export."""
 
     input_names: list[str] = field(default_factory=lambda: ["observation"])
     output_names: list[str] = field(default_factory=lambda: ["action"])
