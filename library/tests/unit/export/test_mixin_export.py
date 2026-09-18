@@ -877,7 +877,7 @@ class TestPostExportHooks:
         output_path = tmp_path / "model.xml"
         wrapper.export(backend="openvino", output_path=output_path, post_export_hooks=[mock_hook])
 
-        mock_hook.assert_called_once_with(output_path)
+        mock_hook.assert_called_once_with(str(output_path))
 
     def test_export_invokes_multiple_hooks_in_order(self, tmp_path):
         """Test that multiple hooks are called in sequence."""
@@ -891,7 +891,7 @@ class TestPostExportHooks:
         output_path = tmp_path / "model.xml"
         wrapper.export(backend="openvino", output_path=output_path, post_export_hooks=[hook1, hook2])
 
-        expected_path = output_path
+        expected_path = str(output_path)
         assert call_order == [("hook1", expected_path), ("hook2", expected_path)]
 
     @pytest.mark.parametrize("backend", ["onnx", "openvino"])
@@ -905,7 +905,7 @@ class TestPostExportHooks:
         output_path = tmp_path / f"model{ext}"
         wrapper.export(backend=backend, output_path=output_path, post_export_hooks=[mock_hook])
 
-        mock_hook.assert_called_once_with(output_path)
+        mock_hook.assert_called_once_with(str(output_path))
 
     def test_export_no_hooks_does_not_fail(self, tmp_path):
         """Test that export works normally without hooks (regression)."""
