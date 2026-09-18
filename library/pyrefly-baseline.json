@@ -32,8 +32,8 @@
       "path": "src/physicalai/data/datamodules.py",
       "code": -2,
       "name": "unsupported-operation",
-      "description": "Cannot set item in `dict[Any, Tensor]`\n  Argument `list[Unknown]` is not assignable to parameter `value` with type `Tensor` in function `dict.__setitem__`",
-      "concise_description": "Cannot set item in `dict[Any, Tensor]`",
+      "description": "Cannot set item in `dict[Unknown, Tensor]`\n  Argument `list[Unknown]` is not assignable to parameter `value` with type `Tensor` in function `dict.__setitem__`",
+      "concise_description": "Cannot set item in `dict[Unknown, Tensor]`",
       "severity": "error"
     },
     {
@@ -277,18 +277,6 @@
       "severity": "error"
     },
     {
-      "line": 229,
-      "column": 16,
-      "stop_line": 235,
-      "stop_column": 10,
-      "path": "src/physicalai/eval/rollout/metric.py",
-      "code": -2,
-      "name": "bad-return",
-      "description": "Returned type `dict[str, Module | Tensor | Unknown]` is not assignable to declared return type `dict[str, Tensor]`",
-      "concise_description": "Returned type `dict[str, Module | Tensor | Unknown]` is not assignable to declared return type `dict[str, Tensor]`",
-      "severity": "error"
-    },
-    {
       "line": 615,
       "column": 13,
       "stop_line": 615,
@@ -296,7 +284,7 @@
       "path": "src/physicalai/export/mixin_policy.py",
       "code": -2,
       "name": "missing-import",
-      "description": "Cannot find module `executorch.exir`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "description": "Cannot find module `executorch.exir`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
       "concise_description": "Cannot find module `executorch.exir`",
       "severity": "error"
     },
@@ -308,7 +296,7 @@
       "path": "src/physicalai/export/mixin_policy.py",
       "code": -2,
       "name": "missing-import",
-      "description": "Cannot find module `executorch.backends.openvino.partitioner`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "description": "Cannot find module `executorch.backends.openvino.partitioner`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
       "concise_description": "Cannot find module `executorch.backends.openvino.partitioner`",
       "severity": "error"
     },
@@ -320,7 +308,7 @@
       "path": "src/physicalai/export/mixin_policy.py",
       "code": -2,
       "name": "missing-import",
-      "description": "Cannot find module `executorch.exir.backend.backend_details`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "description": "Cannot find module `executorch.exir.backend.backend_details`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
       "concise_description": "Cannot find module `executorch.exir.backend.backend_details`",
       "severity": "error"
     },
@@ -332,7 +320,7 @@
       "path": "src/physicalai/export/mixin_policy.py",
       "code": -2,
       "name": "missing-import",
-      "description": "Cannot find module `executorch.backends.xnnpack.partition.xnnpack_partitioner`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "description": "Cannot find module `executorch.backends.xnnpack.partition.xnnpack_partitioner`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
       "concise_description": "Cannot find module `executorch.backends.xnnpack.partition.xnnpack_partitioner`",
       "severity": "error"
     },
@@ -565,6 +553,66 @@
       "severity": "error"
     },
     {
+      "line": 79,
+      "column": 5,
+      "stop_line": 79,
+      "stop_column": 50,
+      "path": "src/physicalai/gyms/libero.py",
+      "code": -2,
+      "name": "missing-import",
+      "description": "Cannot find module `libero.libero.benchmark`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "concise_description": "Cannot find module `libero.libero.benchmark`",
+      "severity": "error"
+    },
+    {
+      "line": 88,
+      "column": 5,
+      "stop_line": 88,
+      "stop_column": 60,
+      "path": "src/physicalai/gyms/libero.py",
+      "code": -2,
+      "name": "missing-import",
+      "description": "Cannot find module `libero.libero`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "concise_description": "Cannot find module `libero.libero`",
+      "severity": "error"
+    },
+    {
+      "line": 89,
+      "column": 5,
+      "stop_line": 89,
+      "stop_column": 46,
+      "path": "src/physicalai/gyms/libero.py",
+      "code": -2,
+      "name": "missing-import",
+      "description": "Cannot find module `libero.libero`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "concise_description": "Cannot find module `libero.libero`",
+      "severity": "error"
+    },
+    {
+      "line": 90,
+      "column": 5,
+      "stop_line": 90,
+      "stop_column": 54,
+      "path": "src/physicalai/gyms/libero.py",
+      "code": -2,
+      "name": "missing-import",
+      "description": "Cannot find module `libero.libero.envs`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "concise_description": "Cannot find module `libero.libero.envs`",
+      "severity": "error"
+    },
+    {
+      "line": 91,
+      "column": 5,
+      "stop_line": 91,
+      "stop_column": 63,
+      "path": "src/physicalai/gyms/libero.py",
+      "code": -2,
+      "name": "missing-import",
+      "description": "Cannot find module `robosuite.utils.transform_utils`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "concise_description": "Cannot find module `robosuite.utils.transform_utils`",
+      "severity": "error"
+    },
+    {
       "line": 280,
       "column": 17,
       "stop_line": 280,
@@ -788,7 +836,7 @@
       "path": "src/physicalai/inference/adapters/executorch.py",
       "code": -2,
       "name": "missing-import",
-      "description": "Cannot find module `executorch.runtime`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
+      "description": "Cannot find module `executorch.runtime`\n  Looked in these locations (from config in `/home/dlyakhov/Projects/physical-ai-studio/library/pyproject.toml`):\n  Search path (from config file): [\"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]\n  Import root (inferred from project layout): \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"\n  Site package path queried from interpreter: [\"/home/dlyakhov/Projects/physical-ai-studio/library/.venv/lib/python3.12/site-packages\", \"/home/dlyakhov/Projects/physical-ai-studio/library/src\"]",
       "concise_description": "Cannot find module `executorch.runtime`",
       "severity": "error"
     },
@@ -949,174 +997,6 @@
       "severity": "error"
     },
     {
-      "line": 239,
-      "column": 25,
-      "stop_line": 239,
-      "stop_column": 38,
-      "path": "src/physicalai/policies/groot/components/action_head.py",
-      "code": -2,
-      "name": "bad-assignment",
-      "description": "`Identity` is not assignable to attribute `vlln` with type `LayerNorm`",
-      "concise_description": "`Identity` is not assignable to attribute `vlln` with type `LayerNorm`",
-      "severity": "error"
-    },
-    {
-      "line": 247,
-      "column": 39,
-      "stop_line": 247,
-      "stop_column": 43,
-      "path": "src/physicalai/policies/groot/components/action_head.py",
-      "code": -2,
-      "name": "bad-assignment",
-      "description": "`None` is not assignable to attribute `position_embedding` with type `Embedding`",
-      "concise_description": "`None` is not assignable to attribute `position_embedding` with type `Embedding`",
-      "severity": "error"
-    },
-    {
-      "line": 443,
-      "column": 16,
-      "stop_line": 443,
-      "stop_column": 54,
-      "path": "src/physicalai/policies/groot/model.py",
-      "code": -2,
-      "name": "bad-return",
-      "description": "Returned type `Tensor | None` is not assignable to declared return type `Tensor`\n  The declared type does not allow `None`. Consider narrowing the value with an `is not None` check or changing the declared type to `Tensor | None`.",
-      "concise_description": "Returned type `Tensor | None` is not assignable to declared return type `Tensor`",
-      "severity": "error"
-    },
-    {
-      "line": 204,
-      "column": 14,
-      "stop_line": 204,
-      "stop_column": 19,
-      "path": "src/physicalai/policies/groot/policy.py",
-      "code": -2,
-      "name": "bad-override-mutable-attribute",
-      "description": "Class member `Groot.model` overrides parent class `ExportablePolicyMixin` in an inconsistent manner\n  `Groot.model` has type `GrootModel | None`, which is not consistent with `Module` in `ExportablePolicyMixin.model` (the type of read-write attributes cannot be changed)",
-      "concise_description": "Class member `Groot.model` overrides parent class `ExportablePolicyMixin` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "line": 204,
-      "column": 14,
-      "stop_line": 204,
-      "stop_column": 19,
-      "path": "src/physicalai/policies/groot/policy.py",
-      "code": -2,
-      "name": "bad-override-mutable-attribute",
-      "description": "Class member `Groot.model` overrides parent class `Policy` in an inconsistent manner\n  `Groot.model` has type `GrootModel | None`, which is not consistent with `Model | None` in `Policy.model` (the type of read-write attributes cannot be changed)",
-      "concise_description": "Class member `Groot.model` overrides parent class `Policy` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "line": 207,
-      "column": 14,
-      "stop_line": 207,
-      "stop_column": 27,
-      "path": "src/physicalai/policies/groot/policy.py",
-      "code": -2,
-      "name": "bad-override-mutable-attribute",
-      "description": "Class member `Groot._preprocessor` overrides parent class `ExportablePolicyMixin` in an inconsistent manner\n  `Groot._preprocessor` has type `GrootPreprocessor | None`, which is not consistent with `Module` in `ExportablePolicyMixin._preprocessor` (the type of read-write attributes cannot be changed)",
-      "concise_description": "Class member `Groot._preprocessor` overrides parent class `ExportablePolicyMixin` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "line": 337,
-      "column": 16,
-      "stop_line": 337,
-      "stop_column": 53,
-      "path": "src/physicalai/policies/groot/policy.py",
-      "code": -2,
-      "name": "bad-return",
-      "description": "Returned type `tuple[Tensor, dict[str, Tensor | float]]` is not assignable to declared return type `Tensor | dict[str, Tensor]`",
-      "concise_description": "Returned type `tuple[Tensor, dict[str, Tensor | float]]` is not assignable to declared return type `Tensor | dict[str, Tensor]`",
-      "severity": "error"
-    },
-    {
-      "line": 388,
-      "column": 9,
-      "stop_line": 388,
-      "stop_column": 29,
-      "path": "src/physicalai/policies/groot/policy.py",
-      "code": -2,
-      "name": "bad-override",
-      "description": "Class member `Groot.configure_optimizers` overrides parent class `Policy` in an inconsistent manner\n  `Groot.configure_optimizers` has type `(self: Groot) -> dict[str, Any]`, which is not assignable to `(self: Groot) -> OptimizerLRScheduler`, the type of `Policy.configure_optimizers`\n  Signature mismatch:\n  expected: def configure_optimizers(self: Groot) -> OptimizerLRScheduler: ...\n                                                     ^^^^^^^^^^^^^^^^^^^^ return type\n  found:    def configure_optimizers(self: Groot) -> dict[str, Any]: ...\n                                                     ^^^^^^^^^^^^^^ return type",
-      "concise_description": "Class member `Groot.configure_optimizers` overrides parent class `Policy` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "line": 292,
-      "column": 17,
-      "stop_line": 292,
-      "stop_column": 42,
-      "path": "src/physicalai/policies/groot/transforms.py",
-      "code": -2,
-      "name": "bad-index",
-      "description": "Cannot index into `Module`\n  Expected `__getitem__` to be a callable, got `Module | Tensor`",
-      "concise_description": "Cannot index into `Module`",
-      "severity": "error"
-    },
-    {
-      "line": 293,
-      "column": 17,
-      "stop_line": 293,
-      "stop_column": 42,
-      "path": "src/physicalai/policies/groot/transforms.py",
-      "code": -2,
-      "name": "bad-index",
-      "description": "Cannot index into `Module`\n  Expected `__getitem__` to be a callable, got `Module | Tensor`",
-      "concise_description": "Cannot index into `Module`",
-      "severity": "error"
-    },
-    {
-      "line": 353,
-      "column": 17,
-      "stop_line": 353,
-      "stop_column": 43,
-      "path": "src/physicalai/policies/groot/transforms.py",
-      "code": -2,
-      "name": "bad-index",
-      "description": "Cannot index into `Module`\n  Expected `__getitem__` to be a callable, got `Module | Tensor`",
-      "concise_description": "Cannot index into `Module`",
-      "severity": "error"
-    },
-    {
-      "line": 354,
-      "column": 17,
-      "stop_line": 354,
-      "stop_column": 43,
-      "path": "src/physicalai/policies/groot/transforms.py",
-      "code": -2,
-      "name": "bad-index",
-      "description": "Cannot index into `Module`\n  Expected `__getitem__` to be a callable, got `Module | Tensor`",
-      "concise_description": "Cannot index into `Module`",
-      "severity": "error"
-    },
-    {
-      "line": 575,
-      "column": 19,
-      "stop_line": 575,
-      "stop_column": 38,
-      "path": "src/physicalai/policies/groot/transforms.py",
-      "code": -2,
-      "name": "bad-index",
-      "description": "Cannot index into `Module`\n  Expected `__getitem__` to be a callable, got `Module | Tensor`",
-      "concise_description": "Cannot index into `Module`",
-      "severity": "error"
-    },
-    {
-      "line": 576,
-      "column": 19,
-      "stop_line": 576,
-      "stop_column": 38,
-      "path": "src/physicalai/policies/groot/transforms.py",
-      "code": -2,
-      "name": "bad-index",
-      "description": "Cannot index into `Module`\n  Expected `__getitem__` to be a callable, got `Module | Tensor`",
-      "concise_description": "Cannot index into `Module`",
-      "severity": "error"
-    },
-    {
       "line": 283,
       "column": 13,
       "stop_line": 283,
@@ -1172,8 +1052,8 @@
       "path": "src/physicalai/policies/lerobot/policy.py",
       "code": -2,
       "name": "bad-argument-type",
-      "description": "Argument `dict[str, dict[str, ndarray[Unknown, Unknown]]] | None` is not assignable to parameter `dataset_stats` with type `dict[str, dict[str, Tensor]] | None` in function `LeRobotPolicy.__init__`",
-      "concise_description": "Argument `dict[str, dict[str, ndarray[Unknown, Unknown]]] | None` is not assignable to parameter `dataset_stats` with type `dict[str, dict[str, Tensor]] | None` in function `LeRobotPolicy.__init__`",
+      "description": "Argument `dict[str, dict[str, ndarray[Unknown, Unknown]]] | dict[str, dict[Unknown, Unknown]] | None` is not assignable to parameter `dataset_stats` with type `dict[str, dict[str, Tensor]] | None` in function `LeRobotPolicy.__init__`",
+      "concise_description": "Argument `dict[str, dict[str, ndarray[Unknown, Unknown]]] | dict[str, dict[Unknown, Unknown]] | None` is not assignable to parameter `dataset_stats` with type `dict[str, dict[str, Tensor]] | None` in function `LeRobotPolicy.__init__`",
       "severity": "error"
     },
     {
@@ -1184,8 +1064,8 @@
       "path": "src/physicalai/policies/lerobot/policy.py",
       "code": -2,
       "name": "bad-argument-type",
-      "description": "Argument `dict[str, dict[str, Tensor]] | dict[str, dict[str, ndarray[Unknown, Unknown]]] | Unknown | None` is not assignable to parameter `dataset_stats` with type `dict[str, dict[str, Tensor]] | None` in function `LeRobotPolicy._initialize_policy`",
-      "concise_description": "Argument `dict[str, dict[str, Tensor]] | dict[str, dict[str, ndarray[Unknown, Unknown]]] | Unknown | None` is not assignable to parameter `dataset_stats` with type `dict[str, dict[str, Tensor]] | None` in function `LeRobotPolicy._initialize_policy`",
+      "description": "Argument `dict[str, dict[str, Tensor]] | dict[str, dict[str, ndarray[Unknown, Unknown]]] | dict[str, dict[Unknown, Unknown]] | Unknown | None` is not assignable to parameter `dataset_stats` with type `dict[str, dict[str, Tensor]] | None` in function `LeRobotPolicy._initialize_policy`",
+      "concise_description": "Argument `dict[str, dict[str, Tensor]] | dict[str, dict[str, ndarray[Unknown, Unknown]]] | dict[str, dict[Unknown, Unknown]] | Unknown | None` is not assignable to parameter `dataset_stats` with type `dict[str, dict[str, Tensor]] | None` in function `LeRobotPolicy._initialize_policy`",
       "severity": "error"
     },
     {
@@ -1222,54 +1102,6 @@
       "name": "bad-return",
       "description": "Returned type `PreTrainedConfig | None` is not assignable to declared return type `PreTrainedConfig`\n  The declared type does not allow `None`. Consider narrowing the value with an `is not None` check or changing the declared type to `PreTrainedConfig | None`.",
       "concise_description": "Returned type `PreTrainedConfig | None` is not assignable to declared return type `PreTrainedConfig`",
-      "severity": "error"
-    },
-    {
-      "line": 205,
-      "column": 14,
-      "stop_line": 205,
-      "stop_column": 19,
-      "path": "src/physicalai/policies/pi0/policy.py",
-      "code": -2,
-      "name": "bad-override-mutable-attribute",
-      "description": "Class member `Pi0.model` overrides parent class `ExportablePolicyMixin` in an inconsistent manner\n  `Pi0.model` has type `Module | None`, which is not consistent with `Module` in `ExportablePolicyMixin.model` (the type of read-write attributes cannot be changed)",
-      "concise_description": "Class member `Pi0.model` overrides parent class `ExportablePolicyMixin` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "line": 205,
-      "column": 14,
-      "stop_line": 205,
-      "stop_column": 19,
-      "path": "src/physicalai/policies/pi0/policy.py",
-      "code": -2,
-      "name": "bad-override-mutable-attribute",
-      "description": "Class member `Pi0.model` overrides parent class `Policy` in an inconsistent manner\n  `Pi0.model` has type `Module | None`, which is not consistent with `Model | None` in `Policy.model` (the type of read-write attributes cannot be changed)",
-      "concise_description": "Class member `Pi0.model` overrides parent class `Policy` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "line": 208,
-      "column": 14,
-      "stop_line": 208,
-      "stop_column": 27,
-      "path": "src/physicalai/policies/pi0/policy.py",
-      "code": -2,
-      "name": "bad-override-mutable-attribute",
-      "description": "Class member `Pi0._preprocessor` overrides parent class `ExportablePolicyMixin` in an inconsistent manner\n  `Pi0._preprocessor` has type `Pi0Preprocessor | None`, which is not consistent with `Module` in `ExportablePolicyMixin._preprocessor` (the type of read-write attributes cannot be changed)",
-      "concise_description": "Class member `Pi0._preprocessor` overrides parent class `ExportablePolicyMixin` in an inconsistent manner",
-      "severity": "error"
-    },
-    {
-      "line": 105,
-      "column": 68,
-      "stop_line": 105,
-      "stop_column": 74,
-      "path": "src/physicalai/policies/pi0/preprocessor.py",
-      "code": -2,
-      "name": "bad-argument-type",
-      "description": "Argument `Tensor` is not assignable to parameter `images` with type `dict[str, Tensor]` in function `Pi0Preprocessor._infer_batch_size`",
-      "concise_description": "Argument `Tensor` is not assignable to parameter `images` with type `dict[str, Tensor]` in function `Pi0Preprocessor._infer_batch_size`",
       "severity": "error"
     },
     {
@@ -1705,30 +1537,6 @@
       "severity": "error"
     },
     {
-      "line": 176,
-      "column": 45,
-      "stop_line": 176,
-      "stop_column": 64,
-      "path": "src/physicalai/policies/pi05/preprocessor.py",
-      "code": -2,
-      "name": "bad-assignment",
-      "description": "`Identity` is not assignable to attribute `_state_action_normalizer` with type `FeatureNormalizeTransform`",
-      "concise_description": "`Identity` is not assignable to attribute `_state_action_normalizer` with type `FeatureNormalizeTransform`",
-      "severity": "error"
-    },
-    {
-      "line": 361,
-      "column": 41,
-      "stop_line": 361,
-      "stop_column": 60,
-      "path": "src/physicalai/policies/pi05/preprocessor.py",
-      "code": -2,
-      "name": "bad-assignment",
-      "description": "`Identity` is not assignable to attribute `_action_denormalizer` with type `FeatureNormalizeTransform`",
-      "concise_description": "`Identity` is not assignable to attribute `_action_denormalizer` with type `FeatureNormalizeTransform`",
-      "severity": "error"
-    },
-    {
       "line": 2037,
       "column": 43,
       "stop_line": 2037,
@@ -1765,18 +1573,6 @@
       "severity": "error"
     },
     {
-      "line": 124,
-      "column": 45,
-      "stop_line": 124,
-      "stop_column": 64,
-      "path": "src/physicalai/policies/smolvla/preprocessor.py",
-      "code": -2,
-      "name": "bad-assignment",
-      "description": "`Identity` is not assignable to attribute `_state_action_normalizer` with type `FeatureNormalizeTransform`",
-      "concise_description": "`Identity` is not assignable to attribute `_state_action_normalizer` with type `FeatureNormalizeTransform`",
-      "severity": "error"
-    },
-    {
       "line": 139,
       "column": 40,
       "stop_line": 139,
@@ -1786,18 +1582,6 @@
       "name": "bad-argument-type",
       "description": "Argument `Tensor` is not assignable to parameter `text` with type `list[str] | str` in function `SmolVLAPreprocessor._tokenize`",
       "concise_description": "Argument `Tensor` is not assignable to parameter `text` with type `list[str] | str` in function `SmolVLAPreprocessor._tokenize`",
-      "severity": "error"
-    },
-    {
-      "line": 407,
-      "column": 41,
-      "stop_line": 407,
-      "stop_column": 60,
-      "path": "src/physicalai/policies/smolvla/preprocessor.py",
-      "code": -2,
-      "name": "bad-assignment",
-      "description": "`Identity` is not assignable to attribute `_action_denormalizer` with type `FeatureNormalizeTransform`",
-      "concise_description": "`Identity` is not assignable to attribute `_action_denormalizer` with type `FeatureNormalizeTransform`",
       "severity": "error"
     },
     {

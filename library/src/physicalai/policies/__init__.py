@@ -8,10 +8,8 @@ from __future__ import annotations
 from . import lerobot
 from .act import ACT, ACTConfig, ACTModel
 from .base import Policy
-from .groot import Groot, GrootConfig, GrootModel
 from .lerobot import get_lerobot_policy
 from .molmoact2 import MolmoAct2, MolmoAct2Config, MolmoAct2Model
-from .pi0 import Pi0, Pi0Config, Pi0Model
 from .pi05 import Pi05, Pi05Config, Pi05Model
 from .rldx1 import Rldx1, Rldx1Config, Rldx1Model
 from .smolvla import SmolVLA, SmolVLAConfig, SmolVLAModel
@@ -22,18 +20,11 @@ __all__ = [  # noqa: RUF022  # grouped by policy family, not isort-sorted
     "ACT",
     "ACTConfig",
     "ACTModel",
-    # Groot
-    "Groot",
-    "GrootConfig",
-    "GrootModel",
     # MolmoAct2
     "MolmoAct2",
     "MolmoAct2Config",
     "MolmoAct2Model",
-    # Pi0
-    "Pi0",
-    "Pi0Config",
-    "Pi0Model",
+    # Pi05
     "Pi05",
     "Pi05Config",
     "Pi05Model",
@@ -66,7 +57,7 @@ def get_policy(policy_name: str, *, source: str = "physicalai", **kwargs) -> Pol
 
     Args:
         policy_name: Name of the policy to create. Supported values depend on source:
-            - physicalai: "act", "dummy", "groot", "pi0", "pi05", "rldx1", "smolvla", "xr0"
+            - physicalai: "act", "molmoact2", "pi05", "rldx1", "smolvla", "xr0"
             - lerobot: "act", "diffusion", "smolvla", "pi0", "pi05", "pi0_fast", "groot", "xvla"
         source: Where the policy implementation comes from. Options:
             - "physicalai": First-party implementations (default)
@@ -85,13 +76,9 @@ def get_policy(policy_name: str, *, source: str = "physicalai", **kwargs) -> Pol
             >>> from physicalai.policies import get_policy
             >>> policy = get_policy("act", learning_rate=1e-4)
 
-        Create first-party Groot policy:
+        Create first-party Pi0.5 policy:
 
-            >>> policy = get_policy("groot", learning_rate=1e-4)
-
-        Create first-party Pi0 policy:
-
-            >>> policy = get_policy("pi0", paligemma_variant="gemma_300m")
+            >>> policy = get_policy("pi05", pretrained_name_or_path="lerobot/pi05_base")
 
         Create LeRobot ACT policy explicitly:
 
@@ -105,7 +92,7 @@ def get_policy(policy_name: str, *, source: str = "physicalai", **kwargs) -> Pol
 
             >>> @pytest.mark.parametrize(
             ...     ("policy_name", "source"),
-            ...     [("act", "physicalai"), ("groot", "physicalai"), ("diffusion", "lerobot")],
+            ...     [("act", "physicalai"), ("pi05", "physicalai"), ("diffusion", "lerobot")],
             ... )
             >>> def test_policy(policy_name, source):
             ...     policy = get_policy(policy_name, source=source)
@@ -118,20 +105,18 @@ def get_policy(policy_name: str, *, source: str = "physicalai", **kwargs) -> Pol
     """
     source = source.lower()
 
-    # First-party policies
     if source == "physicalai":
         return get_physicalai_policy_class(policy_name)(**kwargs)
 
     if source == "lerobot":
-        # LeRobot policies via wrapper
         return get_lerobot_policy(policy_name, **kwargs)
 
     msg = f"Unknown source: {source}. Supported sources: physicalai, lerobot"
     raise ValueError(msg)
 
 
-def get_physicalai_policy_class(policy_name: str) -> type[Policy]:  # noqa: PLR0911
-    """Get policy class by name.
+def get_physicalai_policy_class(policy_name: str) -> type[Policy]:
+    """Get a first-party policy class by name.
 
     Args:
         policy_name: Name of the policy class to retrieve.
@@ -146,20 +131,15 @@ def get_physicalai_policy_class(policy_name: str) -> type[Policy]:  # noqa: PLR0
 
     if policy_name == "act":
         return ACT
-    if policy_name == "groot":
-        return Groot
-    if policy_name == "pi0":
-        return Pi0
+    if policy_name == "molmoact2":
+        return MolmoAct2
     if policy_name == "pi05":
         return Pi05
     if policy_name == "rldx1":
         return Rldx1
     if policy_name == "smolvla":
         return SmolVLA
-    if policy_name == "molmoact2":
-        return MolmoAct2
     if policy_name == "xr0":
         return XR0
-    supported = "act, dummy, groot, molmoact2, pi0, pi05, rldx1, smolvla, xr0"
-    msg = f"Unknown physicalai policy: {policy_name}. Supported policies: {supported}"
+    msg = f"Unknown physicalai policy: {policy_name}. Supported policies: act, molmoact2, pi05, rldx1, smolvla, xr0"
     raise ValueError(msg)
