@@ -54,6 +54,26 @@ NUM_STEPS = 3
 REFERENCE_ACTION = torch.tensor([0.4187, 2.1285, -1.0810, 0.1513, 0.3321, -0.3464, 1.1061, 0.6040])
 
 
+def _fixed_noise(seed: int) -> torch.Tensor:
+    """Build a reproducible rectified-flow noise tensor.
+
+    Drawn from a local generator so building it never perturbs the global RNG the
+    training tests rely on.
+
+    Returns:
+        Gaussian noise of shape ``(1, ACTION_LEN, ACTION_DIM)``.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randn(1, ACTION_LEN, ACTION_DIM, generator=generator)
+
+
+# Injected inference noise: pinning it makes eval runs reproducible without
+# touching the global RNG, and lets the eager and export runs start from the
+# identical point.
+EVAL_NOISE = _fixed_noise(1234)
+EXPORT_NOISE = _fixed_noise(4321)
+
+
 def _config() -> Qwen3VLConfig:
     """Tiny Qwen3-VL config whose head_dim / kv_heads match the DiT."""
     vision = Qwen3VLVisionConfig(
@@ -131,8 +151,9 @@ def _export_batches() -> tuple[dict, dict]:
 
     Patchify now happens off-graph, so both batches carry the identical flat
     patchified ``pixel_values`` the vision tower consumes. They also share the
-    same image, action, state and seed, so their ``_run`` outputs must match (the
-    export op swaps are numerically identical).
+    same image, action and state, so their ``_run`` outputs must match when both
+    are given the same injected noise (the export op swaps are numerically
+    identical).
 
     Returns:
         Tuple of ``(eager_batch, export_batch)``.
@@ -157,7 +178,6 @@ def _export_batches() -> tuple[dict, dict]:
             "action": action.clone(),
             "action_mask": action_mask.clone(),
             "state": state.clone(),
-            "seed": 1234,
         }
 
     return _with(pixel_values), _with(pixel_values)
@@ -212,28 +232,6 @@ class TestGetActionInput:
         assert torch.all(action_mask == 1)
 
 
-class TestNormalizePrefixLength:
-    """``_normalize_prefix_length`` coerces to a bounded int."""
-
-    @pytest.mark.parametrize(
-        ("prefix_length", "action_length", "expected"),
-        [
-            (None, 4, 0),
-            (2, 4, 2),
-            (10, 4, 4),
-            (-3, 4, 0),
-            (torch.tensor(2), 4, 2),
-            (torch.tensor([3, 9]), 4, 3),
-            (torch.tensor(10), 4, 4),
-            (torch.tensor([]), 4, 0),
-        ],
-    )
-    def test_matches_reference(
-        self, prefix_length: int | torch.Tensor | None, action_length: int, expected: int
-    ) -> None:
-        assert XR0Model._normalize_prefix_length(prefix_length, action_length) == expected
-
-
 class TestMakeLocalCausalMask:
     """``_make_local_causal_mask`` batches the ``[sink, state, action]`` mask."""
 
@@ -282,7 +280,7 @@ class TestMakeLocalCausalMask:
 
 
 class TestSampleNoise:
-    """``_sample_noise`` draws rectified-flow noise across train / eval / seed."""
+    """``_sample_noise`` draws rectified-flow noise from the global RNG."""
 
     @staticmethod
     def _action() -> torch.Tensor:
@@ -291,63 +289,58 @@ class TestSampleNoise:
     def test_shape_and_dtype(self, model: XR0Model) -> None:
         model.eval()
         action = self._action()
-        noise = model._sample_noise(action, seed=42)
+        noise = model._sample_noise(action)
         assert noise.shape == action.shape
         assert noise.dtype == action.dtype
 
-    def test_eval_seeded_matches_reference(self, model: XR0Model) -> None:
-        # Eval + int seed reproduces ``manual_seed`` around an f32 draw cast to
-        # the action dtype (the export-friendly deterministic path).
+    def test_successive_eval_draws_differ(self, model: XR0Model) -> None:
+        # The draw advances the global RNG, so successive calls differ.
         model.eval()
         action = self._action()
-        noise = model._sample_noise(action, seed=42)
-        torch.manual_seed(42)
-        reference = torch.randn(action.shape, dtype=torch.float32).to(action.dtype)
-        assert torch.equal(noise, reference)
-
-    def test_eval_seeded_is_deterministic(self, model: XR0Model) -> None:
-        model.eval()
-        action = self._action()
-        first = model._sample_noise(action, seed=7)
-        second = model._sample_noise(action, seed=7)
-        assert torch.equal(first, second)
-
-    def test_tensor_seed_uses_first_element(self, model: XR0Model) -> None:
-        # A tensor seed is coerced via ``flatten()[0]`` -> same draw as its int.
-        model.eval()
-        action = self._action()
-        int_noise = model._sample_noise(action, seed=5)
-        tensor_noise = model._sample_noise(action, torch.tensor([5, 9]))
-        assert torch.equal(int_noise, tensor_noise)
-
-    def test_seeded_restores_global_rng_state(self, model: XR0Model) -> None:
-        # The seeded eval path must not perturb the global RNG stream.
-        model.eval()
-        action = self._action()
-        torch.manual_seed(123)
-        state_before = torch.get_rng_state()
-        model._sample_noise(action, seed=42)
-        assert torch.equal(torch.get_rng_state(), state_before)
-
-    def test_eval_unseeded_advances_rng(self, model: XR0Model) -> None:
-        # Without a seed the eval draw is not restored, so successive calls differ.
-        model.eval()
-        action = self._action()
-        first = model._sample_noise(action, seed=None)
-        second = model._sample_noise(action, seed=None)
+        first = model._sample_noise(action)
+        second = model._sample_noise(action)
         assert first.dtype == action.dtype
         assert not torch.equal(first, second)
 
-    def test_training_ignores_seed(self, model: XR0Model) -> None:
-        # Training draws via ``randn_like`` from the global RNG and ignores the
-        # seed, keeping its RNG stream unchanged.
+    def test_training_uses_randn_like(self, model: XR0Model) -> None:
+        # Training draws via ``randn_like`` in the native action dtype.
         model.train()
         action = self._action()
         torch.manual_seed(321)
-        noise = model._sample_noise(action, seed=999)
+        noise = model._sample_noise(action)
         torch.manual_seed(321)
         reference = torch.randn_like(action)
         assert torch.equal(noise, reference)
+
+
+class TestValidateNoise:
+    """``_validate_noise`` aligns an injected tensor and rejects bad shapes."""
+
+    @staticmethod
+    def _action() -> torch.Tensor:
+        return torch.zeros(1, ACTION_LEN, ACTION_DIM)
+
+    def test_casts_to_action_dtype(self) -> None:
+        action = self._action()
+        noise = torch.ones(1, ACTION_LEN, ACTION_DIM, dtype=torch.float64)
+        out = XR0Model._validate_noise(noise, action)
+        assert out.dtype == action.dtype
+        assert out.device == action.device
+        assert torch.equal(out, torch.ones_like(action))
+
+    def test_matching_dtype_is_passed_through(self) -> None:
+        action = self._action()
+        noise = torch.ones_like(action)
+        assert XR0Model._validate_noise(noise, action) is noise
+
+    @pytest.mark.parametrize(
+        "shape",
+        [(1, ACTION_LEN, ACTION_DIM + 1), (2, ACTION_LEN, ACTION_DIM), (ACTION_LEN, ACTION_DIM)],
+    )
+    def test_shape_mismatch_raises(self, shape: tuple[int, ...]) -> None:
+        action = self._action()
+        with pytest.raises(ValueError, match="does not match the action shape"):
+            XR0Model._validate_noise(torch.zeros(shape), action)
 
 
 class TestRandomMaskPrefix:
@@ -409,13 +402,12 @@ class TestRun:
     The shared ``model`` fixture is reused for every run (no rebuild). Training
     draws its noise / timestep from the global RNG, so each training test builds
     the batch first (``_batch`` reseeds to 0 internally) and then seeds with
-    ``_TRAIN_SEED`` right before ``_run``. Eval passes an in-batch ``seed`` so it
-    is deterministic regardless of the global RNG.
+    ``_TRAIN_SEED`` right before ``_run``. Eval injects the fixed ``EVAL_NOISE``
+    so it is deterministic regardless of the global RNG.
 
     Reference values are placeholders (zeros); fill them from a trusted run.
     """
 
-    _EVAL_SEED = 1234
     _TRAIN_SEED = 0
 
     # Fill from a trusted run.
@@ -440,8 +432,7 @@ class TestRun:
     def test_eval_returns_reference_action(self, model: XR0Model, expected_action: torch.Tensor) -> None:
         model.eval()
         batch = _batch()
-        batch["seed"] = self._EVAL_SEED
-        pred = model._run(batch, return_loss=False)
+        pred = model._run(batch, return_loss=False, noise=EVAL_NOISE)
         assert pred.shape == (1, ACTION_LEN, ACTION_DIM)
         assert torch.allclose(pred, expected_action, atol=1e-4)
 
@@ -486,6 +477,68 @@ class TestRun:
             model.freq_coefficient = 0.0
 
 
+class TestRunInjectedNoise:
+    """``_run(noise=...)`` starts the flow from a caller-supplied tensor."""
+
+    _TRAIN_SEED = 0
+
+    def test_injected_noise_is_reproducible(self, model: XR0Model) -> None:
+        # The same tensor gives the same actions, and a different tensor does not.
+        model.eval()
+        first = model._run(_batch(), return_loss=False, noise=EVAL_NOISE)
+        second = model._run(_batch(), return_loss=False, noise=EVAL_NOISE)
+        other = model._run(_batch(), return_loss=False, noise=EXPORT_NOISE)
+        assert torch.equal(first, second)
+        assert not torch.allclose(first, other)
+
+    def test_injected_noise_ignores_global_rng(self, model: XR0Model) -> None:
+        # Injection bypasses ``_sample_noise``, so the global stream is irrelevant.
+        model.eval()
+        torch.manual_seed(1)
+        first = model._run(_batch(), return_loss=False, noise=EVAL_NOISE)
+        torch.manual_seed(2)
+        second = model._run(_batch(), return_loss=False, noise=EVAL_NOISE)
+        assert torch.equal(first, second)
+
+    def test_default_draws_from_global_rng(self, model: XR0Model) -> None:
+        # Without injection the draw follows the global RNG. The batches are built
+        # up front because ``_batch`` reseeds the global RNG itself.
+        model.eval()
+        first_batch, second_batch, third_batch = _batch(), _batch(), _batch()
+        torch.manual_seed(7)
+        first = model._run(first_batch, return_loss=False)
+        torch.manual_seed(7)
+        second = model._run(second_batch, return_loss=False)
+        third = model._run(third_batch, return_loss=False)
+        assert torch.equal(first, second)
+        assert not torch.allclose(first, third)
+
+    def test_injected_noise_is_cast_to_action_dtype(self, model: XR0Model) -> None:
+        # A foreign-dtype tensor is coerced rather than rejected.
+        model.eval()
+        pred = model._run(_batch(), return_loss=False, noise=EVAL_NOISE.double())
+        reference = model._run(_batch(), return_loss=False, noise=EVAL_NOISE)
+        assert torch.equal(pred, reference)
+
+    def test_wrong_shape_raises(self, model: XR0Model) -> None:
+        model.eval()
+        with pytest.raises(ValueError, match="does not match the action shape"):
+            model._run(_batch(), return_loss=False, noise=torch.zeros(1, ACTION_LEN + 1, ACTION_DIM))
+
+    def test_training_accepts_injected_noise(self, model: XR0Model) -> None:
+        # Training never injects noise in production, but the parameter is not
+        # gated on eval, so a supplied tensor pins the training loss too.
+        model.train()
+        model.freq_coefficient = 0.0
+        batch = _batch()
+        torch.manual_seed(self._TRAIN_SEED)
+        first = model._run(batch, return_loss=True, noise=EVAL_NOISE)["loss"]
+        batch = _batch()
+        torch.manual_seed(self._TRAIN_SEED)
+        second = model._run(batch, return_loss=True, noise=EVAL_NOISE)["loss"]
+        assert torch.equal(first, second)
+
+
 @pytest.fixture
 def export_model() -> XR0Model:
     """A fresh eval-mode model for a single export bake (never the shared one).
@@ -505,7 +558,7 @@ def eager_export_pred() -> torch.Tensor:
     tests as the reference the baked export output must reproduce.
     """
     eager_batch, _ = _export_batches()
-    return _build_model().eval()._run(eager_batch, return_loss=False)
+    return _build_model().eval()._run(eager_batch, return_loss=False, noise=EXPORT_NOISE)
 
 
 class TestRunExport:
@@ -524,7 +577,7 @@ class TestRunExport:
         # Single f32 action output, numerically equal to the eager eval output.
         _, export_batch = _export_batches()
         self._bake_export(export_model, export_batch)
-        export_pred = export_model._run(export_batch, return_loss=False)
+        export_pred = export_model._run(export_batch, return_loss=False, noise=EXPORT_NOISE)
 
         assert isinstance(export_pred, torch.Tensor)
         assert export_pred.dtype == torch.float32
@@ -541,7 +594,7 @@ class TestRunExport:
 
         self._bake_export(export_model, export_batch)
         export_model.export_state_passthrough = True
-        pred, state = export_model._run(export_batch, return_loss=False)
+        pred, state = export_model._run(export_batch, return_loss=False, noise=EXPORT_NOISE)
 
         assert pred.shape == (1, ACTION_LEN, ACTION_DIM)
         assert state.shape == (1, STATE_LEN, STATE_DIM)
@@ -564,16 +617,22 @@ class TestExportInputAlias:
         aliased[TOKENIZED_PROMPT_MASK] = batch["attention_mask"]
         return aliased
 
-    def test_forward_accepts_tokenizer_port_names(
-        self, export_model: XR0Model, eager_export_pred: torch.Tensor
-    ) -> None:
-        # After baking, forward consumes the tokenizer-port keys and reproduces
-        # the eager action for the same observation.
-        _, export_batch = _export_batches()
-        export_model.prepare_ingraph_export(export_batch["image_grid_thw"])
-        pred = export_model(self._aliased(export_batch))
+    def test_forward_accepts_tokenizer_port_names(self, export_model: XR0Model) -> None:
+        # After baking, forward consumes the tokenizer-port keys and produces the
+        # same action as the un-aliased keys. ``forward`` takes no injected noise
+        # (it must keep the framework signature), so both runs are pinned by
+        # seeding the global RNG instead.
+        _, aliased_batch = _export_batches()
+        _, direct_batch = _export_batches()
+        export_model.prepare_ingraph_export(direct_batch["image_grid_thw"])
+
+        torch.manual_seed(0)
+        pred = export_model(self._aliased(aliased_batch))
+        torch.manual_seed(0)
+        expected = export_model(direct_batch)
+
         assert isinstance(pred, torch.Tensor)
-        assert torch.allclose(pred, eager_export_pred.float(), atol=1e-3, rtol=1e-3)
+        assert torch.allclose(pred, expected, atol=1e-6)
 
     def test_alias_maps_keys_before_delegating(self) -> None:
         # Isolate the wrapper: it should inject ``input_ids`` / ``attention_mask``

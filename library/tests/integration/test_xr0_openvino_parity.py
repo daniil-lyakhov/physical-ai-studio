@@ -138,12 +138,12 @@ def _build_processed(policy: XR0) -> dict[str, torch.Tensor]:
 
 @torch.no_grad()
 def _run_forward_with_noise(policy: XR0, processed: dict[str, torch.Tensor], noise: torch.Tensor) -> torch.Tensor:
-    """Run ``predict_action_chunk`` forcing a specific rectified-flow ``noise``.
+    """Run the eager denoising loop forcing a specific rectified-flow ``noise``.
 
     The exported IR samples its starting noise internally (a ``RandomUniform``
     with seed 0), so to compare it against the eager model we feed the eager
-    model the *same* noise the IR drew. This temporarily overrides
-    ``XR0Model._sample_noise`` so the flow starts from the supplied ``noise``.
+    model the *same* noise the IR drew, via the ``noise`` argument of
+    ``XR0Model._run`` (``predict_action_chunk`` is a thin wrapper around it).
 
     Returns:
         The predicted (still normalized) action chunk as a CPU float32 tensor.
@@ -151,13 +151,7 @@ def _run_forward_with_noise(policy: XR0, processed: dict[str, torch.Tensor], noi
     batch: dict[str, object] = {
         key: (value.clone() if torch.is_tensor(value) else value) for key, value in processed.items()
     }
-    model = policy.model
-    original = model._sample_noise
-    model._sample_noise = lambda action, seed: noise.to(action.device, action.dtype)  # noqa: ARG005
-    try:
-        actions = model.predict_action_chunk(batch)
-    finally:
-        model._sample_noise = original
+    actions = policy.model._run(batch, return_loss=False, noise=noise)
     return actions.float().cpu()
 
 

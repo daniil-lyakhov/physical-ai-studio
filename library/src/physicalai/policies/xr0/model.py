@@ -226,7 +226,7 @@ class XR0Model(Model):
         Returns:
             ``list(range(action_len))``.
         """
-        return list(range(self.action_shape[-2]))
+        return list(range(self.action_shape[0]))
 
     @property
     def observation_delta_indices(self) -> None:
@@ -346,21 +346,6 @@ class XR0Model(Model):
     # Batch helpers                                                      #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _normalize_prefix_length(prefix_length: int | torch.Tensor | None, action_length: int) -> int:
-        """Coerce a possibly-tensor ``prefix_length`` into a bounded int.
-
-        Returns:
-            The prefix length clamped to ``[0, action_length]``.
-        """
-        if isinstance(prefix_length, torch.Tensor):
-            prefix_length = 0 if prefix_length.numel() == 0 else int(prefix_length.flatten()[0].item())
-        elif prefix_length is None:
-            prefix_length = 0
-        else:
-            prefix_length = int(prefix_length)
-        return max(0, min(prefix_length, action_length))
-
     def get_action_input(
         self,
         batch: dict[str, Any],
@@ -392,60 +377,60 @@ class XR0Model(Model):
             state = torch.zeros((1, *self.state_shape), device=device, dtype=self._dtype)
         return action, action_mask, state
 
-    def _sample_noise(self, action: torch.Tensor, seed: int | torch.Tensor | None) -> torch.Tensor:
-        """Draw the rectified-flow starting noise.
-
-        When ``seed`` is provided (inference only), the draw is made
-        deterministic per observation by seeding the RNG and restoring the
-        previous global state afterwards -- byte-compatible with the source
-        model's ``torch.manual_seed(seed)`` around a single ``randn_like``.
+    def _sample_noise(self, action: torch.Tensor) -> torch.Tensor:
+        """Draw the rectified-flow starting noise from the global RNG.
 
         At inference the noise is drawn in float32 and cast to the action dtype.
         The model runs in bf16, but the Intel GPU OpenVINO plugin has no layout
         for a bf16 ``RandomUniform``;  an f32 draw exports to a GPU-compatible
         ``RandomUniform`` + cast and is numerically equivalent. Training keeps the
-        native ``randn_like`` draw so its RNG stream is unchanged.
+        native ``randn_like`` draw.
 
         Returns:
             Gaussian noise tensor shaped like ``action``.
         """
+        if self.training:
+            return torch.randn_like(action)
+        return torch.randn(action.shape, dtype=torch.float32, device=action.device).to(action.dtype)
 
-        def _draw() -> torch.Tensor:
-            if self.training:
-                return torch.randn_like(action)
-            return torch.randn(action.shape, dtype=torch.float32, device=action.device).to(action.dtype)
+    @staticmethod
+    def _validate_noise(noise: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """Check a caller-supplied noise tensor and align it with ``action``.
 
-        if seed is None or self.training:
-            return _draw()
+        Returns:
+            ``noise`` on the action's device and dtype.
 
-        seed_val = int(seed.flatten()[0].item()) if isinstance(seed, torch.Tensor) else int(seed)
-        cpu_rng_state = torch.get_rng_state()
-        gpu_rng_state = torch.cuda.get_rng_state(action.device) if action.is_cuda else None
-        torch.manual_seed(seed_val)
-        noise = _draw()
-        torch.set_rng_state(cpu_rng_state)
-        if gpu_rng_state is not None:
-            torch.cuda.set_rng_state(gpu_rng_state, action.device)
-        return noise
+        Raises:
+            ValueError: If ``noise`` does not have the same shape as ``action``.
+        """
+        if noise.shape != action.shape:
+            msg = f"noise shape {tuple(noise.shape)} does not match the action shape {tuple(action.shape)}"
+            raise ValueError(msg)
+        return noise.to(device=action.device, dtype=action.dtype)
 
     # ------------------------------------------------------------------ #
     # Core orchestration                                                 #
     # ------------------------------------------------------------------ #
 
-    def _run(  # noqa: PLR0914, PLR0915
+    def _run(  # noqa: PLR0914
         self,
         batch: dict[str, Any],
         *,
         return_loss: bool,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor | dict[str, torch.Tensor] | tuple[torch.Tensor, torch.Tensor]:
         """VLM encode -> MRoPE continuation -> rectified-flow train / inference.
+
+        Args:
+            batch: The preprocessed observation batch.
+            return_loss: Return the training loss dict instead of the actions.
+            noise: Optional rectified-flow starting noise. When ``None`` the noise
+                is drawn from the global RNG. Leaving it ``None`` keeps
+                the draw inside the traced graph at export time.
 
         Returns:
             The predicted actions (inference) or the loss dict (training).
         """
-        prefix_length = batch.pop("prefix_length", 0)
-        seed = batch.pop("seed", None)
-
         # VLM forward with KV-cache; the shim also surfaces the 3D position ids.
         vlm_outputs = self.vlm(**batch, use_cache=True)
         past_key_values = [(layer.keys, layer.values) for layer in vlm_outputs.past_key_values.layers]
@@ -454,13 +439,15 @@ class XR0Model(Model):
         action_bs, action_length, _ = action.shape
         _, state_length, _ = state.shape
         q_len = action_length + state_length + 1  # +1 sink token
-        prefix_length = self._normalize_prefix_length(prefix_length, action_length)
 
-        if self.training:
+        # The action prefix is a training-only augmentation:
+        # Means number of leading action slots that are already decided
+        # and held fixed during denoising.
+        # Inference always denoises the full chunk.
+        prefix_length = 0
+        if self.training and self.async_train and random.random() < _ASYNC_PREFIX_PROB:  # noqa: S311  # nosec B311
             # Training-time augmentation sampling only; not security-sensitive.
-            prefix_length = 0
-            if self.async_train and random.random() < _ASYNC_PREFIX_PROB:  # noqa: S311  # nosec B311
-                prefix_length = random.randint(1, min(6, action_length))  # noqa: S311  # nosec B311
+            prefix_length = random.randint(1, min(6, action_length))  # noqa: S311  # nosec B311
         prefix = action[:, :prefix_length]
 
         # Continue the VLM MRoPE sequence into the DiT tokens.
@@ -502,7 +489,9 @@ class XR0Model(Model):
             past_key_values = self._repeat_past_key_values(past_key_values)
 
         position_embeds = self.rotary_emb(action, position_ids)
-        noise = self._sample_noise(action, seed)
+        # Drawn after the training repeat so an injected tensor is matched against
+        # the final ``action`` shape.
+        noise = self._sample_noise(action) if noise is None else self._validate_noise(noise, action)
 
         if self.training:
             pred, target, action_mask, weight = self._training_step(
