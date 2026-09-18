@@ -64,7 +64,7 @@ class XR0Config(Config):
         gradient_checkpointing: Enable gradient checkpointing for memory
             optimization. Defaults to True.
         compile_model: Whether to use torch.compile. Defaults to False.
-        compile_mode: Torch compile mode. Defaults to ``"max-autotune"``.
+        compile_mode: Torch compile mode. Defaults to ``"default"``.
         freeze_vision_encoder: Whether to freeze the vision encoder during
             training. Defaults to False.
         freeze_input_embeddings: Whether to freeze the VLM token-embedding table
@@ -98,8 +98,9 @@ class XR0Config(Config):
         optimizer_grad_clip_norm: Maximum gradient norm for clipping. Defaults
             to 1.0.
         scheduler_warmup_steps: Number of warmup steps. Defaults to 2000.
-        scheduler_decay_steps: Number of cosine decay steps. When ``None``,
-            automatically set to the total training steps. Defaults to 30000.
+        scheduler_decay_steps: Explicit cosine decay horizon in steps. When ``None``,
+            the horizon follows the trainer's total step budget
+            (``max_steps``/``max_epochs``). Defaults to None.
         scheduler_decay_lr: Final learning rate after decay. Defaults to 5e-7.
         input_features: Optional explicit observation feature schema
             (``list[Feature]``). When ``None`` it is traced back from the
@@ -140,7 +141,7 @@ class XR0Config(Config):
 
     gradient_checkpointing: bool = True
     compile_model: bool = False
-    compile_mode: str = "max-autotune"
+    compile_mode: str = "default"
 
     freeze_vision_encoder: bool = False
     freeze_input_embeddings: bool = True
@@ -157,7 +158,7 @@ class XR0Config(Config):
     optimizer_grad_clip_norm: float = 1.0
 
     scheduler_warmup_steps: int = 2_000
-    scheduler_decay_steps: int | None = 30_000
+    scheduler_decay_steps: int | None = None
     scheduler_decay_lr: float = 5.0e-7
 
     input_features: list[Feature] | None = None
