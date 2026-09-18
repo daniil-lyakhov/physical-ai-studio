@@ -16,6 +16,7 @@ import gc
 import os
 import weakref
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,7 @@ from training.job import (
     PEFT_POLICIES,
     PRETRAINED_BASE_CHECKPOINTS,
     SNAPFLOW_CHECKPOINT_NAME,
+    _load_policy_from_checkpoint,
     build_policy,
     resolve_checkpoint,
     run_training_job,
@@ -681,3 +683,21 @@ class TestResolveCheckpoint:
         (tmp_path / CHECKPOINT_NAME).write_text("flow-matching")
 
         assert resolve_checkpoint(tmp_path) == tmp_path / CHECKPOINT_NAME
+
+
+class TestLoadPolicyFromCheckpoint:
+    def test_pi05_normalizes_max_autotune_to_default(self, tmp_path: Path) -> None:
+        forward_fn = MagicMock()
+        policy = MagicMock()
+        policy.config = SimpleNamespace(compile_mode="max-autotune")
+        policy.forward = forward_fn
+
+        spec = TrainingJobSpec(policy="pi05", compile_model=True)
+        with (
+            patch("physicalai.policies.get_physicalai_policy_class") as get_cls,
+            patch("torch.compile") as mock_compile,
+        ):
+            get_cls.return_value.load_from_checkpoint.return_value = policy
+            _load_policy_from_checkpoint(spec, tmp_path / "checkpoint.ckpt")
+
+        mock_compile.assert_called_once_with(forward_fn, mode="default")

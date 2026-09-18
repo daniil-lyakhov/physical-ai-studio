@@ -482,6 +482,8 @@ def _load_policy_from_checkpoint(spec: TrainingJobSpec, checkpoint: Path) -> Pol
         import torch
 
         compile_mode = getattr(policy.config, "compile_mode", "default")
+        if spec.policy.lower() == "pi05" and compile_mode == "max-autotune":
+            compile_mode = "default"
         policy.forward = torch.compile(policy.forward, mode=compile_mode)  # type: ignore[method-assign]
     return policy
 

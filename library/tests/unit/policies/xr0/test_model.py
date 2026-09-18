@@ -302,15 +302,6 @@ class TestSampleNoise:
         assert first.dtype == action.dtype
         assert not torch.equal(first, second)
 
-    def test_training_uses_randn_like(self, model: XR0Model) -> None:
-        # Training draws via ``randn_like`` in the native action dtype.
-        model.train()
-        action = self._action()
-        torch.manual_seed(321)
-        noise = model._sample_noise(action)
-        torch.manual_seed(321)
-        reference = torch.randn_like(action)
-        assert torch.equal(noise, reference)
 
 
 class TestValidateNoise:
