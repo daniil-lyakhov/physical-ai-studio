@@ -85,6 +85,7 @@ const mockProjectWithRemoteTrainer = () => {
                 act: ['torch', 'openvino', 'onnx', 'executorch'],
                 smolvla: ['torch', 'openvino'],
                 pi05: ['torch', 'openvino'],
+                xr0: ['torch', 'openvino'],
             })
         ),
         http.get('/api/dataset/{dataset_id}/episodes', () =>
@@ -329,9 +330,16 @@ describe('TrainModelDialog', () => {
         await user.click(await screen.findByRole('option', { name: 'Test dataset' }));
         await user.click(await screen.findByLabelText('Select XR0 policy'));
 
+        // XR0 reads no fixed camera order, so one Next lands on the training parameters,
+        // which is where the LoRA and SnapFlow controls would be offered.
+        await waitFor(() => expect(screen.getByRole('button', { name: 'Next' })).toBeEnabled());
+        await user.click(screen.getByRole('button', { name: 'Next' }));
+        expect(await screen.findByRole('slider', { name: /batch size/i })).toBeInTheDocument();
+
         expect(screen.queryByText('LoRA fine-tuning')).not.toBeInTheDocument();
         expect(screen.queryByRole('checkbox', { name: /snapflow distillation/i })).not.toBeInTheDocument();
 
+        await goToLastStep(user);
         await user.click(screen.getByRole('button', { name: 'Train' }));
 
         await waitFor(() => expect(submitted).toBeDefined());
