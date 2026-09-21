@@ -21,6 +21,7 @@ from physicalai.policies.xr0.preprocessor import (
     _ASSISTANT_PRIMER,
     _MULTI_VIEW_HEADER,
     _TASK_TEMPLATE,
+    ACTION_MASK,
     ACTION_EPS,
     XR0Postprocessor,
     XR0Preprocessor,
@@ -89,16 +90,16 @@ class TestVisionPrompt:
         # End-to-end glue: batch -> model input keys with batched leading dims.
         pre, _ = make_xr0_preprocessors(stats=_stats())
         out = pre(_batch(2))
-        assert {"input_ids", "attention_mask", "pixel_values", "image_grid_thw", "state", ACTION, "action_mask"} <= set(
+        assert {"input_ids", "attention_mask", "pixel_values", "image_grid_thw", STATE, ACTION, ACTION_MASK} <= set(
             out
         )
         assert out["input_ids"].shape[0] == 2
-        assert out["state"].shape == (2, 1, 32)
+        assert out[STATE].shape == (2, 1, 32)
         assert out[ACTION].shape == (2, HORIZON, 32)
-        assert out["action_mask"].shape == (2, HORIZON, 32)
+        assert out[ACTION_MASK].shape == (2, HORIZON, 32)
         # only the real action dims are marked valid.
-        assert out["action_mask"][..., :ACTION_DIM].all()
-        assert not out["action_mask"][..., ACTION_DIM:].any()
+        assert out[ACTION_MASK][..., :ACTION_DIM].all()
+        assert not out[ACTION_MASK][..., ACTION_DIM:].any()
 
 
 class TestBuildMessage:

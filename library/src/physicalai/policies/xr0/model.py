@@ -23,10 +23,12 @@ import torch.nn.functional as F  # noqa: N812
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextRotaryEmbedding
 
 from physicalai.data.constants import TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
+from physicalai.data.observation import ACTION, STATE
 from physicalai.policies.base import Model
 
 from .dit import XR0FlowModel
 from .export_openvino import install_export_rmsnorm
+from .preprocessor import ACTION_MASK
 from .qwen3_vlm import XR0Qwen3VL
 
 logger = logging.getLogger(__name__)
@@ -358,9 +360,9 @@ class XR0Model(Model):
             Tuple of ``(action, action_mask, state)``.
         """
         device = batch["input_ids"].device
-        if "action" in batch:
-            action = batch.pop("action").to(self._dtype)
-            action_mask = batch.pop("action_mask", None)
+        if ACTION in batch:
+            action = batch.pop(ACTION).to(self._dtype)
+            action_mask = batch.pop(ACTION_MASK, None)
             if action_mask is None:
                 action_mask = torch.ones_like(action, dtype=torch.int32)
         else:
@@ -371,8 +373,8 @@ class XR0Model(Model):
         # echoes it as the ``state_passthrough`` output the postprocessor adds
         # back to recover the absolute action. (Zero-filling here would bake a
         # constant-zero passthrough, leaving the exported delta un-inverted.)
-        if "state" in batch:
-            state = batch.pop("state").to(self._dtype)
+        if STATE in batch:
+            state = batch.pop(STATE).to(self._dtype)
         else:
             state = torch.zeros((1, *self.state_shape), device=device, dtype=self._dtype)
         return action, action_mask, state

@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_ASPECT_RATIO = 200
 ACTION_DIM = 32
+ACTION_MASK = "action_mask"
 STATE_DIM = 32
 ACTION_EPS = 1e-6
 _TEMPORAL_STATE_NDIM = 3
@@ -512,7 +513,7 @@ class XR0Preprocessor(torch.nn.Module):
         if ACTION in batch and batch[ACTION] is not None:
             action, action_mask = self._prepare_action(batch[ACTION], device, state=batch[STATE])
             out[ACTION] = action
-            out["action_mask"] = action_mask
+            out[ACTION_MASK] = action_mask
 
         return out
 
