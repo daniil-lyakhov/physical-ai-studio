@@ -29,7 +29,7 @@ def test_unsupported_policy_rejected(policy: str) -> None:
         SubmitJobRequest(spec=TrainingJobSpec(policy=policy))
 
 
-@pytest.mark.parametrize("policy", ["act", "pi05", "rldx1", "smolvla", "xr0"])
+@pytest.mark.parametrize("policy", ["act", "molmoact2", "pi05", "rldx1", "smolvla", "xr0"])
 def test_selectable_policies_accepted(policy: str) -> None:
     """Every policy the UI can select must pass trainer submission validation."""
     assert SubmitJobRequest(spec=TrainingJobSpec(policy=policy)).spec.policy == policy

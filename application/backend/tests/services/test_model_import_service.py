@@ -203,7 +203,7 @@ async def test_import_model_directory_cleans_up_on_failure(tmp_path, project_id,
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("policy_name", ["act", "smolvla", "pi05", "rldx1", "xr0"])
+@pytest.mark.parametrize("policy_name", ["act", "smolvla", "pi05", "rldx1", "molmoact2", "xr0"])
 async def test_import_model_directory_accepts_supported_policies(
     tmp_path, project_id, dataset_id, settings, dataset, job, policy_name
 ):
