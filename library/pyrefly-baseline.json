@@ -323,6 +323,41 @@
       "severity": "error"
     },
     {
+      "column": 5,
+      "path": "src/physicalai/gyms/libero.py",
+      "name": "missing-import",
+      "concise_description": "Cannot find module `libero.libero.benchmark`",
+      "severity": "error"
+    },
+    {
+      "column": 5,
+      "path": "src/physicalai/gyms/libero.py",
+      "name": "missing-import",
+      "concise_description": "Cannot find module `libero.libero`",
+      "severity": "error"
+    },
+    {
+      "column": 5,
+      "path": "src/physicalai/gyms/libero.py",
+      "name": "missing-import",
+      "concise_description": "Cannot find module `libero.libero`",
+      "severity": "error"
+    },
+    {
+      "column": 5,
+      "path": "src/physicalai/gyms/libero.py",
+      "name": "missing-import",
+      "concise_description": "Cannot find module `libero.libero.envs`",
+      "severity": "error"
+    },
+    {
+      "column": 5,
+      "path": "src/physicalai/gyms/libero.py",
+      "name": "missing-import",
+      "concise_description": "Cannot find module `robosuite.utils.transform_utils`",
+      "severity": "error"
+    },
+    {
       "column": 17,
       "path": "src/physicalai/gyms/libero.py",
       "name": "missing-attribute",
