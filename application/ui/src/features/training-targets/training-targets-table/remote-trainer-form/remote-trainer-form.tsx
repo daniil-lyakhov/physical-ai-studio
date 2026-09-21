@@ -24,6 +24,7 @@ import { getApiErrorMessage, getSshHostKeyFingerprint } from '../../../../api/er
 import { SchemaRemoteTrainer } from '../../../../api/openapi-spec';
 import { ReactComponent as AwsIcon } from '../../../../assets/icons/aws-icon.svg';
 import { SshHostKeyConfirmation } from '../ssh-host-key-confirmation-dialog';
+import { INSECURE_TRAINER_URL_WARNING, isInsecureTrainerUrl } from './insecure-trainer-url';
 import { InfoHelp } from './ssh-tunnel-section';
 import { RemoteTrainerFormValues, useRemoteTrainerFormMutation } from './use-remote-trainer-form-mutation';
 import { useSshHostAliases } from './use-ssh-host-aliases';
@@ -127,6 +128,8 @@ export const RemoteTrainerForm = ({ remoteTrainer, close, requestHostKeyConfirma
         name.trim() !== '' &&
         (isSsh ? hasValidSshHost && Boolean(sshRemotePort) && Boolean(sshLocalPort) : url.trim() !== '');
 
+    const isInsecureUrl = isInsecureTrainerUrl(url);
+
     return (
         <Form onSubmit={handleSubmit} validationBehavior='native'>
             <Dialog width='size-6000'>
@@ -173,7 +176,11 @@ export const RemoteTrainerForm = ({ remoteTrainer, close, requestHostKeyConfirma
                                     }
                                     width='100%'
                                 />
-                            ) : (
+                            ) : null}
+                            {!isSsh && isInsecureUrl && (
+                                <Text UNSAFE_className={classes.errorMessage}>{INSECURE_TRAINER_URL_WARNING}</Text>
+                            )}
+                            {isSsh && (
                                 <Flex direction='column' gap='size-100'>
                                     <div className={classes.fieldRow}>
                                         <NumberField

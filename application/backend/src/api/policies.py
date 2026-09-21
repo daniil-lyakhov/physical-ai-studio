@@ -4,7 +4,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from huggingface_hub import HfApi
 from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
-from physicalai.policies import ACT, XR0, Pi05, Rldx1, SmolVLA
+from physicalai.policies import ACT, XR0, MolmoAct2, Pi05, Rldx1, SmolVLA
 from pydantic import BaseModel
 
 from services.training_backends.local import resolve_hf_token
@@ -18,6 +18,7 @@ _POLICY_CLASSES = {
     "pi05": Pi05,
     "rldx1": Rldx1,
     "smolvla": SmolVLA,
+    "molmoact2": MolmoAct2,
     "xr0": XR0,
 }
 
@@ -27,6 +28,7 @@ _HUGGINGFACE_REQUIREMENTS = {
     # download. When adding/changing a policy, inspect its `from_pretrained`,
     # `hf_hub_download`, and `Auto*from_pretrained` calls and list every default
     # repository that Studio training needs here.
+    "molmoact2": (("allenai/MolmoAct2", False),),
     "pi05": (
         ("lerobot/pi05_base", True),
         ("google/paligemma-3b-pt-224", True),
