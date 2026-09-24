@@ -695,6 +695,41 @@ class Pi05(ExportablePolicyMixin, Policy):
                 gradient_clip_algorithm=gradient_clip_algorithm or "norm",
             )
 
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Migrate legacy checkpoints missing target-time MLP parameters.
+
+        Older SmolVLA checkpoints were created before target-time conditioning
+        layers were introduced. Keep strict checkpoint loading enabled by
+        populating any missing target-time parameters from the current model
+        initialization.
+        """
+        super().on_load_checkpoint(checkpoint)
+
+        state_dict = checkpoint.get("state_dict")
+        if not isinstance(state_dict, dict) or self.model is None:
+            return
+
+        defaults = {
+            "model.target_time_mlp_in.weight": self.model.target_time_mlp_in.weight,  # noqa: SLF001
+            "model.target_time_mlp_in.bias": self.model.target_time_mlp_in.bias,  # noqa: SLF001
+            "model.target_time_mlp_out.weight": self.model.target_time_mlp_out.weight,  # noqa: SLF001
+            "model.target_time_mlp_out.bias": self.model.target_time_mlp_out.bias,  # noqa: SLF001
+        }
+
+        inserted: list[str] = []
+        for key, value in defaults.items():
+            if key in state_dict:
+                continue
+            state_dict[key] = value.detach().clone()
+            inserted.append(key)
+
+        if inserted:
+            logger.warning(
+                "Loaded legacy SmolVLA checkpoint missing %d target-time parameter(s): %s",
+                len(inserted),
+                ", ".join(inserted),
+            )
+
     @staticmethod
     def get_supported_export_backends() -> list[str | ExportBackend]:
         """Get a list of export backends supported by policy.
