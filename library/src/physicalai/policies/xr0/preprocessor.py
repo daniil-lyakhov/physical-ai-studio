@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -41,7 +42,7 @@ from physicalai.data import Feature, FeatureType
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Observation
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +72,57 @@ _MULTI_VIEW_HEADER = "The following observations are captured from multiple view
 _TASK_TEMPLATE = "Generate robot actions for the task:\n{instruction} /no_cot"
 _ASSISTANT_PRIMER = "<cot></cot>"
 
-# View titles the model was trained with (Xiaomi reference server prompt in
-# deploy/server.py), e.g. "wrist_left" -> "Left-Wrist" so the prompt reads
-# "# Left-Wrist View". A plain capitalize would wrongly yield "Wrist Left".
+# View titles the model was trained with (Xiaomi reference ``VIEW_TITLES`` in
+# tools/lerobot_convert.py), e.g. "wrist_left" -> "Left-Wrist" so the prompt
+# reads "# Left-Wrist View". A plain capitalize would wrongly yield
+# "Wrist Left". The " View" suffix is appended by the prompt template, so the
+# titles stored here deliberately omit it.
 _VIEW_TITLES = {
+    "ego": "Ego",
     "base": "Base",
     "wrist_left": "Left-Wrist",
     "wrist_right": "Right-Wrist",
 }
+
+# Canonical prompt order of the XR0 view names. The order is fixed by the
+# reference data format rather than by the mapping's insertion order, so an
+# ``image_key_view_map`` round-tripped through a JSON manifest still yields the
+# prompt section order the model was trained with.
+_VIEW_ORDER = ("ego", "base", "wrist_left", "wrist_right")
+
+
+def _normalize_view_map(image_key_view_map: Mapping[str, str] | None) -> dict[str, str]:
+    """Prefix-qualify and validate a dataset-key to canonical-view mapping.
+
+    Keys are accepted with or without the ``observation.images.`` prefix and are
+    returned fully qualified, so the mapping can be compared directly against the
+    flattened batch image keys.
+
+    Returns:
+        The validated mapping, keyed by fully qualified image key.
+
+    Raises:
+        ValueError: If a value is not a canonical XR0 view name, or if two keys
+            map onto the same view.
+    """
+    mapping: dict[str, str] = {}
+    for raw_key, view in (image_key_view_map or {}).items():
+        camera = raw_key.removeprefix("observation.").removeprefix(f"{IMAGES}.")
+        mapping[f"{IMAGES}.{camera}"] = view
+
+    unknown = sorted({view for view in mapping.values() if view not in _VIEW_TITLES})
+    if unknown:
+        msg = (
+            f"image_key_view_map values must be canonical XR0 view names {list(_VIEW_ORDER)}, got {unknown}."
+        )
+        raise ValueError(msg)
+
+    duplicates = sorted(view for view, count in Counter(mapping.values()).items() if count > 1)
+    if duplicates:
+        msg = f"image_key_view_map values must be unique, got duplicates {duplicates}."
+        raise ValueError(msg)
+
+    return mapping
 
 
 def _view_title(view: str) -> str:
@@ -258,6 +302,13 @@ class XR0Preprocessor(torch.nn.Module):
         processor_name: HuggingFace id of the Qwen3-VL processor.
         max_token_len: Fixed prompt length the OpenVINO tokenizer pads to at export
             (matches the graph's baked ``tokenizer_max_length``).
+        image_key_view_map: Optional mapping from dataset image key to canonical
+            XR0 view name (one of ``"ego"``, ``"base"``, ``"wrist_left"``,
+            ``"wrist_right"``). Keys may be given with or without the
+            ``observation.images.`` prefix. When set, the mapping must cover the
+            batch image keys exactly and the prompt sections are emitted in the
+            canonical view order. When empty, the view name is the image key with
+            its prefix stripped and the prompt follows the dataset's key order.
         chunk_size: Number of predicted action timesteps; the temporal length of
             the action normalization buffers.
         state_len: Number of state timesteps; the temporal length of the state
@@ -283,7 +334,7 @@ class XR0Preprocessor(torch.nn.Module):
     state_mean: torch.Tensor
     state_std: torch.Tensor
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         max_state_dim: int = 32,
         max_action_dim: int = 32,
@@ -293,6 +344,7 @@ class XR0Preprocessor(torch.nn.Module):
         processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
         max_token_len: int = 256,
         *,
+        image_key_view_map: Mapping[str, str] | None = None,
         chunk_size: int = 30,
         state_len: int = 1,
         normalize_state: bool = False,
@@ -312,6 +364,7 @@ class XR0Preprocessor(torch.nn.Module):
         self.image_max_pixels = image_max_pixels
         self.processor_name = processor_name
         self.max_token_len = int(max_token_len)
+        self.image_key_view_map = _normalize_view_map(image_key_view_map)
         self.normalize_state = bool(normalize_state)
         self.action_mode = str(action_mode)
         self._processor: Any = None
@@ -448,6 +501,31 @@ class XR0Preprocessor(torch.nn.Module):
             {"role": "assistant", "content": [{"type": "text", "text": _ASSISTANT_PRIMER}]},
         ]
 
+    def _resolve_views(self, image_keys: list[str]) -> tuple[list[str], list[str]]:
+        """Map the batch image keys onto canonical view names in canonical order.
+
+        Returns:
+            An ``(image_keys, views)`` tuple, both ordered by :data:`_VIEW_ORDER`
+            when ``image_key_view_map`` is set and left in the batch's own key
+            order otherwise.
+
+        Raises:
+            ValueError: If ``image_key_view_map`` is set and its keys do not match
+                the batch image keys exactly.
+        """
+        if not self.image_key_view_map:
+            return image_keys, [key.removeprefix(f"{IMAGES}.") for key in image_keys]
+
+        if set(self.image_key_view_map) != set(image_keys):
+            msg = (
+                "image_key_view_map keys must match the batch image keys exactly. "
+                f"Expected {sorted(self.image_key_view_map)}, got {sorted(image_keys)}."
+            )
+            raise ValueError(msg)
+
+        ordered_keys = sorted(image_keys, key=lambda key: _VIEW_ORDER.index(self.image_key_view_map[key]))
+        return ordered_keys, [self.image_key_view_map[key] for key in ordered_keys]
+
     def _extract_view_images(self, batch: dict[str, Any]) -> tuple[list[str], list[list[torch.Tensor]]]:
         """Return the ordered view names and, per sample, the resized images.
 
@@ -462,7 +540,7 @@ class XR0Preprocessor(torch.nn.Module):
         if not image_keys:
             msg = "XR0Preprocessor requires at least one image observation"
             raise ValueError(msg)
-        views = [key.removeprefix(f"{IMAGES}.") for key in image_keys]
+        image_keys, views = self._resolve_views(image_keys)
 
         per_view: list[torch.Tensor] = []
         for key in image_keys:
@@ -736,6 +814,7 @@ def make_xr0_preprocessors(
     image_factor: int = 32,
     image_max_pixels: int = 90000,
     processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
+    image_key_view_map: Mapping[str, str] | None = None,
     normalize_state: bool = False,
     action_mode: str = "absolute",
     action_mean: Sequence[float] | torch.Tensor | None = None,
@@ -755,6 +834,8 @@ def make_xr0_preprocessors(
         image_factor: Patch-alignment factor for image resizing.
         image_max_pixels: Maximum image area for image resizing.
         processor_name: HuggingFace id of the Qwen3-VL processor.
+        image_key_view_map: Optional mapping from dataset image key to canonical
+            XR0 view name, used to rename and order the prompt's view sections.
         normalize_state: When True, normalize the state with the dataset's
             mean/std. Defaults to False (raw state).
         action_mode: ``"absolute"`` (default) or ``"delta"``. In delta mode the
@@ -806,6 +887,7 @@ def make_xr0_preprocessors(
         image_factor=image_factor,
         image_max_pixels=image_max_pixels,
         processor_name=processor_name,
+        image_key_view_map=image_key_view_map,
         chunk_size=chunk_size,
         state_len=state_len,
         normalize_state=normalize_state,
