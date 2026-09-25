@@ -19,13 +19,19 @@
 
 The postprocessor inverts the action normalization
 (:func:`denormalize_action`).
+
+Normalization statistics are **always per-timestep**: the action buffers are
+``(chunk_size, max_action_dim)`` and the state buffers are ``(state_len,
+max_state_dim)``, matching the source ``validate_stats`` contract (which
+requires exactly ``(action_length, 32)``). Per-dimension statistics are never
+broadcast over the time axis -- a per-dimension array is rejected unless the
+expected temporal length is 1, where reshaping it is unambiguous.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -48,6 +54,7 @@ _TEMPORAL_STATE_NDIM = 3
 _TEMPORAL_IMAGE_NDIM = 5
 _BATCHED_IMAGE_NDIM = 4
 _BATCHED_ACTION_NDIM = 2
+_STATS_NDIM = 2
 
 # Pinned commit SHA for the default Qwen3-VL processor download. A concrete
 # revision keeps the fetched tokenizer/processor reproducible and avoids the
@@ -186,6 +193,53 @@ def _denormalize_action(action: torch.Tensor, mean: torch.Tensor, std: torch.Ten
     return action * (std + ACTION_EPS) + mean
 
 
+def _to_chunk_stats(
+    mean: Sequence[float] | torch.Tensor,
+    std: Sequence[float] | torch.Tensor,
+    *,
+    length: int,
+    dim: int,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Coerce ``mean`` / ``std`` into per-timestep ``(length, dim)`` buffers.
+
+    The temporal axis is never broadcast: statistics must already carry one
+    entry per predicted timestep. A 1D ``(D,)`` array is accepted only when
+    ``length == 1``, where reshaping it is unambiguous (the state case). The
+    feature axis is padded with the identity transform (mean 0 / std 1) up to
+    ``dim``, or truncated when the source is wider.
+
+    Returns:
+        A ``(mean, std)`` tuple of ``(length, dim)`` float32 tensors.
+
+    Raises:
+        ValueError: If ``mean`` / ``std`` disagree in shape, or if the statistics
+            are not per-timestep with the expected temporal length.
+    """
+    t_mean = torch.as_tensor(mean, dtype=torch.float32)
+    t_std = torch.as_tensor(std, dtype=torch.float32)
+    if t_mean.shape != t_std.shape:
+        msg = f"{name} mean/std must have the same shape, got {tuple(t_mean.shape)} and {tuple(t_std.shape)}"
+        raise ValueError(msg)
+    if t_mean.ndim == 1 and length == 1:
+        t_mean = t_mean.unsqueeze(0)
+        t_std = t_std.unsqueeze(0)
+    if t_mean.ndim != _STATS_NDIM or int(t_mean.shape[0]) != length:
+        msg = (
+            f"{name} stats must be per-timestep with shape ({length}, D), got {tuple(t_mean.shape)}. "
+            "Per-dimension stats are not broadcast over time; compute per-timestep stats with "
+            "physicalai.policies.xr0.compute_action_chunk_stats."
+        )
+        raise ValueError(msg)
+
+    out_mean = torch.zeros(length, dim)
+    out_std = torch.ones(length, dim)
+    width = min(dim, int(t_mean.shape[-1]))
+    out_mean[:, :width] = t_mean[:, :width]
+    out_std[:, :width] = t_std[:, :width]
+    return out_mean, out_std
+
+
 class XR0Preprocessor(torch.nn.Module):
     """Transform framework observations into the XR0 model batch.
 
@@ -204,13 +258,24 @@ class XR0Preprocessor(torch.nn.Module):
         processor_name: HuggingFace id of the Qwen3-VL processor.
         max_token_len: Fixed prompt length the OpenVINO tokenizer pads to at export
             (matches the graph's baked ``tokenizer_max_length``).
-        normalize_state: When True, normalize the state with per-dimension
+        chunk_size: Number of predicted action timesteps; the temporal length of
+            the action normalization buffers.
+        state_len: Number of state timesteps; the temporal length of the state
+            normalization buffers.
+        normalize_state: When True, normalize the state with per-timestep
             mean/std (from ``features`` or explicit ``state_mean`` / ``state_std``).
             Defaults to False (raw state, matching the upstream recipe).
-        state_mean: Optional explicit ``max_state_dim`` state mean overriding the
-            feature-derived value (used to reload the exported normalization).
-        state_std: Optional explicit ``max_state_dim`` state std overriding the
-            feature-derived value (used to reload the exported normalization).
+        state_mean: Optional explicit ``(state_len, max_state_dim)`` state mean
+            overriding the feature-derived value (used to reload the exported
+            normalization).
+        state_std: Optional explicit ``(state_len, max_state_dim)`` state std
+            overriding the feature-derived value (used to reload the exported
+            normalization).
+        action_mode: ``"absolute"`` or ``"delta"``.
+        action_mean: Optional explicit ``(chunk_size, max_action_dim)`` action
+            mean overriding the feature-derived value.
+        action_std: Optional explicit ``(chunk_size, max_action_dim)`` action std
+            overriding the feature-derived value.
     """
 
     action_mean: torch.Tensor
@@ -228,9 +293,11 @@ class XR0Preprocessor(torch.nn.Module):
         processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
         max_token_len: int = 256,
         *,
+        chunk_size: int = 30,
+        state_len: int = 1,
         normalize_state: bool = False,
-        state_mean: Sequence[float] | None = None,
-        state_std: Sequence[float] | None = None,
+        state_mean: Sequence[float] | torch.Tensor | None = None,
+        state_std: Sequence[float] | torch.Tensor | None = None,
         action_mode: str = "absolute",
         action_mean: Sequence[float] | torch.Tensor | None = None,
         action_std: Sequence[float] | torch.Tensor | None = None,
@@ -239,6 +306,8 @@ class XR0Preprocessor(torch.nn.Module):
         super().__init__()
         self.max_state_dim = max_state_dim
         self.max_action_dim = max_action_dim
+        self.chunk_size = int(chunk_size)
+        self.state_len = int(state_len)
         self.image_factor = image_factor
         self.image_max_pixels = image_max_pixels
         self.processor_name = processor_name
@@ -248,12 +317,17 @@ class XR0Preprocessor(torch.nn.Module):
         self._processor: Any = None
 
         # Explicit ``action_mean`` / ``action_std`` (e.g. per-timestep delta
-        # stats for ``action_mode="delta"``) take precedence over the
-        # feature-derived absolute-action stats. They may be 1D ``(D,)`` or 2D
-        # ``(T, D)`` and broadcast over the action chunk.
+        # stats computed over the training set) take precedence over the
+        # feature-derived stats. Both paths yield ``(chunk_size,
+        # max_action_dim)`` buffers -- there is no per-dimension variant.
         if action_mean is not None and action_std is not None:
-            mean = torch.as_tensor(action_mean, dtype=torch.float32)
-            std = torch.as_tensor(action_std, dtype=torch.float32)
+            mean, std = _to_chunk_stats(
+                action_mean,
+                action_std,
+                length=self.chunk_size,
+                dim=self.max_action_dim,
+                name="action",
+            )
         else:
             mean, std = self._action_stats(features)
         self.register_buffer("action_mean", mean, persistent=False)
@@ -265,64 +339,64 @@ class XR0Preprocessor(torch.nn.Module):
         # exported manifest) take precedence over feature-derived stats so the
         # exported graph reproduces the training normalization exactly.
         if state_mean is not None and state_std is not None:
-            s_mean = torch.as_tensor(state_mean, dtype=torch.float32).flatten()
-            s_std = torch.as_tensor(state_std, dtype=torch.float32).flatten()
+            s_mean, s_std = _to_chunk_stats(
+                state_mean,
+                state_std,
+                length=self.state_len,
+                dim=self.max_state_dim,
+                name="state",
+            )
         else:
             s_mean, s_std = self._state_stats(features)
         self.register_buffer("state_mean", s_mean, persistent=False)
         self.register_buffer("state_std", s_std, persistent=False)
 
     def _action_stats(self, features: dict[str, Feature] | None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build padded ``(max_action_dim,)`` mean/std buffers from action features.
+        """Build per-timestep ``(chunk_size, max_action_dim)`` mean/std buffers from action features.
 
         Returns:
-            A ``(mean, std)`` tuple of ``(max_action_dim,)`` buffers.
+            A ``(mean, std)`` tuple of ``(chunk_size, max_action_dim)`` buffers.
         """
-        mean = torch.zeros(self.max_action_dim)
-        std = torch.ones(self.max_action_dim)
-        if features is None:
-            return mean, std
-        for feature in features.values():
+        for feature in (features or {}).values():
             if feature.ftype != FeatureType.ACTION or feature.normalization_data is None:
                 continue
             norm = feature.normalization_data
             if norm.mean is None or norm.std is None:
                 continue
-            feat_mean = torch.as_tensor(norm.mean, dtype=torch.float32).flatten()
-            feat_std = torch.as_tensor(norm.std, dtype=torch.float32).flatten()
-            dim = min(self.max_action_dim, feat_mean.numel())
-            mean[:dim] = feat_mean[:dim]
-            std[:dim] = feat_std[:dim]
-            break
-        return mean, std
+            return _to_chunk_stats(
+                norm.mean,
+                norm.std,
+                length=self.chunk_size,
+                dim=self.max_action_dim,
+                name="action",
+            )
+        return torch.zeros(self.chunk_size, self.max_action_dim), torch.ones(self.chunk_size, self.max_action_dim)
 
     def _state_stats(self, features: dict[str, Feature] | None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build padded ``(max_state_dim,)`` mean/std buffers from state features.
+        """Build per-timestep ``(state_len, max_state_dim)`` mean/std buffers from state features.
 
         Returns identity buffers (mean 0, std 1) when state normalization is
         disabled or no state stats are available, so ``_prepare_state`` is a
         no-op and raw-state checkpoints stay bit-for-bit unchanged.
 
         Returns:
-            A ``(mean, std)`` tuple of ``(max_state_dim,)`` buffers.
+            A ``(mean, std)`` tuple of ``(state_len, max_state_dim)`` buffers.
         """
-        mean = torch.zeros(self.max_state_dim)
-        std = torch.ones(self.max_state_dim)
-        if features is None or not self.normalize_state:
-            return mean, std
-        for feature in features.values():
-            if feature.ftype != FeatureType.STATE or feature.normalization_data is None:
-                continue
-            norm = feature.normalization_data
-            if norm.mean is None or norm.std is None:
-                continue
-            feat_mean = torch.as_tensor(norm.mean, dtype=torch.float32).flatten()
-            feat_std = torch.as_tensor(norm.std, dtype=torch.float32).flatten()
-            dim = min(self.max_state_dim, feat_mean.numel())
-            mean[:dim] = feat_mean[:dim]
-            std[:dim] = feat_std[:dim]
-            break
-        return mean, std
+        if self.normalize_state:
+            for feature in (features or {}).values():
+                if feature.ftype != FeatureType.STATE or feature.normalization_data is None:
+                    continue
+                norm = feature.normalization_data
+                if norm.mean is None or norm.std is None:
+                    continue
+                return _to_chunk_stats(
+                    norm.mean,
+                    norm.std,
+                    length=self.state_len,
+                    dim=self.max_state_dim,
+                    name="state",
+                )
+        return torch.zeros(self.state_len, self.max_state_dim), torch.ones(self.state_len, self.max_state_dim)
 
     @property
     def processor(self) -> Any:  # noqa: ANN401
@@ -421,11 +495,13 @@ class XR0Preprocessor(torch.nn.Module):
             state = state[:, -1, :]
         state = state.to(torch.float32)
         state = F.pad(state, (0, max(0, self.max_state_dim - state.shape[-1])))[:, : self.max_state_dim]
+        state = state.unsqueeze(1)  # (B, 1, max_state_dim)
         if self.normalize_state:
+            # ``(B, 1, D)`` against the per-timestep ``(state_len, D)`` buffers.
             mean = self.state_mean.to(state.device)
             std = self.state_std.to(state.device)
             state = _normalize_action(state, mean, std)
-        return state.unsqueeze(1).to(device)
+        return state.to(device)
 
     def _prepare_action(
         self,
@@ -444,9 +520,16 @@ class XR0Preprocessor(torch.nn.Module):
             A ``(action, mask)`` tuple of padded action and its validity mask.
 
         Raises:
-            ValueError: If ``action_mode == 'delta'`` but no ``state`` is provided.
+            ValueError: If ``action_mode == 'delta'`` but no ``state`` is provided,
+                or if the action chunk length does not match ``chunk_size``.
         """
         action = action.to(torch.float32).clone()  # Clone tensor to avoid mutating the input action
+        if action.shape[-2] != self.chunk_size:
+            msg = (
+                f"expected an action chunk of {self.chunk_size} timesteps to match the per-timestep "
+                f"normalization stats, got {action.shape[-2]}"
+            )
+            raise ValueError(msg)
         if self.action_mode == "delta":
             if state is None:
                 msg = "action_mode='delta' requires the current state to form the delta target."
@@ -529,6 +612,13 @@ class XR0Postprocessor(torch.nn.Module):
         max_action_dim: Padded action dimension used by the preprocessor.
         features: Optional feature map used to recover the action mean/std and
             the original action dimension.
+        chunk_size: Number of predicted action timesteps; the temporal length of
+            the action normalization buffers.
+        action_mode: ``"absolute"`` or ``"delta"``.
+        action_mean: Optional explicit ``(chunk_size, max_action_dim)`` action
+            mean overriding the feature-derived value.
+        action_std: Optional explicit ``(chunk_size, max_action_dim)`` action std
+            overriding the feature-derived value.
     """
 
     action_mean: torch.Tensor
@@ -539,6 +629,7 @@ class XR0Postprocessor(torch.nn.Module):
         max_action_dim: int = 32,
         features: dict[str, Feature] | None = None,
         *,
+        chunk_size: int = 30,
         action_mode: str = "absolute",
         action_mean: Sequence[float] | torch.Tensor | None = None,
         action_std: Sequence[float] | torch.Tensor | None = None,
@@ -546,32 +637,42 @@ class XR0Postprocessor(torch.nn.Module):
         """Initialize the XR0 postprocessor."""
         super().__init__()
         self.max_action_dim = max_action_dim
+        self.chunk_size = int(chunk_size)
         self.action_dim: int | None = None
         self.action_mode = str(action_mode)
 
-        mean = torch.zeros(max_action_dim)
-        std = torch.ones(max_action_dim)
-        if features is not None:
-            for feature in features.values():
-                if feature.ftype != FeatureType.ACTION or feature.normalization_data is None:
-                    continue
-                norm = feature.normalization_data
-                if norm.mean is None or norm.std is None:
-                    continue
-                feat_mean = torch.as_tensor(norm.mean, dtype=torch.float32).flatten()
-                feat_std = torch.as_tensor(norm.std, dtype=torch.float32).flatten()
-                dim = min(max_action_dim, feat_mean.numel())
-                mean[:dim] = feat_mean[:dim]
-                std[:dim] = feat_std[:dim]
-                self.action_dim = int(feat_mean.numel())
-                break
+        mean = torch.zeros(self.chunk_size, max_action_dim)
+        std = torch.ones(self.chunk_size, max_action_dim)
+        for feature in (features or {}).values():
+            if feature.ftype != FeatureType.ACTION or feature.normalization_data is None:
+                continue
+            norm = feature.normalization_data
+            if norm.mean is None or norm.std is None:
+                continue
+            mean, std = _to_chunk_stats(
+                norm.mean,
+                norm.std,
+                length=self.chunk_size,
+                dim=max_action_dim,
+                name="action",
+            )
+            # The unpadded action width is the feature's last axis, not its
+            # element count: the stats are per-timestep ``(chunk_size, D)``.
+            feat_dim = int(torch.as_tensor(norm.mean).shape[-1])
+            self.action_dim = min(max_action_dim, feat_dim)
+            break
 
-        # Explicit stats (per-timestep delta stats for ``action_mode="delta"``)
-        # override the feature-derived denormalization mean/std; the unpadded
-        # ``action_dim`` is still recovered from ``features`` for the final slice.
+        # Explicit per-timestep stats (e.g. delta stats computed over the
+        # training set) override the feature-derived denormalization mean/std;
+        # the unpadded ``action_dim`` is still recovered from ``features``.
         if action_mean is not None and action_std is not None:
-            mean = torch.as_tensor(action_mean, dtype=torch.float32)
-            std = torch.as_tensor(action_std, dtype=torch.float32)
+            mean, std = _to_chunk_stats(
+                action_mean,
+                action_std,
+                length=self.chunk_size,
+                dim=max_action_dim,
+                name="action",
+            )
 
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
@@ -587,11 +688,18 @@ class XR0Postprocessor(torch.nn.Module):
             Batch dict with the denormalized action.
 
         Raises:
-            ValueError: If ``action_mode == 'delta'`` but no ``state`` is provided.
+            ValueError: If ``action_mode == 'delta'`` but no ``state`` is provided,
+                or if the action chunk length does not match ``chunk_size``.
         """
         batch = dict(batch)
         if ACTION in batch and batch[ACTION] is not None:
             action = batch[ACTION].to(torch.float32)
+            if action.shape[-2] != self.chunk_size:
+                msg = (
+                    f"expected an action chunk of {self.chunk_size} timesteps to match the per-timestep "
+                    f"normalization stats, got {action.shape[-2]}"
+                )
+                raise ValueError(msg)
             mean = self.action_mean.to(action.device)
             std = self.action_std.to(action.device)
             action = _denormalize_action(action, mean, std)
@@ -623,31 +731,39 @@ def make_xr0_preprocessors(
     max_action_dim: int = 32,
     stats: dict[str, dict[str, Any]] | None = None,
     *,
+    chunk_size: int = 30,
+    state_len: int = 1,
     image_factor: int = 32,
     image_max_pixels: int = 90000,
     processor_name: str = "Qwen/Qwen3-VL-4B-Instruct",
     normalize_state: bool = False,
     action_mode: str = "absolute",
-    action_delta_mean: Sequence[float] | torch.Tensor | None = None,
-    action_delta_std: Sequence[float] | torch.Tensor | None = None,
+    action_mean: Sequence[float] | torch.Tensor | None = None,
+    action_std: Sequence[float] | torch.Tensor | None = None,
 ) -> tuple[XR0Preprocessor, XR0Postprocessor]:
     """Create the XR0 preprocessor / postprocessor pair from dataset stats.
 
     Args:
         max_state_dim: Padded state dimension.
         max_action_dim: Padded action dimension.
-        stats: Dataset statistics as nested dicts (LeRobot format).
+        stats: Dataset statistics as nested dicts (LeRobot format). The action
+            entry must carry per-timestep ``(chunk_size, D)`` mean/std; compute
+            them with
+            :func:`~physicalai.policies.xr0.stats.compute_action_chunk_stats`.
+        chunk_size: Number of predicted action timesteps.
+        state_len: Number of state timesteps.
         image_factor: Patch-alignment factor for image resizing.
         image_max_pixels: Maximum image area for image resizing.
         processor_name: HuggingFace id of the Qwen3-VL processor.
         normalize_state: When True, normalize the state with the dataset's
-            per-dimension mean/std. Defaults to False (raw state).
+            mean/std. Defaults to False (raw state).
         action_mode: ``"absolute"`` (default) or ``"delta"``. In delta mode the
-            action target/inverse use ``action_delta_mean`` / ``action_delta_std``.
-        action_delta_mean: Per-timestep delta-action mean (``(chunk_size,
-            max_action_dim)``), used only when ``action_mode="delta"``.
-        action_delta_std: Per-timestep delta-action std, same shape as
-            ``action_delta_mean``.
+            action target is ``action[t] - state`` and the postprocessor re-adds
+            the state.
+        action_mean: Per-timestep action mean (``(chunk_size,
+            max_action_dim)``) overriding the stats-derived value. Applies to
+            both action modes.
+        action_std: Per-timestep action std, same shape as ``action_mean``.
 
     Returns:
         Tuple of (preprocessor, postprocessor).
@@ -679,9 +795,9 @@ def make_xr0_preprocessors(
 
     override_mean: torch.Tensor | None = None
     override_std: torch.Tensor | None = None
-    if action_mode == "delta" and action_delta_mean is not None and action_delta_std is not None:
-        override_mean = torch.as_tensor(action_delta_mean, dtype=torch.float32)
-        override_std = torch.as_tensor(action_delta_std, dtype=torch.float32)
+    if action_mean is not None and action_std is not None:
+        override_mean = torch.as_tensor(action_mean, dtype=torch.float32)
+        override_std = torch.as_tensor(action_std, dtype=torch.float32)
 
     preprocessor = XR0Preprocessor(
         max_state_dim=max_state_dim,
@@ -690,6 +806,8 @@ def make_xr0_preprocessors(
         image_factor=image_factor,
         image_max_pixels=image_max_pixels,
         processor_name=processor_name,
+        chunk_size=chunk_size,
+        state_len=state_len,
         normalize_state=normalize_state,
         action_mode=action_mode,
         action_mean=override_mean,
@@ -698,6 +816,7 @@ def make_xr0_preprocessors(
     postprocessor = XR0Postprocessor(
         max_action_dim=max_action_dim,
         features=features,
+        chunk_size=chunk_size,
         action_mode=action_mode,
         action_mean=override_mean,
         action_std=override_std,

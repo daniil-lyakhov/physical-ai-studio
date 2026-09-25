@@ -35,6 +35,7 @@ from openvino.preprocess import PrePostProcessor
 from physicalai.data.observation import IMAGES, STATE, TASK
 from physicalai.inference.constants import TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
 from physicalai.policies import XR0
+from physicalai.policies.xr0 import XR0Config
 from physicalai.policies.xr0.pretrained_utils import extract_xr0_dataset_stats
 
 # ---------------------------------------------------------------------------
@@ -81,12 +82,13 @@ def _build_dataset_stats() -> dict[str, Any]:
 
     The checkpoint only carries action normalization stats, so the observation
     schema (state + two camera views) is added so ``sample_input`` and the
-    preprocessor have everything they need.
+    preprocessor have everything they need. The published per-timestep action
+    stats are expanded to the policy's chunk length.
 
     Returns:
         The dataset stats dict augmented with the observation schema.
     """
-    stats = extract_xr0_dataset_stats(_CHECKPOINT) or {}
+    stats = extract_xr0_dataset_stats(_CHECKPOINT, chunk_size=XR0Config().chunk_size) or {}
     stats["observation.state"] = {"name": "state", "type": "STATE", "shape": (8,)}
     stats["observation.images.base"] = {"name": "images.base", "type": "VISUAL", "shape": (3, 256, 256)}
     stats["observation.images.wrist_left"] = {

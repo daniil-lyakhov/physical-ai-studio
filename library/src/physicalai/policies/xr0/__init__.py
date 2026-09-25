@@ -21,6 +21,7 @@ from .pretrained_utils import (
     resolve_pretrained_path,
 )
 from .qwen3_vlm import XR0Qwen3VL
+from .stats import compute_action_chunk_stats
 
 __all__ = [
     "XR0",
@@ -30,6 +31,7 @@ __all__ = [
     "XR0Postprocessor",
     "XR0Preprocessor",
     "XR0Qwen3VL",
+    "compute_action_chunk_stats",
     "extract_xr0_dataset_stats",
     "load_xr0_pretrained_weights",
     "make_xr0_preprocessors",

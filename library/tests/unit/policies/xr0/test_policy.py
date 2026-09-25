@@ -26,7 +26,6 @@ from physicalai.policies import get_physicalai_policy_class, get_policy
 from physicalai.policies.xr0 import XR0, XR0Config
 
 
-
 def _minimal_export_stats() -> dict[str, dict[str, Any]]:
     """Return minimal dataset statistics for exercising the export hooks."""
     return {
@@ -98,6 +97,46 @@ class TestXR0Policy:
         # eval forward routes to predict_action_chunk, which raises without a model
         with pytest.raises(ValueError, match="not initialized"):
             policy(obs)
+
+
+class TestSetActionStats:
+    """Installing per-timestep action statistics on the policy."""
+
+    def test_stats_are_stored_and_checkpointed(self) -> None:
+        policy = XR0(chunk_size=4, n_action_steps=4)
+        shape = (policy.config.chunk_size, policy.config.max_action_dim)
+        mean = torch.full(shape, 0.5)
+        std = torch.full(shape, 2.0)
+
+        policy.set_action_stats(mean, std)
+
+        assert torch.allclose(policy._action_mean, mean)  # noqa: SLF001
+        assert torch.allclose(policy._action_std, std)  # noqa: SLF001
+        # mirrored into hparams so they survive a checkpoint round-trip.
+        assert policy.hparams["action_mean"] == mean.tolist()
+        assert policy.hparams["action_std"] == std.tolist()
+
+    def test_non_float_input_is_converted(self) -> None:
+        policy = XR0(chunk_size=4, n_action_steps=4)
+        shape = (policy.config.chunk_size, policy.config.max_action_dim)
+        policy.set_action_stats(torch.zeros(shape, dtype=torch.float64), torch.ones(shape, dtype=torch.float64))
+        assert policy._action_mean.dtype is torch.float32  # noqa: SLF001
+
+    @pytest.mark.parametrize("bad", ["per_dim", "wrong_chunk", "wrong_width"])
+    def test_wrong_shape_raises(self, bad: str) -> None:
+        policy = XR0(chunk_size=4, n_action_steps=4)
+        chunk, width = policy.config.chunk_size, policy.config.max_action_dim
+        shapes = {
+            "per_dim": (width,),  # per-dimension stats are no longer accepted
+            "wrong_chunk": (chunk + 1, width),
+            "wrong_width": (chunk, width - 1),
+        }
+        good = torch.zeros(chunk, width)
+        bad_tensor = torch.zeros(shapes[bad])
+        with pytest.raises(ValueError, match="must have shape"):
+            policy.set_action_stats(bad_tensor, good.clone())
+        with pytest.raises(ValueError, match="must have shape"):
+            policy.set_action_stats(good.clone(), bad_tensor)
 
 
 class TestXR0Features:
@@ -270,21 +309,20 @@ class TestXR0DeltaMode:
         std: list[list[float]] | None,
         expect_stats: bool,
     ) -> None:
-        policy = XR0(action_mode="delta", action_delta_mean=mean, action_delta_std=std)
+        policy = XR0(action_mode="delta", action_mean=mean, action_std=std)
         if expect_stats:
             # Stored as float32 tensors for the preprocessor and mirrored into
             # hparams as plain lists so they round-trip through checkpoints.
-            assert isinstance(policy._action_delta_mean, torch.Tensor)
-            assert isinstance(policy._action_delta_std, torch.Tensor)
-            assert policy._action_delta_mean.dtype is torch.float32
-            assert policy._action_delta_std.dtype is torch.float32
-            assert policy.hparams["action_delta_mean"] == mean
-            assert policy.hparams["action_delta_std"] == std
+            assert isinstance(policy._action_mean, torch.Tensor)
+            assert isinstance(policy._action_std, torch.Tensor)
+            assert policy._action_mean.dtype is torch.float32
+            assert policy._action_std.dtype is torch.float32
+            assert policy.hparams["action_mean"] == mean
+            assert policy.hparams["action_std"] == std
         else:
-            assert policy._action_delta_mean is None
-            assert policy._action_delta_std is None
+            assert policy._action_mean is None
+            assert policy._action_std is None
             # ``save_hyperparameters`` still captures the init args, but they are
             # left as ``None`` (not overwritten with the mirrored lists).
-            assert policy.hparams["action_delta_mean"] is None
-            assert policy.hparams["action_delta_std"] is None
-
+            assert policy.hparams["action_mean"] is None
+            assert policy.hparams["action_std"] is None
