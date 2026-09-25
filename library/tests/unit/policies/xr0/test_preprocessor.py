@@ -132,6 +132,7 @@ class TestViewTitle:
     """Human-readable camera-view titles embedded in the chat prompt."""
 
     def test_known_views_use_reference_titles(self) -> None:
+        assert _view_title("ego") == "Ego"
         assert _view_title("base") == "Base"
         assert _view_title("wrist_left") == "Left-Wrist"
         assert _view_title("wrist_right") == "Right-Wrist"
@@ -212,6 +213,81 @@ class TestExtractViewImages:
         assert views == ["wrist_left", "base"]
         assert int(sample[0].max()) == 255
         assert int(sample[1].max()) == 0
+
+
+class TestImageKeyViewMap:
+    """Dataset image keys renamed onto the canonical XR0 view names."""
+
+    @staticmethod
+    def _batch() -> dict:
+        # Keys and order of the local ``Put-the-yellow-ball-to-the-black-box``
+        # dataset: neither name is a canonical XR0 view.
+        return {
+            "images.pov_black_follower_camera": torch.ones(1, 3, 32, 32),
+            "images.top_camera": torch.zeros(1, 3, 32, 32),
+        }
+
+    def test_renames_and_reorders_canonically(self) -> None:
+        # The map is declared in dataset order, but the prompt must follow the
+        # canonical order the pretrained checkpoint was trained with.
+        pre = XR0Preprocessor(
+            image_key_view_map={
+                "pov_black_follower_camera": "wrist_left",
+                "top_camera": "ego",
+            },
+        )
+        views, images = pre._extract_view_images(self._batch())  # noqa: SLF001
+        sample = images[0]
+        assert views == ["ego", "wrist_left"]
+        # ``ego`` is top_camera (0) and ``wrist_left`` is the follower cam (255).
+        assert int(sample[0].max()) == 0
+        assert int(sample[1].max()) == 255
+
+    def test_prompt_matches_pretrain_reference(self) -> None:
+        # Byte-for-byte parity with the reference prompt of the base Pretrain
+        # checkpoint (xr0/docs/data_format.md, mibot/server/runtime/client.py).
+        pre = XR0Preprocessor(image_key_view_map={"top_camera": "ego", "pov_black_follower_camera": "wrist_left"})
+        views, _ = pre._extract_view_images(self._batch())  # noqa: SLF001
+        img = Image.new("RGB", (32, 32))
+        content = pre._build_message("pick up the cube", views, [img, img])[0]["content"]  # noqa: SLF001
+        assert content[1]["text"] == "# Ego View\n"
+        assert content[4]["text"] == "# Left-Wrist View\n"
+
+    def test_accepts_prefixed_keys(self) -> None:
+        pre = XR0Preprocessor(
+            image_key_view_map={
+                "observation.images.top_camera": "ego",
+                "images.pov_black_follower_camera": "wrist_left",
+            },
+        )
+        views, _ = pre._extract_view_images(self._batch())  # noqa: SLF001
+        assert views == ["ego", "wrist_left"]
+
+    def test_empty_map_keeps_dataset_names(self) -> None:
+        pre = XR0Preprocessor()
+        views, _ = pre._extract_view_images(self._batch())  # noqa: SLF001
+        assert views == ["pov_black_follower_camera", "top_camera"]
+
+    def test_key_mismatch_raises(self) -> None:
+        pre = XR0Preprocessor(image_key_view_map={"top_camera": "ego"})
+        with pytest.raises(ValueError, match="must match the batch image keys exactly"):
+            pre._extract_view_images(self._batch())  # noqa: SLF001
+
+    def test_unknown_view_name_raises(self) -> None:
+        with pytest.raises(ValueError, match="canonical XR0 view names"):
+            XR0Preprocessor(image_key_view_map={"top_camera": "front_cam"})
+
+    def test_duplicate_view_name_raises(self) -> None:
+        with pytest.raises(ValueError, match="must be unique"):
+            XR0Preprocessor(image_key_view_map={"top_camera": "ego", "pov_black_follower_camera": "ego"})
+
+    def test_factory_threads_the_map(self) -> None:
+        pre, _ = make_xr0_preprocessors(
+            stats=_stats(),
+            chunk_size=HORIZON,
+            image_key_view_map={"top_camera": "ego"},
+        )
+        assert pre.image_key_view_map == {"images.top_camera": "ego"}
 
 
 class TestPrepareAction:

@@ -80,6 +80,15 @@ class TestXR0Config:
         assert "config" in policy.hparams
         assert policy.hparams["config"]["chunk_size"] == 30
 
+    def test_image_key_view_map_defaults_empty(self) -> None:
+        assert XR0().config.image_key_view_map == {}
+
+    def test_image_key_view_map_wiring(self) -> None:
+        view_map = {"top_camera": "ego", "pov_black_follower_camera": "wrist_left"}
+        policy = XR0(image_key_view_map=view_map)
+        assert policy.config.image_key_view_map == view_map
+        assert policy.hparams.image_key_view_map == view_map
+
 
 class TestXR0Policy:
     """Policy behaviour without an initialized model."""

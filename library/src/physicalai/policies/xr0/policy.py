@@ -203,6 +203,11 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         image_resolution: Target image resolution (unused placeholder kept for
             config parity; the Qwen3-VL processor performs area-based resizing).
         tokenizer_max_length: Maximum tokenizer length.
+        image_key_view_map: Mapping from dataset image key to canonical XR0 view
+            name (``"ego"``, ``"base"``, ``"wrist_left"`` or ``"wrist_right"``),
+            used to rename and reorder the prompt's view sections so they match
+            the pretrained checkpoint. Keys may be given with or without the
+            ``observation.images.`` prefix.
         gradient_checkpointing: Enable gradient checkpointing.
         compile_model: Whether to use torch.compile.
         compile_mode: Torch compile mode.
@@ -274,6 +279,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         async_train: bool = False,
         image_resolution: tuple[int, int] = (256, 256),
         tokenizer_max_length: int = 256,
+        image_key_view_map: dict[str, str] | None = None,
         gradient_checkpointing: bool = True,
         compile_model: bool = False,
         compile_mode: str = "max-autotune",
@@ -333,6 +339,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             async_train=async_train,
             image_resolution=image_resolution,
             tokenizer_max_length=tokenizer_max_length,
+            image_key_view_map=image_key_view_map or {},
             gradient_checkpointing=gradient_checkpointing,
             compile_model=compile_model,
             compile_mode=compile_mode,
@@ -440,6 +447,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             chunk_size=cfg.chunk_size,
             state_len=cfg.state_len,
             processor_name=cfg.vlm_model_id,
+            image_key_view_map=cfg.image_key_view_map,
             normalize_state=cfg.normalize_state,
             action_mode=cfg.action_mode,
             action_mean=self._action_mean,
@@ -467,6 +475,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             chunk_size=cfg.chunk_size,
             state_len=cfg.state_len,
             processor_name=cfg.vlm_model_id,
+            image_key_view_map=cfg.image_key_view_map,
             normalize_state=cfg.normalize_state,
             action_mode=cfg.action_mode,
             action_mean=self._action_mean,
@@ -1019,6 +1028,11 @@ class XR0(XR0ExportablePolicyMixin, Policy):
                 patch_size=int(image_processor.patch_size),
                 merge_size=int(image_processor.merge_size),
                 temporal_patch_size=int(image_processor.temporal_patch_size),
+                # Bake the camera-view renaming so the exported prompt carries the
+                # same view titles, in the same order, as at training time. The
+                # config's raw keys are exported (not the prefix-qualified ones)
+                # because the runtime uses its own ``images.`` key prefix.
+                image_key_view_map=dict(cfg.image_key_view_map),
                 # Bake the state normalization so the exported graph applies
                 # the exact transform used at training time (identity when
                 # ``normalize_state`` is disabled -> raw-state parity).
