@@ -349,32 +349,45 @@ def _load_json_artifact(pretrained_name_or_path: str | Path, filename: str, **kw
 def extract_xr0_dataset_stats(
     pretrained_name_or_path: str | Path,
     robot_type: str | None = None,
+    chunk_size: int | None = None,
     **kwargs: object,
 ) -> dict[str, dict[str, object]] | None:
     """Extract action-normalization stats from a pretrained XR0 checkpoint.
 
     The source publishes per-robot action ``mean`` / ``std`` in the processor's
-    ``preprocessor_config.json`` under ``action_config``. The stats are stored
-    per action-timestep but are time-invariant, so they reduce to a single
-    per-dimension vector. Only the leading dimensions with ``std > 1e-5`` are
-    active (mirroring the source ``get_action_mask``); trailing padding
-    dimensions are dropped so the postprocessor emits the true action size
-    (e.g. 7 for LIBERO).
+    ``preprocessor_config.json`` under ``action_config``, stored per
+    action-timestep as ``(T, 32)``. The time axis is preserved, since XR0
+    normalizes the action chunk per timestep. Only the leading dimensions with
+    ``std > 1e-5`` at any timestep are active (mirroring the source
+    ``get_action_mask``); trailing padding dimensions are dropped so the
+    postprocessor emits the true action size (e.g. 7 for LIBERO).
+
+    When ``chunk_size`` is given and differs from the published ``T``, the stats
+    are repeated along the time axis -- but only after verifying they are
+    time-invariant, so no information is fabricated. The released checkpoints
+    publish ``T = 10`` (the reference eval's execution horizon) with identical
+    rows, while the model predicts a 30-step chunk.
 
     Args:
         pretrained_name_or_path: Local checkpoint dir/file or HuggingFace repo id.
         robot_type: Which ``action_config`` entry to use. Defaults to the sole
             entry (or the first, when several are present).
+        chunk_size: Expected number of action timesteps. ``None`` keeps the
+            published length.
         **kwargs: Optional ``huggingface_hub`` download options.
 
     Returns:
-        A ``dataset_stats`` dict ``{"action": {...}}`` consumable by
+        A ``dataset_stats`` dict ``{"action": {...}}`` whose ``mean`` / ``std``
+        are per-timestep ``(T, real_dim)`` arrays (``shape`` stays the action
+        width ``(real_dim,)``), consumable by
         :func:`~physicalai.policies.xr0.preprocessor.make_xr0_preprocessors`,
         or ``None`` if no ``action_config`` is available.
 
     Raises:
         KeyError: If ``robot_type`` is not present in the checkpoint's
             ``action_config``.
+        ValueError: If the published stats vary over time but their length does
+            not match ``chunk_size``.
     """
     import numpy as np  # noqa: PLC0415
 
@@ -392,22 +405,30 @@ def extract_xr0_dataset_stats(
         raise KeyError(msg)
 
     entry = action_config[robot_type]
-    mean = np.asarray(entry["mean"], dtype=np.float64)
-    std = np.asarray(entry["std"], dtype=np.float64)
+    mean = np.atleast_2d(np.asarray(entry["mean"], dtype=np.float64))
+    std = np.atleast_2d(np.asarray(entry["std"], dtype=np.float64))
 
-    # Collapse the (time-invariant) per-timestep dimension to a per-dim vector.
-    if mean.ndim > 1:
-        mean = mean.reshape(-1, mean.shape[-1])[0]
-        std = std.reshape(-1, std.shape[-1])[0]
+    if chunk_size is not None and mean.shape[0] != chunk_size:
+        time_invariant = bool((mean == mean[0]).all() and (std == std[0]).all())
+        if not time_invariant:
+            msg = (
+                f"checkpoint publishes {mean.shape[0]} timesteps of action stats that vary over time, "
+                f"but the policy predicts {chunk_size} timesteps"
+            )
+            raise ValueError(msg)
+        mean = np.repeat(mean[:1], chunk_size, axis=0)
+        std = np.repeat(std[:1], chunk_size, axis=0)
 
-    active = np.nonzero(std > _ACTION_ACTIVE_STD)[0]
+    active = np.nonzero(std.max(axis=0) > _ACTION_ACTIVE_STD)[0]
     real_dim = int(active[-1]) + 1 if active.size else int(mean.shape[-1])
-    mean = mean[:real_dim]
-    std = std[:real_dim]
+    mean = mean[:, :real_dim]
+    std = std[:, :real_dim]
 
     return {
         ACTION: {
             "name": ACTION,
+            # ``shape`` describes the action feature itself (its width); the
+            # mean/std arrays carry the extra per-timestep axis.
             "shape": (real_dim,),
             "mean": mean.tolist(),
             "std": std.tolist(),
