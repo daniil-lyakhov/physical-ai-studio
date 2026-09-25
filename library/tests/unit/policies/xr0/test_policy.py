@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import types
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -92,6 +93,19 @@ class TestXR0Config:
 
 class TestXR0Policy:
     """Policy behaviour without an initialized model."""
+
+    def test_augmentation_only_on_training_forward(self) -> None:
+        policy = XR0(augment_images=True)
+        policy._preprocessor = MagicMock(return_value={})  # noqa: SLF001
+        policy.model = MagicMock()
+        obs = Observation(state=torch.randn(1, 8))
+
+        policy.forward(obs)
+        policy.compute_val_loss(obs)
+
+        assert policy.hparams.augment_images is True
+        assert policy._preprocessor.call_args_list[0].kwargs == {"augment_images": True}  # noqa: SLF001
+        assert policy._preprocessor.call_args_list[1].kwargs == {}  # noqa: SLF001
 
     @pytest.mark.parametrize("method", ["forward", "predict_action_chunk"])
     def test_methods_raise_without_model(self, method: str) -> None:

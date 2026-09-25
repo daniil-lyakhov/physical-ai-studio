@@ -286,6 +286,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         freeze_vision_encoder: bool = False,
         freeze_input_embeddings: bool = True,
         normalize_state: bool = False,
+        augment_images: bool = False,
         action_mode: Literal["absolute", "delta"] = "absolute",
         action_mean: Sequence[float] | torch.Tensor | None = None,
         action_std: Sequence[float] | torch.Tensor | None = None,
@@ -360,6 +361,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
 
         self.save_hyperparameters(ignore=["config", "compile_model", "pretrained_name_or_path"])
         self._set_hparam_keys()
+        self.augment_images = augment_images
 
         # Per-timestep action stats overriding the dataset-derived ones.
         # Stored as tensors for the preprocessors and mirrored into hparams as
@@ -605,7 +607,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             if self.model is None or self._preprocessor is None:
                 msg = "Model is not initialized"
                 raise ValueError(msg)
-            processed = self._preprocessor(batch.to_dict())
+            processed = self._preprocessor(batch.to_dict(), augment_images=self.augment_images)
             return self.model(processed)
         return self.predict_action_chunk(batch)
 

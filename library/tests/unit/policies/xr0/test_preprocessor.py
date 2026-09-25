@@ -11,6 +11,8 @@ and are skipped otherwise; the normalization round-trip test does not.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import numpy as np
 from PIL import Image
 import pytest
@@ -213,6 +215,34 @@ class TestExtractViewImages:
         assert views == ["wrist_left", "base"]
         assert int(sample[0].max()) == 255
         assert int(sample[1].max()) == 0
+
+    def test_augmentation_crops_after_resize_without_changing_geometry(self) -> None:
+        pre = XR0Preprocessor()
+        image = torch.arange(64 * 64, dtype=torch.int32).reshape(64, 64).remainder(256).to(torch.uint8)
+        batch = {"images.base": image.expand(1, 3, -1, -1)}
+        _, plain = pre._extract_view_images(batch)  # noqa: SLF001
+        with (
+            patch("physicalai.policies.xr0.preprocessor.random.uniform", side_effect=[0.0, 1.0, 1.0]),
+            patch("physicalai.policies.xr0.preprocessor.random.randint", return_value=1),
+            patch("physicalai.policies.xr0.preprocessor.random.randrange", return_value=1),
+        ):
+            _, augmented = pre._extract_view_images(batch, augment_images=True)  # noqa: SLF001
+        assert augmented[0][0].shape == plain[0][0].shape == (3, 64, 64)
+        assert augmented[0][0].dtype == torch.uint8
+        assert not torch.equal(augmented[0][0], plain[0][0])
+
+    def test_color_gates_and_factors_shared_across_views(self) -> None:
+        pre = XR0Preprocessor()
+        image = torch.full((1, 3, 64, 64), 128, dtype=torch.uint8)
+        batch = {"images.base": image, "images.wrist_left": image}
+        with (
+            patch("physicalai.policies.xr0.preprocessor.random.uniform", side_effect=[-32 / 255, 1.5, 0.5]) as factors,
+            patch("physicalai.policies.xr0.preprocessor.random.randint", side_effect=[0, 1, 1]) as gates,
+        ):
+            _, images = pre._extract_view_images(batch, augment_images=True)  # noqa: SLF001
+        assert factors.call_count == gates.call_count == 3
+        assert torch.equal(images[0][0], images[0][1])
+        assert int(images[0][0].max()) < 128
 
 
 class TestImageKeyViewMap:
