@@ -41,6 +41,62 @@ logger = logging.getLogger(__name__)
 _DTYPES: dict[str, torch.dtype] = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 
+def _build_optimizer(config: XR0Config, param_groups: list[dict[str, Any]]) -> torch.optim.Optimizer:
+    """Build the AdamW variant selected by ``config.optimizer_type``.
+
+    torchao's low-bit variants hold the Adam moments in int4/int8 blocks of 128
+    elements, cutting optimizer memory roughly 4x/2x versus fp32 moments.
+    Parameters whose element count is not a multiple of the block size keep
+    plain fp32 moments, so the saving is approximate.
+
+    They also enable stochastic rounding of the bf16 parameter update whenever
+    the weights are bf16. This matters more than the memory: with
+    round-to-nearest, an AdamW step smaller than half a bf16 ULP is discarded
+    entirely, which freezes every parameter whose magnitude exceeds roughly
+    ``lr * 2**8``. Stochastic rounding makes the update unbiased in expectation
+    so small updates accumulate instead of vanishing.
+
+    Args:
+        config: Policy config supplying the optimizer hyperparameters.
+        param_groups: Parameter groups carrying their weight-decay overrides.
+
+    Returns:
+        The configured optimizer.
+
+    Raises:
+        ImportError: If a low-bit optimizer is requested but torchao is missing.
+    """
+    if config.optimizer_type == "adamw":
+        return torch.optim.AdamW(
+            param_groups,
+            lr=config.optimizer_lr,
+            betas=config.optimizer_betas,
+            eps=config.optimizer_eps,
+        )
+
+    # torchao ships only with the `cu128` / `xpu` extras, so import it lazily to
+    # keep CPU-only installs working.
+    try:
+        from torchao.optim import AdamW4bit, AdamW8bit  # noqa: PLC0415
+    except ImportError as exc:
+        msg = (
+            f"optimizer_type={config.optimizer_type!r} requires the 'torchao' package. "
+            "Install a hardware extra that provides it (`uv sync --extra cu128` or "
+            "`uv sync --extra xpu`), or set optimizer_type='adamw'."
+        )
+        raise ImportError(msg) from exc
+
+    # Explicit mapping rather than getattr(): no dynamic attribute lookup.
+    optimizer_cls = AdamW4bit if config.optimizer_type == "adamw4bit" else AdamW8bit
+    return optimizer_cls(
+        param_groups,
+        lr=config.optimizer_lr,
+        betas=config.optimizer_betas,
+        eps=config.optimizer_eps,
+        bf16_stochastic_round=config.dtype == "bfloat16",
+    )
+
+
 class XR0ExportablePolicyMixin(ExportablePolicyMixin):
     """Export mixin that owns the XR0 self-contained OpenVINO baking.
 
@@ -203,6 +259,10 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         image_resolution: Target image resolution (unused placeholder kept for
             config parity; the Qwen3-VL processor performs area-based resizing).
         tokenizer_max_length: Maximum tokenizer length.
+        image_key_view_map: Mapping from dataset image key to canonical XR0 view
+            name (``"ego"``, ``"base"``, ``"wrist_left"`` or ``"wrist_right"``).
+            Keys must match the flattened batch image keys (e.g.
+            ``"images.top_camera"``). The prompt uses canonical view order.
         gradient_checkpointing: Enable gradient checkpointing.
         compile_model: Whether to use torch.compile.
         compile_mode: Torch compile mode.
@@ -216,12 +276,15 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         action_mode: ``"absolute"`` (default) predicts the raw action;
             ``"delta"`` predicts ``action[t] - state`` and re-adds the state at
             inference, matching the pretrained flow head's delta prior.
-        action_delta_mean: Per-timestep delta-action mean
-            (``(chunk_size, max_action_dim)``) used when ``action_mode="delta"``;
-            compute it with :func:`compute_delta_action_stats`.
-        action_delta_std: Per-timestep delta-action std, same shape as
-            ``action_delta_mean``.
+        action_mean: Per-timestep action mean
+            (``(chunk_size, max_action_dim)``); compute it with
+            :func:`~physicalai.policies.xr0.stats.compute_action_chunk_stats`,
+            or install it later with :meth:`XR0.set_action_stats`. Applies to
+            both action modes.
+        action_std: Per-timestep action std, same shape as ``action_mean``.
         normalization_mode: Normalization method for state/action features.
+        optimizer_type: AdamW implementation: ``"adamw4bit"`` (default),
+            ``"adamw8bit"`` or ``"adamw"``. The low-bit variants need torchao.
         optimizer_lr: Learning rate.
         optimizer_betas: Adam beta coefficients.
         optimizer_eps: Optimizer epsilon.
@@ -273,16 +336,19 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         async_train: bool = False,
         image_resolution: tuple[int, int] = (256, 256),
         tokenizer_max_length: int = 256,
+        image_key_view_map: dict[str, str] | None = None,
         gradient_checkpointing: bool = True,
         compile_model: bool = False,
         compile_mode: str = "max-autotune",
         freeze_vision_encoder: bool = False,
         freeze_input_embeddings: bool = True,
         normalize_state: bool = False,
+        augment_images: bool = False,
         action_mode: Literal["absolute", "delta"] = "absolute",
-        action_delta_mean: Sequence[float] | torch.Tensor | None = None,
-        action_delta_std: Sequence[float] | torch.Tensor | None = None,
+        action_mean: Sequence[float] | torch.Tensor | None = None,
+        action_std: Sequence[float] | torch.Tensor | None = None,
         normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES",
+        optimizer_type: Literal["adamw", "adamw4bit", "adamw8bit"] = "adamw4bit",
         optimizer_lr: float = 1.0e-4,
         optimizer_betas: tuple[float, float] = (0.9, 0.95),
         optimizer_eps: float = 1e-8,
@@ -332,6 +398,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             async_train=async_train,
             image_resolution=image_resolution,
             tokenizer_max_length=tokenizer_max_length,
+            image_key_view_map=image_key_view_map or {},
             gradient_checkpointing=gradient_checkpointing,
             compile_model=compile_model,
             compile_mode=compile_mode,
@@ -340,6 +407,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             normalize_state=normalize_state,
             action_mode=action_mode,
             normalization_mode=normalization_mode,
+            optimizer_type=optimizer_type,
             optimizer_lr=optimizer_lr,
             optimizer_betas=optimizer_betas,
             optimizer_eps=optimizer_eps,
@@ -352,19 +420,20 @@ class XR0(XR0ExportablePolicyMixin, Policy):
 
         self.save_hyperparameters(ignore=["config", "compile_model", "pretrained_name_or_path"])
         self._set_hparam_keys()
+        self.augment_images = augment_images
 
-        # Per-timestep delta-action stats (only used when action_mode="delta").
+        # Per-timestep action stats overriding the dataset-derived ones.
         # Stored as tensors for the preprocessors and mirrored into hparams as
         # plain lists so they round-trip through Lightning checkpoints.
-        self._action_delta_mean: torch.Tensor | None = (
-            None if action_delta_mean is None else torch.as_tensor(action_delta_mean, dtype=torch.float32)
+        self._action_mean: torch.Tensor | None = (
+            None if action_mean is None else torch.as_tensor(action_mean, dtype=torch.float32)
         )
-        self._action_delta_std: torch.Tensor | None = (
-            None if action_delta_std is None else torch.as_tensor(action_delta_std, dtype=torch.float32)
+        self._action_std: torch.Tensor | None = (
+            None if action_std is None else torch.as_tensor(action_std, dtype=torch.float32)
         )
-        if self._action_delta_mean is not None and self._action_delta_std is not None:
-            self.hparams["action_delta_mean"] = self._action_delta_mean.tolist()
-            self.hparams["action_delta_std"] = self._action_delta_std.tolist()
+        if self._action_mean is not None and self._action_std is not None:
+            self.hparams["action_mean"] = self._action_mean.tolist()
+            self.hparams["action_std"] = self._action_std.tolist()
 
         self.model: XR0Model | None = None
         self._preprocessor: XR0Preprocessor | None = None
@@ -390,7 +459,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         # recover the action-normalization stats from the checkpoint so the
         # policy is usable for standalone inference (no training dataset).
         if dataset_stats is None and pretrained_name_or_path is not None:
-            dataset_stats = extract_xr0_dataset_stats(pretrained_name_or_path)
+            dataset_stats = extract_xr0_dataset_stats(pretrained_name_or_path, chunk_size=chunk_size)
             self._dataset_stats = dataset_stats
 
         if dataset_stats is not None:
@@ -436,11 +505,14 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             max_state_dim=cfg.max_state_dim,
             max_action_dim=cfg.max_action_dim,
             stats=dataset_stats,
+            chunk_size=cfg.chunk_size,
+            state_len=cfg.state_len,
             processor_name=cfg.vlm_model_id,
+            image_key_view_map=cfg.image_key_view_map,
             normalize_state=cfg.normalize_state,
             action_mode=cfg.action_mode,
-            action_delta_mean=self._action_delta_mean,
-            action_delta_std=self._action_delta_std,
+            action_mean=self._action_mean,
+            action_std=self._action_std,
         )
         self._dataset_stats = dataset_stats
 
@@ -461,13 +533,48 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             max_state_dim=cfg.max_state_dim,
             max_action_dim=cfg.max_action_dim,
             stats=dataset_stats,
+            chunk_size=cfg.chunk_size,
+            state_len=cfg.state_len,
             processor_name=cfg.vlm_model_id,
+            image_key_view_map=cfg.image_key_view_map,
             normalize_state=cfg.normalize_state,
             action_mode=cfg.action_mode,
-            action_delta_mean=self._action_delta_mean,
-            action_delta_std=self._action_delta_std,
+            action_mean=self._action_mean,
+            action_std=self._action_std,
         )
         self._dataset_stats = dataset_stats
+
+    def set_action_stats(
+        self,
+        mean: Sequence[float] | torch.Tensor,
+        std: Sequence[float] | torch.Tensor,
+    ) -> None:
+        """Install per-timestep action normalization statistics.
+
+        Args:
+            mean: ``(chunk_size, max_action_dim)`` action mean.
+            std: ``(chunk_size, max_action_dim)`` action std.
+
+        Raises:
+            ValueError: If ``mean`` / ``std`` are not per-timestep statistics of
+                the policy's chunk size.
+        """
+        cfg = self.config
+        t_mean = torch.as_tensor(mean, dtype=torch.float32)
+        t_std = torch.as_tensor(std, dtype=torch.float32)
+        expected = (cfg.chunk_size, cfg.max_action_dim)
+        for name, tensor in (("mean", t_mean), ("std", t_std)):
+            if tuple(tensor.shape) != expected:
+                msg = f"action {name} must have shape {expected}, got {tuple(tensor.shape)}"
+                raise ValueError(msg)
+
+        self._action_mean = t_mean
+        self._action_std = t_std
+        self.hparams["action_mean"] = t_mean.tolist()
+        self.hparams["action_std"] = t_std.tolist()
+
+        if self._preprocessor is not None and self._dataset_stats is not None:
+            self._rebuild_preprocessors(self._dataset_stats)
 
     def _load_pretrained_weights(self, pretrained_path: Path) -> None:
         """Load remapped pretrained weights into ``self.model`` (non-strict).
@@ -553,7 +660,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             if self.model is None or self._preprocessor is None:
                 msg = "Model is not initialized"
                 raise ValueError(msg)
-            processed = self._preprocessor(batch.to_dict())
+            processed = self._preprocessor(batch.to_dict(), augment_images=self.augment_images)
             return self.model(processed)
         return self.predict_action_chunk(batch)
 
@@ -622,14 +729,12 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             else:
                 decay_params.append(param)
 
-        optimizer = torch.optim.AdamW(
+        optimizer = _build_optimizer(
+            self.config,
             [
                 {"params": decay_params, "weight_decay": self.config.optimizer_weight_decay},
                 {"params": no_decay_params, "weight_decay": 0.0},
             ],
-            lr=self.config.optimizer_lr,
-            betas=self.config.optimizer_betas,
-            eps=self.config.optimizer_eps,
         )
 
         num_training_steps = int(self.trainer.estimated_stepping_batches)
@@ -976,6 +1081,9 @@ class XR0(XR0ExportablePolicyMixin, Policy):
                 patch_size=int(image_processor.patch_size),
                 merge_size=int(image_processor.merge_size),
                 temporal_patch_size=int(image_processor.temporal_patch_size),
+                # Bake the camera-view renaming so the exported prompt carries the
+                # same view titles, in the same order, as at training time.
+                image_key_view_map=dict(cfg.image_key_view_map),
                 # Bake the state normalization so the exported graph applies
                 # the exact transform used at training time (identity when
                 # ``normalize_state`` is disabled -> raw-state parity).
@@ -985,8 +1093,9 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             )
             ov_postproc = ComponentSpec(
                 type="xr0_denormalize",
-                # In ``action_mode="delta"`` the baked ``action_mean``/``action_std``
-                # are per-timestep ``(chunk_size, max_action_dim)`` delta stats and
+                # The baked ``action_mean``/``action_std`` are always per-timestep
+                # ``(chunk_size, max_action_dim)`` stats, which broadcast over the
+                # ``(B, chunk_size, max_action_dim)`` graph output at runtime.
                 action_mode=self._postprocessor.action_mode,
                 action_mean=self._postprocessor.action_mean.tolist(),
                 action_std=self._postprocessor.action_std.tolist(),
