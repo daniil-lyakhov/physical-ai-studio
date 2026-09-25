@@ -32,11 +32,13 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from torchvision.transforms import functional as vision_f
 
 from physicalai.data import Feature, FeatureType
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, Observation
@@ -217,6 +219,32 @@ def _resize_batch(images: torch.Tensor, factor: int, max_pixels: int) -> torch.T
             antialias=True,
         )
     return images.clamp(0.0, 255.0).round().to(torch.uint8)
+
+
+def _augment_images(images: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Apply Xiaomi's training crop and shared per-sample color jitter to resized views.
+
+    Returns:
+        Augmented RGB uint8 views at their original resized dimensions.
+    """
+    ops = (
+        (vision_f.adjust_brightness, 1.0 + random.uniform(-32.0 / 255.0, 32.0 / 255.0)),
+        (vision_f.adjust_contrast, random.uniform(0.5, 1.5)),
+        (vision_f.adjust_saturation, random.uniform(0.5, 1.5)),
+    )
+    flags = [random.randint(0, 1) == 0 for _ in ops]
+    augmented = []
+    for image in images:
+        height, width = image.shape[-2:]
+        crop_h, crop_w = int(height * 0.95), int(width * 0.95)
+        top = random.randrange(height - crop_h + 1)
+        left = random.randrange(width - crop_w + 1)
+        image = vision_f.resize(vision_f.crop(image, top, left, crop_h, crop_w), (height, width))
+        for use, (op, factor) in zip(flags, ops, strict=True):
+            if use:
+                image = op(image, factor)
+        augmented.append(image)
+    return augmented
 
 
 def _normalize_action(action: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
@@ -526,7 +554,9 @@ class XR0Preprocessor(torch.nn.Module):
         ordered_keys = sorted(image_keys, key=lambda key: _VIEW_ORDER.index(self.image_key_view_map[key]))
         return ordered_keys, [self.image_key_view_map[key] for key in ordered_keys]
 
-    def _extract_view_images(self, batch: dict[str, Any]) -> tuple[list[str], list[list[torch.Tensor]]]:
+    def _extract_view_images(
+        self, batch: dict[str, Any], *, augment_images: bool = False
+    ) -> tuple[list[str], list[list[torch.Tensor]]]:
         """Return the ordered view names and, per sample, the resized images.
 
         Returns:
@@ -560,6 +590,8 @@ class XR0Preprocessor(torch.nn.Module):
 
         batch_size = per_view[0].shape[0]
         images = [[view[sample] for view in per_view] for sample in range(batch_size)]
+        if augment_images:
+            images = [_augment_images(sample) for sample in images]
         return views, images
 
     def _prepare_state(self, batch: dict[str, Any], device: torch.device) -> torch.Tensor:
@@ -631,7 +663,7 @@ class XR0Preprocessor(torch.nn.Module):
         mask[..., :real_dim] = 1
         return action.to(device), mask.to(device)
 
-    def forward(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
+    def forward(self, batch: dict[str, Any], *, augment_images: bool = False) -> dict[str, torch.Tensor]:
         """Process a batch into the XR0 model input.
 
         Args:
@@ -645,7 +677,7 @@ class XR0Preprocessor(torch.nn.Module):
         batch = dict(batch)
         device = batch[STATE].device
 
-        views, images = self._extract_view_images(batch)
+        views, images = self._extract_view_images(batch, augment_images=augment_images)
         batch_size = len(images)
 
         task = batch.get(TASK)
