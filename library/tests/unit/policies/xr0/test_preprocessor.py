@@ -11,6 +11,8 @@ and are skipped otherwise; the normalization round-trip test does not.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import numpy as np
 from PIL import Image
 import pytest
@@ -38,9 +40,16 @@ HORIZON = 3
 
 
 def _stats() -> dict:
+    # Action stats are per-timestep ``(HORIZON, ACTION_DIM)``; the state is a
+    # single frame, so its stats stay a plain ``(STATE_DIM,)`` vector.
     return {
         "observation.state": {"name": "observation.state", "shape": (STATE_DIM,), "mean": [0.0] * STATE_DIM, "std": [1.0] * STATE_DIM},
-        "action": {"name": "action", "shape": (ACTION_DIM,), "mean": [0.1] * ACTION_DIM, "std": [2.0] * ACTION_DIM},
+        "action": {
+            "name": "action",
+            "shape": (ACTION_DIM,),
+            "mean": [[0.1] * ACTION_DIM] * HORIZON,
+            "std": [[2.0] * ACTION_DIM] * HORIZON,
+        },
     }
 
 
@@ -74,7 +83,7 @@ class TestVisionPrompt:
 
     def test_apply_chat_template(self) -> None:
         # The built message tokenizes into the model input keys via the processor.
-        pre, _ = make_xr0_preprocessors(stats=_stats())
+        pre, _ = make_xr0_preprocessors(stats=_stats(), chunk_size=HORIZON)
         message = pre._build_message("pick up the cube", ["base"], [Image.new("RGB", (32, 32))])  # noqa: SLF001
         encoded = pre.processor.apply_chat_template(
             [message],
@@ -88,7 +97,7 @@ class TestVisionPrompt:
 
     def test_forward_keys_and_shapes(self) -> None:
         # End-to-end glue: batch -> model input keys with batched leading dims.
-        pre, _ = make_xr0_preprocessors(stats=_stats())
+        pre, _ = make_xr0_preprocessors(stats=_stats(), chunk_size=HORIZON)
         out = pre(_batch(2))
         assert {"input_ids", "attention_mask", "pixel_values", "image_grid_thw", STATE, ACTION, ACTION_MASK} <= set(
             out
@@ -125,6 +134,7 @@ class TestViewTitle:
     """Human-readable camera-view titles embedded in the chat prompt."""
 
     def test_known_views_use_reference_titles(self) -> None:
+        assert _view_title("ego") == "Ego"
         assert _view_title("base") == "Base"
         assert _view_title("wrist_left") == "Left-Wrist"
         assert _view_title("wrist_right") == "Right-Wrist"
@@ -206,18 +216,131 @@ class TestExtractViewImages:
         assert int(sample[0].max()) == 255
         assert int(sample[1].max()) == 0
 
+    def test_augmentation_crops_after_resize_without_changing_geometry(self) -> None:
+        pre = XR0Preprocessor()
+        image = torch.arange(64 * 64, dtype=torch.int32).reshape(64, 64).remainder(256).to(torch.uint8)
+        batch = {"images.base": image.expand(1, 3, -1, -1)}
+        _, plain = pre._extract_view_images(batch)  # noqa: SLF001
+        with (
+            patch(
+                "physicalai.policies.xr0.preprocessor.torch.rand",
+                return_value=torch.tensor([0.5, 0.5, 0.5, 1.0, 1.0, 1.0]),
+            ),
+            patch("physicalai.policies.xr0.preprocessor.torch.randint", return_value=torch.tensor(1)) as crop_draws,
+        ):
+            _, augmented = pre._extract_view_images(batch, augment_images=True)  # noqa: SLF001
+        assert crop_draws.call_count == 2
+        assert augmented[0][0].shape == plain[0][0].shape == (3, 64, 64)
+        assert augmented[0][0].dtype == torch.uint8
+        assert not torch.equal(augmented[0][0], plain[0][0])
+
+    def test_color_gates_and_factors_shared_across_views(self) -> None:
+        pre = XR0Preprocessor()
+        image = torch.full((1, 3, 64, 64), 128, dtype=torch.uint8)
+        batch = {"images.base": image, "images.wrist_left": image}
+        with patch(
+            "physicalai.policies.xr0.preprocessor.torch.rand",
+            return_value=torch.tensor([0.0, 1.0, 0.0, 0.0, 1.0, 1.0]),
+        ) as draws:
+            _, images = pre._extract_view_images(batch, augment_images=True)  # noqa: SLF001
+        draws.assert_called_once_with(6, device=image.device)
+        assert torch.equal(images[0][0], images[0][1])
+        assert int(images[0][0].max()) < 128
+
+
+class TestImageKeyViewMap:
+    """Dataset image keys renamed onto the canonical XR0 view names."""
+
+    @staticmethod
+    def _batch() -> dict:
+        # Keys and order of the local ``Put-the-yellow-ball-to-the-black-box``
+        # dataset: neither name is a canonical XR0 view.
+        return {
+            "images.pov_black_follower_camera": torch.ones(1, 3, 32, 32),
+            "images.top_camera": torch.zeros(1, 3, 32, 32),
+        }
+
+    def test_renames_and_reorders_canonically(self) -> None:
+        # The map is declared in dataset order, but the prompt must follow the
+        # canonical order the pretrained checkpoint was trained with.
+        pre = XR0Preprocessor(
+            image_key_view_map={
+                "images.pov_black_follower_camera": "wrist_left",
+                "images.top_camera": "ego",
+            },
+        )
+        views, images = pre._extract_view_images(self._batch())  # noqa: SLF001
+        sample = images[0]
+        assert views == ["ego", "wrist_left"]
+        # ``ego`` is top_camera (0) and ``wrist_left`` is the follower cam (255).
+        assert int(sample[0].max()) == 0
+        assert int(sample[1].max()) == 255
+
+    def test_prompt_matches_pretrain_reference(self) -> None:
+        # Byte-for-byte parity with the reference prompt of the base Pretrain
+        # checkpoint (xr0/docs/data_format.md, mibot/server/runtime/client.py).
+        pre = XR0Preprocessor(image_key_view_map={"images.top_camera": "ego", "images.pov_black_follower_camera": "wrist_left"})
+        views, _ = pre._extract_view_images(self._batch())  # noqa: SLF001
+        img = Image.new("RGB", (32, 32))
+        content = pre._build_message("pick up the cube", views, [img, img])[0]["content"]  # noqa: SLF001
+        assert content[1]["text"] == "# Ego View\n"
+        assert content[4]["text"] == "# Left-Wrist View\n"
+
+    @pytest.mark.parametrize("prefix", ["", "observation.images."])
+    def test_alias_keys_are_rejected(self, prefix: str) -> None:
+        pre = XR0Preprocessor(
+            image_key_view_map={
+                f"{prefix}top_camera": "ego",
+                f"{prefix}pov_black_follower_camera": "wrist_left",
+            },
+        )
+        with pytest.raises(ValueError, match="must match the batch image keys exactly"):
+            pre._extract_view_images(self._batch())  # noqa: SLF001
+
+    def test_empty_map_keeps_dataset_names(self) -> None:
+        pre = XR0Preprocessor()
+        views, _ = pre._extract_view_images(self._batch())  # noqa: SLF001
+        assert views == ["pov_black_follower_camera", "top_camera"]
+
+    def test_key_mismatch_raises(self) -> None:
+        pre = XR0Preprocessor(image_key_view_map={"images.top_camera": "ego"})
+        with pytest.raises(ValueError, match="must match the batch image keys exactly"):
+            pre._extract_view_images(self._batch())  # noqa: SLF001
+
+    def test_unknown_view_name_raises(self) -> None:
+        with pytest.raises(ValueError, match="canonical XR0 view names"):
+            XR0Preprocessor(image_key_view_map={"images.top_camera": "front_cam"})
+
+    def test_duplicate_view_name_raises(self) -> None:
+        with pytest.raises(ValueError, match="must be unique"):
+            XR0Preprocessor(image_key_view_map={"images.top_camera": "ego", "images.pov_black_follower_camera": "ego"})
+
+    def test_factory_threads_the_map(self) -> None:
+        pre, _ = make_xr0_preprocessors(
+            stats=_stats(),
+            chunk_size=HORIZON,
+            image_key_view_map={"images.top_camera": "ego"},
+        )
+        assert pre.image_key_view_map == {"images.top_camera": "ego"}
+
 
 class TestPrepareAction:
     """Action normalize + pad + validity mask, incl. delta corner cases."""
 
     @staticmethod
-    def _pre(max_action_dim: int = 10, *, action_mode: str = "absolute") -> XR0Preprocessor:
+    def _pre(
+        max_action_dim: int = 10,
+        *,
+        chunk_size: int = HORIZON,
+        action_mode: str = "absolute",
+    ) -> XR0Preprocessor:
         # Identity stats (mean 0 / std 1) so normalization is a near-passthrough.
         return XR0Preprocessor(
             max_action_dim=max_action_dim,
+            chunk_size=chunk_size,
             action_mode=action_mode,
-            action_mean=torch.zeros(max_action_dim),
-            action_std=torch.ones(max_action_dim),
+            action_mean=torch.zeros(chunk_size, max_action_dim),
+            action_std=torch.ones(chunk_size, max_action_dim),
         )
 
     def test_absolute_pad_and_mask(self) -> None:
@@ -271,7 +394,7 @@ class TestPrepareAction:
         ],
     )
     def test_delta_matches_reference(self, state: torch.Tensor, reference: torch.Tensor) -> None:
-        pre = self._pre(max_action_dim=3, action_mode="delta")
+        pre = self._pre(max_action_dim=3, chunk_size=2, action_mode="delta")
         action = torch.arange(2 * 2 * 2).reshape(2, 2, 2).float()
         out, _ = pre._prepare_action(action, torch.device("cpu"), state=state)  # noqa: SLF001
         assert torch.allclose(out, reference, atol=1e-5)
@@ -286,7 +409,7 @@ class TestPrepareAction:
         ],
     )
     def test_absolute_matches_reference(self, max_action_dim: int, reference: torch.Tensor) -> None:
-        pre = self._pre(max_action_dim=max_action_dim, action_mode="absolute")
+        pre = self._pre(max_action_dim=max_action_dim, chunk_size=2, action_mode="absolute")
         action = torch.arange(2 * 2 * 2).reshape(2, 2, 2).float()
         out, mask = pre._prepare_action(action, torch.device("cpu"))  # noqa: SLF001
         assert torch.allclose(out, reference, atol=1e-5)
@@ -294,6 +417,12 @@ class TestPrepareAction:
         assert mask.shape == reference.shape
         assert mask[..., :2].all()
         assert not mask[..., 2:].any()
+
+    def test_chunk_length_must_match_stats(self) -> None:
+        # Per-timestep stats are never broadcast over time.
+        pre = self._pre(max_action_dim=3, chunk_size=2)
+        with pytest.raises(ValueError, match="2 timesteps"):
+            pre._prepare_action(torch.randn(2, 5, 3), torch.device("cpu"))  # noqa: SLF001
 
 
 class TestPostprocessor:
@@ -303,15 +432,17 @@ class TestPostprocessor:
     def _post(
         max_action_dim: int = 3,
         *,
+        chunk_size: int = 2,
         action_mode: str = "absolute",
         action_dim: int | None = None,
     ) -> XR0Postprocessor:
         # Identity stats (mean 0 / std 1) so denormalization is a near-passthrough.
         post = XR0Postprocessor(
             max_action_dim=max_action_dim,
+            chunk_size=chunk_size,
             action_mode=action_mode,
-            action_mean=torch.zeros(max_action_dim),
-            action_std=torch.ones(max_action_dim),
+            action_mean=torch.zeros(chunk_size, max_action_dim),
+            action_std=torch.ones(chunk_size, max_action_dim),
         )
         post.action_dim = action_dim  # unpadded slice width (None -> no slice)
         return post
@@ -376,42 +507,108 @@ class TestPostprocessor:
 class TestMakeXr0Preprocessors:
     """Factory wiring: stats -> features -> pre/post action stats."""
 
+    def test_state_stats_feature_default_and_explicit(self) -> None:
+        stats = _stats()
+        stats["observation.state"]["mean"] = [2.0] * STATE_DIM
+        stats["observation.state"]["std"] = [3.0] * STATE_DIM
+        pre, _ = make_xr0_preprocessors(
+            stats=stats, chunk_size=HORIZON, max_state_dim=10, normalize_state=True
+        )
+        assert torch.equal(pre.state_mean[0, :STATE_DIM], torch.full((STATE_DIM,), 2.0))
+        assert torch.equal(pre.state_std[0, :STATE_DIM], torch.full((STATE_DIM,), 3.0))
+        assert torch.equal(pre.state_mean[0, STATE_DIM:], torch.zeros(2))
+        assert torch.equal(pre.state_std[0, STATE_DIM:], torch.ones(2))
+
+        raw, _ = make_xr0_preprocessors(stats=stats, chunk_size=HORIZON, max_state_dim=10)
+        assert torch.equal(raw.state_mean, torch.zeros(1, 10))
+        assert torch.equal(raw.state_std, torch.ones(1, 10))
+
+        explicit = XR0Preprocessor(
+            max_state_dim=10, state_mean=[4.0] * STATE_DIM, state_std=[5.0] * STATE_DIM
+        )
+        assert torch.equal(explicit.state_mean[0, :STATE_DIM], torch.full((STATE_DIM,), 4.0))
+        assert torch.equal(explicit.state_std[0, :STATE_DIM], torch.full((STATE_DIM,), 5.0))
+
     def test_absolute_derives_stats_from_features(self) -> None:
-        pre, post = make_xr0_preprocessors(max_action_dim=32, stats=_stats())
+        pre, post = make_xr0_preprocessors(max_action_dim=32, stats=_stats(), chunk_size=HORIZON)
         assert isinstance(pre, XR0Preprocessor)
         assert isinstance(post, XR0Postprocessor)
         assert pre.action_mode == "absolute"
         # feature action mean/std (0.1 / 2.0) fill the real dims, padding stays 0/1.
-        assert torch.allclose(pre.action_mean[:ACTION_DIM], torch.full((ACTION_DIM,), 0.1))
-        assert torch.allclose(pre.action_mean[ACTION_DIM:], torch.zeros(32 - ACTION_DIM))
-        assert torch.allclose(pre.action_std[:ACTION_DIM], torch.full((ACTION_DIM,), 2.0))
-        assert torch.allclose(pre.action_std[ACTION_DIM:], torch.ones(32 - ACTION_DIM))
+        assert pre.action_mean.shape == (HORIZON, 32)
+        assert torch.allclose(pre.action_mean[:, :ACTION_DIM], torch.full((HORIZON, ACTION_DIM), 0.1))
+        assert torch.allclose(pre.action_mean[:, ACTION_DIM:], torch.zeros(HORIZON, 32 - ACTION_DIM))
+        assert torch.allclose(pre.action_std[:, :ACTION_DIM], torch.full((HORIZON, ACTION_DIM), 2.0))
+        assert torch.allclose(pre.action_std[:, ACTION_DIM:], torch.ones(HORIZON, 32 - ACTION_DIM))
         # postprocessor recovers the unpadded action_dim for the final slice.
         assert post.action_dim == ACTION_DIM
         assert torch.allclose(post.action_mean, pre.action_mean)
         assert torch.allclose(post.action_std, pre.action_std)
 
-    def test_delta_override_stats_applied_to_pair(self) -> None:
-        delta_mean = torch.full((HORIZON, 32), 0.5)
-        delta_std = torch.full((HORIZON, 32), 3.0)
+    def test_per_dim_action_stats_are_rejected(self) -> None:
+        # A per-dimension action vector would have to be broadcast over time.
+        stats = _stats()
+        stats["action"]["mean"] = [0.1] * ACTION_DIM
+        stats["action"]["std"] = [2.0] * ACTION_DIM
+        with pytest.raises(ValueError, match="per-timestep"):
+            make_xr0_preprocessors(max_action_dim=32, stats=stats, chunk_size=HORIZON)
+
+    def test_per_dim_dataset_stats_with_chunk_override(self) -> None:
+        stats = _stats()
+        stats["action"]["mean"] = [0.1] * ACTION_DIM
+        stats["action"]["std"] = [2.0] * ACTION_DIM
+        mean = torch.full((HORIZON, 32), 0.5)
+        std = torch.full((HORIZON, 32), 3.0)
+
+        pre, post = make_xr0_preprocessors(
+            stats=stats,
+            chunk_size=HORIZON,
+            action_mean=mean,
+            action_std=std,
+        )
+
+        assert post.action_dim == ACTION_DIM
+        assert torch.equal(pre.action_mean, mean)
+        assert torch.equal(post.action_mean, mean)
+        assert torch.equal(post.action_std, std)
+
+    @pytest.mark.parametrize("action_mode", ["absolute", "delta"])
+    def test_override_stats_applied_to_pair(self, action_mode: str) -> None:
+        override_mean = torch.full((HORIZON, 32), 0.5)
+        override_std = torch.full((HORIZON, 32), 3.0)
         pre, post = make_xr0_preprocessors(
             stats=_stats(),
-            action_mode="delta",
-            action_delta_mean=delta_mean,
-            action_delta_std=delta_std,
+            chunk_size=HORIZON,
+            action_mode=action_mode,
+            action_mean=override_mean,
+            action_std=override_std,
         )
-        assert pre.action_mode == "delta"
-        assert post.action_mode == "delta"
-        # explicit delta stats override the feature-derived absolute stats.
-        assert torch.allclose(pre.action_mean, delta_mean)
-        assert torch.allclose(pre.action_std, delta_std)
-        assert torch.allclose(post.action_mean, delta_mean)
-        assert torch.allclose(post.action_std, delta_std)
+        assert pre.action_mode == action_mode
+        assert post.action_mode == action_mode
+        # explicit per-timestep stats override the ones derived from the features.
+        assert torch.allclose(pre.action_mean, override_mean)
+        assert torch.allclose(pre.action_std, override_std)
+        assert torch.allclose(post.action_mean, override_mean)
+        assert torch.allclose(post.action_std, override_std)
         # the unpadded action_dim is still recovered from features.
         assert post.action_dim == ACTION_DIM
 
+    def test_round_trip_with_per_timestep_stats(self) -> None:
+        # Each chunk position gets its own scale; pre -> post must be the identity.
+        mean = torch.arange(HORIZON * 32, dtype=torch.float32).reshape(HORIZON, 32)
+        std = torch.arange(1, HORIZON * 32 + 1, dtype=torch.float32).reshape(HORIZON, 32)
+        pre, post = make_xr0_preprocessors(
+            stats=_stats(),
+            chunk_size=HORIZON,
+            action_mean=mean,
+            action_std=std,
+        )
+        action = torch.randn(2, HORIZON, ACTION_DIM)
+        normalized, _ = pre._prepare_action(action, torch.device("cpu"))  # noqa: SLF001
+        assert torch.allclose(post({ACTION: normalized})[ACTION], action, atol=1e-4)
+
     def test_no_stats_is_identity(self) -> None:
-        pre, post = make_xr0_preprocessors(max_action_dim=32, stats=None)
-        assert torch.allclose(pre.action_mean, torch.zeros(32))
-        assert torch.allclose(pre.action_std, torch.ones(32))
+        pre, post = make_xr0_preprocessors(max_action_dim=32, stats=None, chunk_size=HORIZON)
+        assert torch.allclose(pre.action_mean, torch.zeros(HORIZON, 32))
+        assert torch.allclose(pre.action_std, torch.ones(HORIZON, 32))
         assert post.action_dim is None
