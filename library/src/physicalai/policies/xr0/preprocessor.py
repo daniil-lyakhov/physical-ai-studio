@@ -759,13 +759,14 @@ class XR0Postprocessor(torch.nn.Module):
             norm = feature.normalization_data
             if norm.mean is None or norm.std is None:
                 continue
-            mean, std = _to_chunk_stats(
-                norm.mean,
-                norm.std,
-                length=self.chunk_size,
-                dim=max_action_dim,
-                name="action",
-            )
+            if action_mean is None or action_std is None:
+                mean, std = _to_chunk_stats(
+                    norm.mean,
+                    norm.std,
+                    length=self.chunk_size,
+                    dim=max_action_dim,
+                    name="action",
+                )
             # The unpadded action width is the feature's last axis, not its
             # element count: the stats are per-timestep ``(chunk_size, D)``.
             feat_dim = int(torch.as_tensor(norm.mean).shape[-1])

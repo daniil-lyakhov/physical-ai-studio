@@ -527,6 +527,25 @@ class TestMakeXr0Preprocessors:
         with pytest.raises(ValueError, match="per-timestep"):
             make_xr0_preprocessors(max_action_dim=32, stats=stats, chunk_size=HORIZON)
 
+    def test_per_dim_dataset_stats_with_chunk_override(self) -> None:
+        stats = _stats()
+        stats["action"]["mean"] = [0.1] * ACTION_DIM
+        stats["action"]["std"] = [2.0] * ACTION_DIM
+        mean = torch.full((HORIZON, 32), 0.5)
+        std = torch.full((HORIZON, 32), 3.0)
+
+        pre, post = make_xr0_preprocessors(
+            stats=stats,
+            chunk_size=HORIZON,
+            action_mean=mean,
+            action_std=std,
+        )
+
+        assert post.action_dim == ACTION_DIM
+        assert torch.equal(pre.action_mean, mean)
+        assert torch.equal(post.action_mean, mean)
+        assert torch.equal(post.action_std, std)
+
     @pytest.mark.parametrize("action_mode", ["absolute", "delta"])
     def test_override_stats_applied_to_pair(self, action_mode: str) -> None:
         override_mean = torch.full((HORIZON, 32), 0.5)
