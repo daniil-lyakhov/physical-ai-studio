@@ -204,10 +204,9 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             config parity; the Qwen3-VL processor performs area-based resizing).
         tokenizer_max_length: Maximum tokenizer length.
         image_key_view_map: Mapping from dataset image key to canonical XR0 view
-            name (``"ego"``, ``"base"``, ``"wrist_left"`` or ``"wrist_right"``),
-            used to rename and reorder the prompt's view sections so they match
-            the pretrained checkpoint. Keys may be given with or without the
-            ``observation.images.`` prefix.
+            name (``"ego"``, ``"base"``, ``"wrist_left"`` or ``"wrist_right"``).
+            Keys must match the flattened batch image keys (e.g.
+            ``"images.top_camera"``). The prompt uses canonical view order.
         gradient_checkpointing: Enable gradient checkpointing.
         compile_model: Whether to use torch.compile.
         compile_mode: Torch compile mode.

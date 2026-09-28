@@ -63,12 +63,9 @@ class XR0Config(Config):
             256.
         image_key_view_map: Mapping from dataset image key to canonical XR0 view
             name (``"ego"``, ``"base"``, ``"wrist_left"`` or ``"wrist_right"``).
-            Keys may be given with or without the ``observation.images.`` prefix.
-            When set, the mapping must cover the observation's image keys exactly
-            and the prompt's view sections are renamed and reordered to the
-            canonical order the pretrained checkpoint was trained with. Defaults
-            to an empty mapping, which keeps the dataset's own key names and
-            order.
+            Keys must match the flattened batch image keys (e.g.
+            ``"images.top_camera"``). The prompt uses canonical view order.
+            Defaults to an empty mapping, keeping the dataset's names and order.
         gradient_checkpointing: Enable gradient checkpointing for memory
             optimization. Defaults to True.
         compile_model: Whether to use torch.compile. Defaults to False.

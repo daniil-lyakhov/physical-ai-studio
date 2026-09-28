@@ -66,8 +66,8 @@ EXPERIMENT_DIR = Path("experiments") / "Put_different_box_09_26_long"
 # prompt read "# Ego View" / "# Left-Wrist View", exactly like the data
 # Xiaomi-Robotics-0-Pretrain was trained on.
 IMAGE_KEY_VIEW_MAP = {
-    "top_camera": "ego",
-    "pov_black_follower_camera": "wrist_left",
+    "images.top_camera": "ego",
+    "images.pov_black_follower_camera": "wrist_left",
 }
 
 

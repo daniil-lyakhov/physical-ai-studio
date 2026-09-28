@@ -86,24 +86,17 @@ _VIEW_TITLES = {
 _VIEW_ORDER = ("ego", "base", "wrist_left", "wrist_right")
 
 
-def _normalize_view_map(image_key_view_map: Mapping[str, str] | None) -> dict[str, str]:
-    """Prefix-qualify and validate a dataset-key to canonical-view mapping.
-
-    Keys are accepted with or without the ``observation.images.`` prefix and are
-    returned fully qualified, so the mapping can be compared directly against the
-    flattened batch image keys.
+def _validate_view_map(image_key_view_map: Mapping[str, str] | None) -> dict[str, str]:
+    """Validate a mapping from exact batch image keys to canonical views.
 
     Returns:
-        The validated mapping, keyed by fully qualified image key.
+        The validated mapping, keyed by batch image key.
 
     Raises:
         ValueError: If a value is not a canonical XR0 view name, or if two keys
             map onto the same view.
     """
-    mapping: dict[str, str] = {}
-    for raw_key, view in (image_key_view_map or {}).items():
-        camera = raw_key.removeprefix("observation.").removeprefix(f"{IMAGES}.")
-        mapping[f"{IMAGES}.{camera}"] = view
+    mapping = dict(image_key_view_map or {})
 
     unknown = sorted({view for view in mapping.values() if view not in _VIEW_TITLES})
     if unknown:
@@ -323,11 +316,11 @@ class XR0Preprocessor(torch.nn.Module):
             (matches the graph's baked ``tokenizer_max_length``).
         image_key_view_map: Optional mapping from dataset image key to canonical
             XR0 view name (one of ``"ego"``, ``"base"``, ``"wrist_left"``,
-            ``"wrist_right"``). Keys may be given with or without the
-            ``observation.images.`` prefix. When set, the mapping must cover the
-            batch image keys exactly and the prompt sections are emitted in the
-            canonical view order. When empty, the view name is the image key with
-            its prefix stripped and the prompt follows the dataset's key order.
+            ``"wrist_right"``). Keys must match the flattened batch image keys
+            (e.g. ``"images.top_camera"``). When set, the mapping must cover all
+            batch image keys and the prompt sections use canonical view order.
+            When empty, the view name is the image key without ``"images."``
+            and the prompt follows the dataset's key order.
         chunk_size: Number of predicted action timesteps; the temporal length of
             the action normalization buffers.
         state_len: Number of state timesteps; the temporal length of the state
@@ -383,7 +376,7 @@ class XR0Preprocessor(torch.nn.Module):
         self.image_max_pixels = image_max_pixels
         self.processor_name = processor_name
         self.max_token_len = int(max_token_len)
-        self.image_key_view_map = _normalize_view_map(image_key_view_map)
+        self.image_key_view_map = _validate_view_map(image_key_view_map)
         self.normalize_state = bool(normalize_state)
         self.action_mode = str(action_mode)
         self._processor: Any = None
@@ -859,6 +852,7 @@ def make_xr0_preprocessors(
         processor_name: HuggingFace id of the Qwen3-VL processor.
         image_key_view_map: Optional mapping from dataset image key to canonical
             XR0 view name, used to rename and order the prompt's view sections.
+            Keys must match the flattened batch keys (e.g. ``"images.top_camera"``).
         normalize_state: When True, normalize the state with the dataset's
             mean/std. Defaults to False (raw state).
         action_mode: ``"absolute"`` (default) or ``"delta"``. In delta mode the

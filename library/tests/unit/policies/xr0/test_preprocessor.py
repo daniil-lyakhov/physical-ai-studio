@@ -262,8 +262,8 @@ class TestImageKeyViewMap:
         # canonical order the pretrained checkpoint was trained with.
         pre = XR0Preprocessor(
             image_key_view_map={
-                "pov_black_follower_camera": "wrist_left",
-                "top_camera": "ego",
+                "images.pov_black_follower_camera": "wrist_left",
+                "images.top_camera": "ego",
             },
         )
         views, images = pre._extract_view_images(self._batch())  # noqa: SLF001
@@ -276,22 +276,23 @@ class TestImageKeyViewMap:
     def test_prompt_matches_pretrain_reference(self) -> None:
         # Byte-for-byte parity with the reference prompt of the base Pretrain
         # checkpoint (xr0/docs/data_format.md, mibot/server/runtime/client.py).
-        pre = XR0Preprocessor(image_key_view_map={"top_camera": "ego", "pov_black_follower_camera": "wrist_left"})
+        pre = XR0Preprocessor(image_key_view_map={"images.top_camera": "ego", "images.pov_black_follower_camera": "wrist_left"})
         views, _ = pre._extract_view_images(self._batch())  # noqa: SLF001
         img = Image.new("RGB", (32, 32))
         content = pre._build_message("pick up the cube", views, [img, img])[0]["content"]  # noqa: SLF001
         assert content[1]["text"] == "# Ego View\n"
         assert content[4]["text"] == "# Left-Wrist View\n"
 
-    def test_accepts_prefixed_keys(self) -> None:
+    @pytest.mark.parametrize("prefix", ["", "observation.images."])
+    def test_alias_keys_are_rejected(self, prefix: str) -> None:
         pre = XR0Preprocessor(
             image_key_view_map={
-                "observation.images.top_camera": "ego",
-                "images.pov_black_follower_camera": "wrist_left",
+                f"{prefix}top_camera": "ego",
+                f"{prefix}pov_black_follower_camera": "wrist_left",
             },
         )
-        views, _ = pre._extract_view_images(self._batch())  # noqa: SLF001
-        assert views == ["ego", "wrist_left"]
+        with pytest.raises(ValueError, match="must match the batch image keys exactly"):
+            pre._extract_view_images(self._batch())  # noqa: SLF001
 
     def test_empty_map_keeps_dataset_names(self) -> None:
         pre = XR0Preprocessor()
@@ -299,23 +300,23 @@ class TestImageKeyViewMap:
         assert views == ["pov_black_follower_camera", "top_camera"]
 
     def test_key_mismatch_raises(self) -> None:
-        pre = XR0Preprocessor(image_key_view_map={"top_camera": "ego"})
+        pre = XR0Preprocessor(image_key_view_map={"images.top_camera": "ego"})
         with pytest.raises(ValueError, match="must match the batch image keys exactly"):
             pre._extract_view_images(self._batch())  # noqa: SLF001
 
     def test_unknown_view_name_raises(self) -> None:
         with pytest.raises(ValueError, match="canonical XR0 view names"):
-            XR0Preprocessor(image_key_view_map={"top_camera": "front_cam"})
+            XR0Preprocessor(image_key_view_map={"images.top_camera": "front_cam"})
 
     def test_duplicate_view_name_raises(self) -> None:
         with pytest.raises(ValueError, match="must be unique"):
-            XR0Preprocessor(image_key_view_map={"top_camera": "ego", "pov_black_follower_camera": "ego"})
+            XR0Preprocessor(image_key_view_map={"images.top_camera": "ego", "images.pov_black_follower_camera": "ego"})
 
     def test_factory_threads_the_map(self) -> None:
         pre, _ = make_xr0_preprocessors(
             stats=_stats(),
             chunk_size=HORIZON,
-            image_key_view_map={"top_camera": "ego"},
+            image_key_view_map={"images.top_camera": "ego"},
         )
         assert pre.image_key_view_map == {"images.top_camera": "ego"}
 
