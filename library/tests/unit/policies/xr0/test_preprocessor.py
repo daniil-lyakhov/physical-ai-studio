@@ -222,11 +222,14 @@ class TestExtractViewImages:
         batch = {"images.base": image.expand(1, 3, -1, -1)}
         _, plain = pre._extract_view_images(batch)  # noqa: SLF001
         with (
-            patch("physicalai.policies.xr0.preprocessor.random.uniform", side_effect=[0.0, 1.0, 1.0]),
-            patch("physicalai.policies.xr0.preprocessor.random.randint", return_value=1),
-            patch("physicalai.policies.xr0.preprocessor.random.randrange", return_value=1),
+            patch(
+                "physicalai.policies.xr0.preprocessor.torch.rand",
+                return_value=torch.tensor([0.5, 0.5, 0.5, 1.0, 1.0, 1.0]),
+            ),
+            patch("physicalai.policies.xr0.preprocessor.torch.randint", return_value=torch.tensor(1)) as crop_draws,
         ):
             _, augmented = pre._extract_view_images(batch, augment_images=True)  # noqa: SLF001
+        assert crop_draws.call_count == 2
         assert augmented[0][0].shape == plain[0][0].shape == (3, 64, 64)
         assert augmented[0][0].dtype == torch.uint8
         assert not torch.equal(augmented[0][0], plain[0][0])
@@ -235,12 +238,12 @@ class TestExtractViewImages:
         pre = XR0Preprocessor()
         image = torch.full((1, 3, 64, 64), 128, dtype=torch.uint8)
         batch = {"images.base": image, "images.wrist_left": image}
-        with (
-            patch("physicalai.policies.xr0.preprocessor.random.uniform", side_effect=[-32 / 255, 1.5, 0.5]) as factors,
-            patch("physicalai.policies.xr0.preprocessor.random.randint", side_effect=[0, 1, 1]) as gates,
-        ):
+        with patch(
+            "physicalai.policies.xr0.preprocessor.torch.rand",
+            return_value=torch.tensor([0.0, 1.0, 0.0, 0.0, 1.0, 1.0]),
+        ) as draws:
             _, images = pre._extract_view_images(batch, augment_images=True)  # noqa: SLF001
-        assert factors.call_count == gates.call_count == 3
+        draws.assert_called_once_with(6, device=image.device)
         assert torch.equal(images[0][0], images[0][1])
         assert int(images[0][0].max()) < 128
 

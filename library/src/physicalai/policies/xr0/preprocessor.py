@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import logging
 import math
-import random
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
@@ -213,18 +212,19 @@ def _augment_images(images: list[torch.Tensor]) -> list[torch.Tensor]:
     Returns:
         Augmented RGB uint8 views at their original resized dimensions.
     """
+    draws = torch.rand(6, device=images[0].device).tolist()
     ops = (
-        (vision_f.adjust_brightness, 1.0 + random.uniform(-32.0 / 255.0, 32.0 / 255.0)),
-        (vision_f.adjust_contrast, random.uniform(0.5, 1.5)),
-        (vision_f.adjust_saturation, random.uniform(0.5, 1.5)),
+        (vision_f.adjust_brightness, 1.0 + (2 * draws[0] - 1) * 32.0 / 255.0),
+        (vision_f.adjust_contrast, 0.5 + draws[1]),
+        (vision_f.adjust_saturation, 0.5 + draws[2]),
     )
-    flags = [random.randint(0, 1) == 0 for _ in ops]
+    flags = [draw < 0.5 for draw in draws[3:]]
     augmented = []
     for image in images:
         height, width = image.shape[-2:]
         crop_h, crop_w = int(height * 0.95), int(width * 0.95)
-        top = random.randrange(height - crop_h + 1)
-        left = random.randrange(width - crop_w + 1)
+        top = torch.randint(height - crop_h + 1, (), device=image.device).item()
+        left = torch.randint(width - crop_w + 1, (), device=image.device).item()
         image = vision_f.resize(vision_f.crop(image, top, left, crop_h, crop_w), (height, width))
         for use, (op, factor) in zip(flags, ops, strict=True):
             if use:
