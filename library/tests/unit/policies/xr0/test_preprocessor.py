@@ -507,6 +507,28 @@ class TestPostprocessor:
 class TestMakeXr0Preprocessors:
     """Factory wiring: stats -> features -> pre/post action stats."""
 
+    def test_state_stats_feature_default_and_explicit(self) -> None:
+        stats = _stats()
+        stats["observation.state"]["mean"] = [2.0] * STATE_DIM
+        stats["observation.state"]["std"] = [3.0] * STATE_DIM
+        pre, _ = make_xr0_preprocessors(
+            stats=stats, chunk_size=HORIZON, max_state_dim=10, normalize_state=True
+        )
+        assert torch.equal(pre.state_mean[0, :STATE_DIM], torch.full((STATE_DIM,), 2.0))
+        assert torch.equal(pre.state_std[0, :STATE_DIM], torch.full((STATE_DIM,), 3.0))
+        assert torch.equal(pre.state_mean[0, STATE_DIM:], torch.zeros(2))
+        assert torch.equal(pre.state_std[0, STATE_DIM:], torch.ones(2))
+
+        raw, _ = make_xr0_preprocessors(stats=stats, chunk_size=HORIZON, max_state_dim=10)
+        assert torch.equal(raw.state_mean, torch.zeros(1, 10))
+        assert torch.equal(raw.state_std, torch.ones(1, 10))
+
+        explicit = XR0Preprocessor(
+            max_state_dim=10, state_mean=[4.0] * STATE_DIM, state_std=[5.0] * STATE_DIM
+        )
+        assert torch.equal(explicit.state_mean[0, :STATE_DIM], torch.full((STATE_DIM,), 4.0))
+        assert torch.equal(explicit.state_std[0, :STATE_DIM], torch.full((STATE_DIM,), 5.0))
+
     def test_absolute_derives_stats_from_features(self) -> None:
         pre, post = make_xr0_preprocessors(max_action_dim=32, stats=_stats(), chunk_size=HORIZON)
         assert isinstance(pre, XR0Preprocessor)

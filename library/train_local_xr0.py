@@ -39,7 +39,7 @@ SMOKE_TEST = False
 
 # Training hyperparameters. XR0 is far larger than ACT, so keep the batch small.
 MAX_STEPS = 300 if SMOKE_TEST else 120_000
-BATCH_SIZE = 16 if SMOKE_TEST else 16
+BATCH_SIZE = 16
 WARMUP_STEPS = 20 if SMOKE_TEST else 2_000
 
 # Smoke-test knobs: cap the delta-stats estimation and the train/val loop to a
@@ -73,7 +73,6 @@ IMAGE_KEY_VIEW_MAP = {
 
 def main() -> None:
     """Run XR0 fine-tuning on the local dataset."""
-
     datamodule = LeRobotDataModule(
         # `repo_id` is only used as a name when `root` points at a local dataset.
         root=str(DATASET_ROOT),
@@ -102,7 +101,7 @@ def main() -> None:
         image_key_view_map=IMAGE_KEY_VIEW_MAP,
         # Align the cosine decay horizon with the full training length (the
         # config default decays over 30k steps, which under-decays a 40k run).
-        scheduler_decay_steps=MAX_STEPS-10_000,
+        scheduler_decay_steps=MAX_STEPS - 10_000,
         scheduler_warmup_steps=WARMUP_STEPS,
     )
 
@@ -151,4 +150,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

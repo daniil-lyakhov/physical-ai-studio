@@ -99,9 +99,7 @@ def _validate_view_map(image_key_view_map: Mapping[str, str] | None) -> dict[str
 
     unknown = sorted({view for view in mapping.values() if view not in _VIEW_TITLES})
     if unknown:
-        msg = (
-            f"image_key_view_map values must be canonical XR0 view names {list(_VIEW_ORDER)}, got {unknown}."
-        )
+        msg = f"image_key_view_map values must be canonical XR0 view names {list(_VIEW_ORDER)}, got {unknown}."
         raise ValueError(msg)
 
     duplicates = sorted(view for view, count in Counter(mapping.values()).items() if count > 1)
@@ -218,16 +216,16 @@ def _augment_images(images: list[torch.Tensor]) -> list[torch.Tensor]:
         (vision_f.adjust_contrast, 0.5 + draws[1]),
         (vision_f.adjust_saturation, 0.5 + draws[2]),
     )
-    flags = [draw < 0.5 for draw in draws[3:]]
     augmented = []
-    for image in images:
-        height, width = image.shape[-2:]
+    jitter_probability = 0.5
+    for source in images:
+        height, width = source.shape[-2:]
         crop_h, crop_w = int(height * 0.95), int(width * 0.95)
-        top = torch.randint(height - crop_h + 1, (), device=image.device).item()
-        left = torch.randint(width - crop_w + 1, (), device=image.device).item()
-        image = vision_f.resize(vision_f.crop(image, top, left, crop_h, crop_w), (height, width))
-        for use, (op, factor) in zip(flags, ops, strict=True):
-            if use:
+        top = int(torch.randint(height - crop_h + 1, (), device=source.device).item())
+        left = int(torch.randint(width - crop_w + 1, (), device=source.device).item())
+        image = vision_f.resize(vision_f.crop(source, top, left, crop_h, crop_w), [height, width])
+        for draw, (op, factor) in zip(draws[3:], ops, strict=True):
+            if draw < jitter_probability:
                 image = op(image, factor)
         augmented.append(image)
     return augmented
@@ -385,15 +383,16 @@ class XR0Preprocessor(torch.nn.Module):
         # feature-derived stats. Both paths yield ``(chunk_size,
         # max_action_dim)`` buffers.
         if action_mean is not None and action_std is not None:
-            mean, std = _to_chunk_stats(
-                action_mean,
-                action_std,
-                chunk_size=self.chunk_size,
-                dim=self.max_action_dim,
-                name="action",
-            )
+            raw_mean, raw_std = action_mean, action_std
         else:
-            mean, std = self._action_stats(features)
+            raw_mean, raw_std = self._action_stats(features)
+        mean, std = _to_chunk_stats(
+            raw_mean,
+            raw_std,
+            chunk_size=self.chunk_size,
+            dim=self.max_action_dim,
+            name="action",
+        )
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
 
@@ -403,23 +402,24 @@ class XR0Preprocessor(torch.nn.Module):
         # exported manifest) take precedence over feature-derived stats so the
         # exported graph reproduces the training normalization exactly.
         if state_mean is not None and state_std is not None:
-            s_mean, s_std = _to_chunk_stats(
-                state_mean,
-                state_std,
-                chunk_size=self.state_len,
-                dim=self.max_state_dim,
-                name="state",
-            )
+            raw_mean, raw_std = state_mean, state_std
         else:
-            s_mean, s_std = self._state_stats(features)
+            raw_mean, raw_std = self._state_stats(features)
+        s_mean, s_std = _to_chunk_stats(
+            raw_mean,
+            raw_std,
+            chunk_size=self.state_len,
+            dim=self.max_state_dim,
+            name="state",
+        )
         self.register_buffer("state_mean", s_mean, persistent=False)
         self.register_buffer("state_std", s_std, persistent=False)
 
     def _action_stats(self, features: dict[str, Feature] | None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build per-timestep ``(chunk_size, max_action_dim)`` mean/std buffers from action features.
+        """Get action mean/std from features, or identity stats when unavailable.
 
         Returns:
-            A ``(mean, std)`` tuple of ``(chunk_size, max_action_dim)`` buffers.
+            The raw feature stats or ``(chunk_size, max_action_dim)`` identity stats.
         """
         for feature in (features or {}).values():
             if feature.ftype != FeatureType.ACTION or feature.normalization_data is None:
@@ -427,24 +427,18 @@ class XR0Preprocessor(torch.nn.Module):
             norm = feature.normalization_data
             if norm.mean is None or norm.std is None:
                 continue
-            return _to_chunk_stats(
-                norm.mean,
-                norm.std,
-                chunk_size=self.chunk_size,
-                dim=self.max_action_dim,
-                name="action",
-            )
+            return torch.as_tensor(norm.mean), torch.as_tensor(norm.std)
         return torch.zeros(self.chunk_size, self.max_action_dim), torch.ones(self.chunk_size, self.max_action_dim)
 
     def _state_stats(self, features: dict[str, Feature] | None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build per-timestep ``(state_len, max_state_dim)`` mean/std buffers from state features.
+        """Get state mean/std from features, or identity stats when unavailable.
 
-        Returns identity buffers (mean 0, std 1) when state normalization is
-        disabled or no state stats are available, so ``_prepare_state`` is a
-        no-op and raw-state checkpoints stay bit-for-bit unchanged.
+        Returns identity stats (mean 0, std 1) when state normalization is
+        disabled or no state stats are available, so raw-state checkpoints
+        stay bit-for-bit unchanged.
 
         Returns:
-            A ``(mean, std)`` tuple of ``(state_len, max_state_dim)`` buffers.
+            The raw feature stats or ``(state_len, max_state_dim)`` identity stats.
         """
         if self.normalize_state:
             for feature in (features or {}).values():
@@ -453,13 +447,7 @@ class XR0Preprocessor(torch.nn.Module):
                 norm = feature.normalization_data
                 if norm.mean is None or norm.std is None:
                     continue
-                return _to_chunk_stats(
-                    norm.mean,
-                    norm.std,
-                    chunk_size=self.state_len,
-                    dim=self.max_state_dim,
-                    name="state",
-                )
+                return torch.as_tensor(norm.mean), torch.as_tensor(norm.std)
         return torch.zeros(self.state_len, self.max_state_dim), torch.ones(self.state_len, self.max_state_dim)
 
     @property
@@ -538,7 +526,10 @@ class XR0Preprocessor(torch.nn.Module):
         return ordered_keys, [self.image_key_view_map[key] for key in ordered_keys]
 
     def _extract_view_images(
-        self, batch: dict[str, Any], *, augment_images: bool = False
+        self,
+        batch: dict[str, Any],
+        *,
+        augment_images: bool = False,
     ) -> tuple[list[str], list[list[torch.Tensor]]]:
         """Return the ordered view names and, per sample, the resized images.
 
@@ -651,6 +642,7 @@ class XR0Preprocessor(torch.nn.Module):
 
         Args:
             batch: Dict with STATE, TASK, image keys and optionally ACTION.
+            augment_images: Apply training crop and color jitter to images.
 
         Returns:
             Dict with ``input_ids`` / ``attention_mask`` / ``pixel_values`` /
@@ -734,8 +726,8 @@ class XR0Postprocessor(torch.nn.Module):
         self.action_dim: int | None = None
         self.action_mode = str(action_mode)
 
-        mean = torch.zeros(self.chunk_size, max_action_dim)
-        std = torch.ones(self.chunk_size, max_action_dim)
+        raw_mean: Sequence[float] | torch.Tensor = torch.zeros(self.chunk_size, max_action_dim)
+        raw_std: Sequence[float] | torch.Tensor = torch.ones(self.chunk_size, max_action_dim)
         for feature in (features or {}).values():
             if feature.ftype != FeatureType.ACTION or feature.normalization_data is None:
                 continue
@@ -743,13 +735,7 @@ class XR0Postprocessor(torch.nn.Module):
             if norm.mean is None or norm.std is None:
                 continue
             if action_mean is None or action_std is None:
-                mean, std = _to_chunk_stats(
-                    norm.mean,
-                    norm.std,
-                    chunk_size=self.chunk_size,
-                    dim=max_action_dim,
-                    name="action",
-                )
+                raw_mean, raw_std = torch.as_tensor(norm.mean), torch.as_tensor(norm.std)
             # The unpadded action width is the feature's last axis, not its
             # element count: the stats are per-timestep ``(chunk_size, D)``.
             feat_dim = int(torch.as_tensor(norm.mean).shape[-1])
@@ -760,13 +746,14 @@ class XR0Postprocessor(torch.nn.Module):
         # training set) override the feature-derived denormalization mean/std;
         # the unpadded ``action_dim`` is still recovered from ``features``.
         if action_mean is not None and action_std is not None:
-            mean, std = _to_chunk_stats(
-                action_mean,
-                action_std,
-                chunk_size=self.chunk_size,
-                dim=max_action_dim,
-                name="action",
-            )
+            raw_mean, raw_std = action_mean, action_std
+        mean, std = _to_chunk_stats(
+            raw_mean,
+            raw_std,
+            chunk_size=self.chunk_size,
+            dim=max_action_dim,
+            name="action",
+        )
 
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
