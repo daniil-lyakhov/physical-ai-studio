@@ -19,13 +19,6 @@
 
 The postprocessor inverts the action normalization
 (:func:`denormalize_action`).
-
-Normalization statistics are **always per-timestep**: the action buffers are
-``(chunk_size, max_action_dim)`` and the state buffers are ``(state_len,
-max_state_dim)``, matching the source ``validate_stats`` contract (which
-requires exactly ``(action_length, 32)``). Per-dimension statistics are never
-broadcast over the time axis -- a per-dimension array is rejected unless the
-expected temporal length is 1, where reshaping it is unambiguous.
 """
 
 from __future__ import annotations
@@ -269,43 +262,41 @@ def _to_chunk_stats(
     mean: Sequence[float] | torch.Tensor,
     std: Sequence[float] | torch.Tensor,
     *,
-    length: int,
+    chunk_size: int,
     dim: int,
     name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Coerce ``mean`` / ``std`` into per-timestep ``(length, dim)`` buffers.
+    """Coerce ``mean`` / ``std`` into per-timestep ``(chunk_size, dim)`` buffers.
 
-    The temporal axis is never broadcast: statistics must already carry one
-    entry per predicted timestep. A 1D ``(D,)`` array is accepted only when
-    ``length == 1``, where reshaping it is unambiguous (the state case). The
-    feature axis is padded with the identity transform (mean 0 / std 1) up to
-    ``dim``, or truncated when the source is wider.
+    Stats need one row per timestep; only a single-timestep chunk accepts a
+    1D array. Pad missing dimensions with mean 0 and std 1 so they stay
+    unchanged, or truncate extra dimensions. Already full-width stats are copied.
 
     Returns:
-        A ``(mean, std)`` tuple of ``(length, dim)`` float32 tensors.
+        A ``(mean, std)`` tuple of ``(chunk_size, dim)`` float32 tensors.
 
     Raises:
         ValueError: If ``mean`` / ``std`` disagree in shape, or if the statistics
-            are not per-timestep with the expected temporal length.
+            are not per-timestep with the expected temporal chunk_size.
     """
     t_mean = torch.as_tensor(mean, dtype=torch.float32)
     t_std = torch.as_tensor(std, dtype=torch.float32)
     if t_mean.shape != t_std.shape:
         msg = f"{name} mean/std must have the same shape, got {tuple(t_mean.shape)} and {tuple(t_std.shape)}"
         raise ValueError(msg)
-    if t_mean.ndim == 1 and length == 1:
+    if t_mean.ndim == 1 and chunk_size == 1:
         t_mean = t_mean.unsqueeze(0)
         t_std = t_std.unsqueeze(0)
-    if t_mean.ndim != _STATS_NDIM or int(t_mean.shape[0]) != length:
+    if t_mean.ndim != _STATS_NDIM or int(t_mean.shape[0]) != chunk_size:
         msg = (
-            f"{name} stats must be per-timestep with shape ({length}, D), got {tuple(t_mean.shape)}. "
+            f"{name} stats must be per-timestep with shape ({chunk_size}, D), got {tuple(t_mean.shape)}. "
             "Per-dimension stats are not broadcast over time; compute per-timestep stats with "
             "physicalai.policies.xr0.compute_action_chunk_stats."
         )
         raise ValueError(msg)
 
-    out_mean = torch.zeros(length, dim)
-    out_std = torch.ones(length, dim)
+    out_mean = torch.zeros(chunk_size, dim)
+    out_std = torch.ones(chunk_size, dim)
     width = min(dim, int(t_mean.shape[-1]))
     out_mean[:, :width] = t_mean[:, :width]
     out_std[:, :width] = t_std[:, :width]
@@ -397,15 +388,14 @@ class XR0Preprocessor(torch.nn.Module):
         self.action_mode = str(action_mode)
         self._processor: Any = None
 
-        # Explicit ``action_mean`` / ``action_std`` (e.g. per-timestep delta
-        # stats computed over the training set) take precedence over the
+        # Explicit ``action_mean`` / ``action_std`` take precedence over the
         # feature-derived stats. Both paths yield ``(chunk_size,
-        # max_action_dim)`` buffers -- there is no per-dimension variant.
+        # max_action_dim)`` buffers.
         if action_mean is not None and action_std is not None:
             mean, std = _to_chunk_stats(
                 action_mean,
                 action_std,
-                length=self.chunk_size,
+                chunk_size=self.chunk_size,
                 dim=self.max_action_dim,
                 name="action",
             )
@@ -423,7 +413,7 @@ class XR0Preprocessor(torch.nn.Module):
             s_mean, s_std = _to_chunk_stats(
                 state_mean,
                 state_std,
-                length=self.state_len,
+                chunk_size=self.state_len,
                 dim=self.max_state_dim,
                 name="state",
             )
@@ -447,7 +437,7 @@ class XR0Preprocessor(torch.nn.Module):
             return _to_chunk_stats(
                 norm.mean,
                 norm.std,
-                length=self.chunk_size,
+                chunk_size=self.chunk_size,
                 dim=self.max_action_dim,
                 name="action",
             )
@@ -473,7 +463,7 @@ class XR0Preprocessor(torch.nn.Module):
                 return _to_chunk_stats(
                     norm.mean,
                     norm.std,
-                    length=self.state_len,
+                    chunk_size=self.state_len,
                     dim=self.max_state_dim,
                     name="state",
                 )
@@ -763,7 +753,7 @@ class XR0Postprocessor(torch.nn.Module):
                 mean, std = _to_chunk_stats(
                     norm.mean,
                     norm.std,
-                    length=self.chunk_size,
+                    chunk_size=self.chunk_size,
                     dim=max_action_dim,
                     name="action",
                 )
@@ -780,7 +770,7 @@ class XR0Postprocessor(torch.nn.Module):
             mean, std = _to_chunk_stats(
                 action_mean,
                 action_std,
-                length=self.chunk_size,
+                chunk_size=self.chunk_size,
                 dim=max_action_dim,
                 name="action",
             )
