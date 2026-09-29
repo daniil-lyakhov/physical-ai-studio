@@ -15,13 +15,13 @@ from .preprocessor import (
     make_xr0_preprocessors,
 )
 from .pretrained_utils import (
+    compute_action_chunk_stats,
     extract_xr0_dataset_stats,
     load_xr0_pretrained_weights,
     remap_xr0_state_dict,
     resolve_pretrained_path,
 )
 from .qwen3_vlm import XR0Qwen3VL
-from .stats import compute_action_chunk_stats
 
 __all__ = [
     "XR0",

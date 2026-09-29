@@ -22,7 +22,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 from physicalai.data import LeRobotDataModule
 from physicalai.policies import XR0
-from physicalai.policies.xr0 import compute_action_chunk_stats
+from physicalai.policies.xr0.pretrained_utils import compute_action_chunk_stats
 from physicalai.train import Trainer
 from physicalai.train.utils import reformat_dataset_to_match_policy
 

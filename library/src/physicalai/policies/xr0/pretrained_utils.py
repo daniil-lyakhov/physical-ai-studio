@@ -22,10 +22,13 @@ import logging
 # Only referenced for pickle.UnpicklingError in an except clause; never used to deserialize.
 import pickle  # noqa: S403  # nosec B403
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from safetensors.torch import load_file
+
+from physicalai.data.constants import ACTION, STATE
+from physicalai.devices.utils import get_device
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -434,3 +437,134 @@ def extract_xr0_dataset_stats(
             "std": std.tolist(),
         },
     }
+
+
+def _feature_tensor(value: Any) -> torch.Tensor:  # noqa: ANN401
+    """Coerce an observation field (tensor or single-entry dict) to a tensor.
+
+    Returns:
+        The tensor held by ``value``.
+
+    Raises:
+        TypeError: If no tensor can be recovered from ``value``.
+    """
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, dict):
+        for sub in value.values():
+            if isinstance(sub, torch.Tensor):
+                return sub
+    msg = f"expected a tensor (or dict containing one), got {type(value)!r}"
+    raise TypeError(msg)
+
+
+_TEMPORAL_STATE_NDIM = 3
+_BATCHED_ACTION_NDIM = 2
+
+
+def compute_action_chunk_stats(  # noqa: PLR0914
+    datamodule: Any,  # noqa: ANN401
+    *,
+    chunk_size: int,
+    action_dim: int,
+    max_action_dim: int = 32,
+    action_mode: Literal["absolute", "delta"] = "delta",
+    max_batches: int | None = None,
+    subset_size: int | None = None,
+    setup_stage: str | None = "fit",
+    device: str | torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-timestep action mean/std over a training dataset.
+
+    Reads the train dataloader once, including padded episode endings. Computes
+    mean and std for each action timestep: raw actions in ``"absolute"`` mode,
+    or actions minus the current state in ``"delta"`` mode. Uses float64 while
+    accumulating on the selected device, then returns CPU float32 stats padded
+    with mean 0 and std 1.
+
+    Chunk the datamodule first with
+    :func:`physicalai.train.utils.reformat_dataset_to_match_policy`.
+
+    Args:
+        datamodule: A Lightning datamodule exposing ``train_dataloader()`` (and an
+            optional ``setup`` method) yielding batched observations with ``state``
+            and ``action`` fields.
+        chunk_size: Number of action steps per chunk (the temporal dimension).
+        action_dim: True (unpadded) action dimension of the dataset.
+        max_action_dim: Padded action dimension of the returned buffers.
+        action_mode: ``"delta"`` (default) subtracts the current state from the
+            action target; ``"absolute"`` accumulates the raw action.
+        max_batches: Optional cap on the number of batches to consume (for a quick
+            estimate). ``None`` consumes the full train set.
+        subset_size: Optional number of samples to use from the start of the
+            train dataloader. ``None`` uses all samples (subject to ``max_batches``).
+        setup_stage: Stage passed to ``datamodule.setup(...)`` before iterating.
+            Pass ``None`` to skip setup (e.g. when already set up).
+        device: Compute device. Defaults to CUDA or XPU when available, otherwise CPU.
+
+    Returns:
+        A ``(mean, std)`` tuple of ``(chunk_size, max_action_dim)`` float32 tensors.
+
+    Raises:
+        ValueError: If ``subset_size`` is not positive, the dataset yields no
+            samples, or an action chunk has the wrong temporal dimension.
+    """
+    if subset_size is not None and subset_size <= 0:
+        msg = "subset_size must be positive"
+        raise ValueError(msg)
+
+    if setup_stage is not None and hasattr(datamodule, "setup"):
+        datamodule.setup(setup_stage)
+
+    compute_device = get_device() if device is None else torch.device(device)
+    sum_1 = torch.zeros(chunk_size, action_dim, dtype=torch.float64, device=compute_device)
+    sum_2 = torch.zeros(chunk_size, action_dim, dtype=torch.float64, device=compute_device)
+    count = 0
+
+    for index, batch in enumerate(datamodule.train_dataloader()):
+        if max_batches is not None and index >= max_batches:
+            break
+
+        action_field = batch.action if hasattr(batch, "action") else batch[ACTION]
+        action = _feature_tensor(action_field)
+        if subset_size is not None:
+            action = action[: subset_size - count]
+        action = action.to(device=compute_device, dtype=torch.float64)
+        if action.ndim == _BATCHED_ACTION_NDIM:  # (B, D) -> (B, 1, D)
+            action = action.unsqueeze(1)
+        if action.shape[1] != chunk_size:
+            msg = (
+                f"action chunk has temporal dim {action.shape[1]}, expected chunk_size={chunk_size}; "
+                "call reformat_dataset_to_match_policy(policy, datamodule) first"
+            )
+            raise ValueError(msg)
+        target = action[..., :action_dim]
+
+        if action_mode == "delta":
+            state_field = batch.state if hasattr(batch, "state") else batch[STATE]
+            state = _feature_tensor(state_field)[: action.shape[0]].to(device=compute_device, dtype=torch.float64)
+            if state.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> current (last) frame
+                state = state[:, -1, :]
+            # Not in-place: ``target`` is a view of the caller's action tensor.
+            target = target - state[..., :action_dim].unsqueeze(1)  # noqa: PLR6104
+
+        sum_1 += target.sum(dim=0)
+        sum_2 += (target * target).sum(dim=0)
+        count += target.shape[0]
+        if subset_size is not None and count >= subset_size:
+            break
+
+    if count == 0:
+        msg = "no samples found while computing action chunk stats"
+        raise ValueError(msg)
+
+    mean = sum_1 / count
+    var = (sum_2 / count - mean * mean).clamp_min(0.0)
+    std = var.sqrt()
+
+    mean_full = torch.zeros(chunk_size, max_action_dim, dtype=torch.float32)
+    std_full = torch.ones(chunk_size, max_action_dim, dtype=torch.float32)
+    width = min(action_dim, max_action_dim)
+    mean_full[:, :width] = mean[:, :width].to(device="cpu", dtype=torch.float32)
+    std_full[:, :width] = std[:, :width].to(device="cpu", dtype=torch.float32)
+    return mean_full, std_full
