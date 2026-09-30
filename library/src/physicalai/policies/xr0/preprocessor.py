@@ -68,9 +68,7 @@ _ASSISTANT_PRIMER = "<cot></cot>"
 
 # View titles the model was trained with (Xiaomi reference ``VIEW_TITLES`` in
 # tools/lerobot_convert.py), e.g. "wrist_left" -> "Left-Wrist" so the prompt
-# reads "# Left-Wrist View". A plain capitalize would wrongly yield
-# "Wrist Left". The " View" suffix is appended by the prompt template, so the
-# titles stored here deliberately omit it.
+# reads "# Left-Wrist View".
 _VIEW_TITLES = {
     "ego": "Ego",
     "base": "Base",
@@ -78,10 +76,7 @@ _VIEW_TITLES = {
     "wrist_right": "Right-Wrist",
 }
 
-# Canonical prompt order of the XR0 view names. The order is fixed by the
-# reference data format rather than by the mapping's insertion order, so an
-# ``image_key_view_map`` round-tripped through a JSON manifest still yields the
-# prompt section order the model was trained with.
+# Canonical prompt order of the XR0 view names.
 _VIEW_ORDER = ("ego", "base", "wrist_left", "wrist_right")
 
 
@@ -257,7 +252,7 @@ def _to_chunk_stats(
     dim: int,
     name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Coerce ``mean`` / ``std`` into per-timestep ``(chunk_size, dim)`` buffers.
+    """Convert ``mean`` / ``std`` into per-timestep ``(chunk_size, dim)`` buffers.
 
     Stats need one row per timestep; only a single-timestep chunk accepts a
     1D array. Pad missing dimensions with mean 0 and std 1 so they stay
@@ -332,7 +327,8 @@ class XR0Preprocessor(torch.nn.Module):
         state_std: Optional explicit ``(state_len, max_state_dim)`` state std
             overriding the feature-derived value (used to reload the exported
             normalization).
-        action_mode: ``"absolute"`` or ``"delta"``.
+        action_mode: ``"absolute"`` normalizes raw actions; ``"delta"``
+            normalizes actions relative to the current state.
         action_mean: Optional explicit ``(chunk_size, max_action_dim)`` action
             mean overriding the feature-derived value.
         action_std: Optional explicit ``(chunk_size, max_action_dim)`` action std
@@ -396,10 +392,8 @@ class XR0Preprocessor(torch.nn.Module):
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
 
-        # State normalization is opt-in and identity by default so raw-state
-        # checkpoints (e.g. the upstream LIBERO / Pretrain releases) are
-        # unaffected. Explicit ``state_mean`` / ``state_std`` (baked into the
-        # exported manifest) take precedence over feature-derived stats so the
+        # Explicit ``state_mean`` / ``state_std`` 
+        # take precedence over feature-derived stats so the
         # exported graph reproduces the training normalization exactly.
         if state_mean is not None and state_std is not None:
             raw_mean, raw_std = state_mean, state_std

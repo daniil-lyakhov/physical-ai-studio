@@ -491,12 +491,6 @@ class XR0(XR0ExportablePolicyMixin, Policy):
     ) -> None:
         """Install per-timestep action normalization statistics.
 
-        Compute them with
-        :func:`~physicalai.policies.xr0.stats.compute_action_chunk_stats` and
-        call this before ``trainer.fit``. The stats are mirrored into the
-        checkpoint hyperparameters and, when the pre/post-processors already
-        exist, applied immediately.
-
         Args:
             mean: ``(chunk_size, max_action_dim)`` action mean.
             std: ``(chunk_size, max_action_dim)`` action std.
@@ -1030,9 +1024,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
                 merge_size=int(image_processor.merge_size),
                 temporal_patch_size=int(image_processor.temporal_patch_size),
                 # Bake the camera-view renaming so the exported prompt carries the
-                # same view titles, in the same order, as at training time. The
-                # config's raw keys are exported (not the prefix-qualified ones)
-                # because the runtime uses its own ``images.`` key prefix.
+                # same view titles, in the same order, as at training time.
                 image_key_view_map=dict(cfg.image_key_view_map),
                 # Bake the state normalization so the exported graph applies
                 # the exact transform used at training time (identity when

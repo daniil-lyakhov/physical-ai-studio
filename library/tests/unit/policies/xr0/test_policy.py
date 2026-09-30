@@ -24,7 +24,7 @@ from physicalai.export import ExportBackend
 from physicalai.export.backends import TorchExportParameters
 from physicalai.inference.data import InferenceFeatureDtype, InferenceFeatureType
 from physicalai.policies import get_physicalai_policy_class, get_policy
-from physicalai.policies.xr0 import XR0, XR0Config
+from physicalai.policies.xr0 import XR0, XR0Config, make_xr0_preprocessors
 
 
 def _minimal_export_stats() -> dict[str, dict[str, Any]]:
@@ -209,6 +209,21 @@ class TestXR0Factory:
 
 class TestXR0Export:
     """Torch export hooks (no model download)."""
+
+    def test_openvino_export_preserves_image_view_map(self) -> None:
+        view_map = {"images.top_camera": "ego", "images.wrist_camera": "wrist_left"}
+        policy = XR0(image_key_view_map=view_map)
+        policy.model = object()  # type: ignore[assignment]
+        policy._preprocessor, policy._postprocessor = make_xr0_preprocessors()
+        policy._preprocessor._processor = types.SimpleNamespace(  # noqa: SLF001
+            image_processor=types.SimpleNamespace(
+                image_mean=[0.0] * 3, image_std=[1.0] * 3,
+                rescale_factor=1.0, patch_size=14, merge_size=2, temporal_patch_size=2,
+            ),
+        )
+
+        spec = policy.extra_export_args["openvino"].preprocessors_specs[0]
+        assert spec.model_dump()["image_key_view_map"] == view_map
 
     def test_supported_backends_torch_and_openvino(self) -> None:
         assert XR0.get_supported_export_backends() == [ExportBackend.TORCH, ExportBackend.OPENVINO]
