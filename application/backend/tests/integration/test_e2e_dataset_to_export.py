@@ -29,7 +29,7 @@ from fastapi.testclient import TestClient
 from api.dependencies import get_scheduler
 from main import app
 from schemas.base_job import JobStatus
-from schemas.job import TrainJobPayload
+from schemas.job import LocalTrainJobPayload, TrainJobPayloadAdapter
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
@@ -75,7 +75,7 @@ def _run_training_job_step() -> None:
         async with get_async_db_session_ctx() as session:
             job = await JobService(session).get_pending_train_job()
         assert job is not None, "Expected a pending training job"
-        payload = TrainJobPayload.model_validate(job.payload)
+        payload = TrainJobPayloadAdapter.validate_python(job.payload)
 
         settings = get_settings()
         model_id = uuid4()
@@ -175,7 +175,7 @@ def test_dataset_upload_train_export_infer_e2e(
             "dataset_id": dataset_id,
             "policy": "act",
             "model_name": "E2E ACT Model",
-            "max_steps": 100,  # TrainJobPayload.max_steps has a ge=100 floor
+            "max_epochs": 1,
             "batch_size": 2,
             "num_workers": 0,
             "val_split": 0.5,
@@ -211,7 +211,7 @@ def test_dataset_upload_train_export_infer_e2e(
     assert response.status_code == 200, response.text
     detail = response.json()
     assert any(export["type"] == _ONNX_BACKEND for export in detail["exports"])
-    assert detail["training_summary"]["max_steps"] == 100
+    assert detail["training_summary"]["max_epochs"] == 1
 
     # --- 5. Download the onnx export and confirm it is a valid archive -------------
     response = client.get(f"/api/models/{model_id}/exports/{_ONNX_BACKEND}/download")
@@ -273,14 +273,14 @@ def test_submit_training_job_for_missing_project_returns_404(migrated_db: None) 
             "dataset_id": str(uuid4()),
             "policy": "act",
             "model_name": "Orphan Job",
-            "max_steps": 100,
+            "max_epochs": 1,
         },
     )
     assert response.status_code == 404, response.text
 
 
-def test_interrupt_job_marks_job_canceled(migrated_db: None) -> None:
-    """POST /api/jobs/{id}:interrupt flips a running job to CANCELED.
+def test_interrupt_job_waits_for_worker_before_deletion(migrated_db: None) -> None:
+    """Stop signals the worker; Delete waits until the worker confirms cancellation.
 
     Overrides `get_scheduler` with a minimal stand-in instead of running the
     real `Scheduler` (which needs the FastAPI lifespan to populate
@@ -303,12 +303,12 @@ def test_interrupt_job_marks_job_canceled(migrated_db: None) -> None:
         async with get_async_db_session_ctx() as session:
             job_service = JobService(session)
             job = await job_service.submit_train_job(
-                TrainJobPayload(
+                LocalTrainJobPayload(
                     project_id=project_id,
                     dataset_id=uuid4(),
                     policy="act",
                     model_name="Interrupt Me",
-                    max_steps=100,
+                    max_epochs=1,
                 )
             )
             await job_service.update_job_status(job.id, status=JobStatus.RUNNING, message="Training started")
@@ -328,4 +328,17 @@ def test_interrupt_job_marks_job_canceled(migrated_db: None) -> None:
 
     response = client.get(f"/api/jobs/{job_id}")
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == JobStatus.CANCELED
+    assert response.json()["status"] == JobStatus.RUNNING
+    response = client.delete(f"/api/jobs/{job_id}")
+    assert response.status_code == 409, response.text
+
+    async def _worker_finishes_stop() -> None:
+        from db import get_async_db_session_ctx
+        from services.job_service import JobService
+
+        async with get_async_db_session_ctx() as session:
+            await JobService(session).update_job_status(UUID(job_id), status=JobStatus.CANCELED)
+
+    asyncio.run(_worker_finishes_stop())
+    response = client.delete(f"/api/jobs/{job_id}")
+    assert response.status_code == 200, response.text

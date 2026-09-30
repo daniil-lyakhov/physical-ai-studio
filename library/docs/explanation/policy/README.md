@@ -75,13 +75,14 @@ Both `Policy` and `InferenceModel` satisfy this protocol, enabling:
 
 ## Implemented Policies
 
-| Policy        | Description                  | Source                |
-| ------------- | ---------------------------- | --------------------- |
-| **ACT**       | Action Chunking Transformer  | Native implementation |
-| **Diffusion** | Diffusion Policy             | LeRobot wrapper       |
-| **GROOT**     | Vision-language policy       | Native implementation |
-| **Pi0**       | Physical Intelligence model  | Native implementation |
-| **SmolVLA**   | Small Vision-Language-Action | Native + LeRobot      |
+| Policy      | Description                             | Source                |
+| ----------- | --------------------------------------- | --------------------- |
+| **ACT**     | Action Chunking Transformer             | Native implementation |
+| **Pi0.5**   | Physical Intelligence flow-matching VLA | Native implementation |
+| **RLDX-1**  | RLWRLD multi-embodiment VLA             | Native implementation |
+| **SmolVLA** | Small Vision-Language-Action            | Native + LeRobot      |
+
+LeRobot wrappers are documented separately in [`lerobot.md`](./lerobot.md).
 
 ## Creating a New Policy
 
@@ -215,5 +216,6 @@ Policies compose functionality through mixins:
 ## See Also
 
 - [Base Policy](base.md) - Detailed base class documentation
+- [Action Heads](action_head.md) - Shared action head interface for regression, flow matching and diffusion
 - [Export Design](../export/README.md) - Model export system
 - [Data Module](../data/README.md) - Dataset integration

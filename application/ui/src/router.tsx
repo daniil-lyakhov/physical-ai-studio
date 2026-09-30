@@ -1,17 +1,19 @@
 import { Suspense } from 'react';
 
-import { Content, Grid, Heading, IllustratedMessage, Loading, View } from '@geti-ui/ui';
+import { Content, Grid, Heading, IllustratedMessage, Loading, minmax, View } from '@geti-ui/ui';
+import { isObject } from 'lodash-es';
 import { createBrowserRouter, Outlet, redirect } from 'react-router';
 import { path } from 'static-path';
 
+import { queryClient } from '../src/query-client/query-client';
+import { $api, fetchClient } from './api/client';
 import { ReactComponent as RobotIllustration } from './assets/illustrations/INTEL_08_NO-TESTS.svg';
 import { ErrorPage } from './components/error-page/error-page';
-import { featureFlags } from './config/feature-flags';
+import { AppLayout } from './routes/app/app.layout';
 import { Camera } from './routes/cameras/camera';
 import { Edit as CameraEdit } from './routes/cameras/edit';
 import { Layout as CamerasLayout } from './routes/cameras/layout';
 import { New as CamerasNew } from './routes/cameras/new';
-import { CameraWebcam } from './routes/cameras/webcam';
 import { Index as Datasets } from './routes/datasets/index';
 import { Index as RecordingPage } from './routes/datasets/record/index';
 import { Edit as EnvironmentEdit } from './routes/environments/edit';
@@ -21,9 +23,9 @@ import { EnvironmentShow } from './routes/environments/show';
 import { Index as Models } from './routes/models/index';
 import { Index as Inference } from './routes/models/inference/index';
 import { OpenApi } from './routes/openapi';
+import { Plugins } from './routes/plugins';
 import { Index as Projects } from './routes/projects/index';
 import { ProjectLayout } from './routes/projects/project.layout';
-import { Index as RemoteServers } from './routes/remote-servers/index';
 import { Edit as RobotEdit } from './routes/robots/edit';
 import { Layout as RobotsLayout } from './routes/robots/layout';
 import { New as RobotsNew } from './routes/robots/new';
@@ -31,23 +33,36 @@ import { NewRobotLayout } from './routes/robots/new-layout';
 import { Robot } from './routes/robots/robot';
 import { SO101Setup } from './routes/robots/so101-setup';
 import { TabNavigation as RobotsTabNavigation } from './routes/robots/tab-navigation';
+import { Settings } from './routes/settings';
 
 const root = path('/');
+const settings = root.path('/settings');
+const plugins = root.path('/plugins');
 const projects = root.path('/projects');
 const project = root.path('/projects/:project_id');
 const robots = project.path('robots');
 const robot = robots.path(':robot_id');
 const datasets = project.path('/datasets');
 const dataset = datasets.path(':dataset_id');
+const datasetEpisode = dataset.path('episodes').path(':episode_index');
 const models = project.path('/models');
-const remoteServers = project.path('/remote-servers');
 const cameras = project.path('cameras');
 const environments = project.path('environments');
 const environment = environments.path(':environment_id');
 
 export const paths = {
     root,
+    settings: {
+        index: settings,
+        trainingTargets: settings.path('/training-targets'),
+        hotkeys: settings.path('/hotkeys'),
+        storage: settings.path('/storage'),
+        about: settings.path('/about'),
+    },
     openapi: root.path('/openapi'),
+    plugins: {
+        index: plugins,
+    },
     projects: {
         index: projects,
     },
@@ -56,6 +71,7 @@ export const paths = {
         datasets: {
             index: datasets,
             show: dataset,
+            showEpisode: datasetEpisode,
             record: dataset.path('record'),
         },
         robots: {
@@ -67,7 +83,6 @@ export const paths = {
         },
         cameras: {
             index: cameras,
-            webcam: cameras.path('/webcam'),
             new: cameras.path('/new'),
             edit: cameras.path(':camera_id/edit'),
             show: cameras.path(':camera_id'),
@@ -84,9 +99,6 @@ export const paths = {
         models: {
             index: models,
             inference: models.path('/:model_id/inference/:backend'),
-        },
-        remoteServers: {
-            index: remoteServers,
         },
     },
 };
@@ -118,11 +130,32 @@ export const router = createBrowserRouter([
                 },
             },
             {
-                path: paths.projects.index.pattern,
+                element: <AppLayout />,
                 children: [
                     {
-                        index: true,
+                        path: paths.projects.index.pattern,
                         element: <Projects />,
+                    },
+                    {
+                        path: paths.settings.index.pattern,
+                        children: [
+                            {
+                                index: true,
+                                element: <Settings />,
+                            },
+                            {
+                                path: paths.settings.trainingTargets.pattern,
+                                element: <Settings />,
+                            },
+                            {
+                                path: paths.settings.hotkeys.pattern,
+                                element: <Settings />,
+                            },
+                        ],
+                    },
+                    {
+                        path: paths.plugins.index.pattern,
+                        element: <Plugins />,
                     },
                 ],
             },
@@ -153,10 +186,39 @@ export const router = createBrowserRouter([
                         children: [
                             {
                                 index: true,
+                                loader: async ({ params }) => {
+                                    const project_id = params.project_id;
+
+                                    if (project_id === undefined) {
+                                        return redirect(paths.projects.index({}));
+                                    }
+
+                                    const { data: projectData, error } = await fetchClient.GET(
+                                        '/api/projects/{project_id}',
+                                        {
+                                            params: { path: { project_id } },
+                                        }
+                                    );
+
+                                    if (error !== undefined || projectData?.datasets[0]?.id === undefined) {
+                                        return null;
+                                    }
+
+                                    return redirect(
+                                        paths.project.datasets.show({
+                                            project_id,
+                                            dataset_id: projectData.datasets[0].id,
+                                        })
+                                    );
+                                },
                                 element: <Datasets />,
                             },
                             {
                                 path: paths.project.datasets.show.pattern,
+                                element: <Datasets />,
+                            },
+                            {
+                                path: paths.project.datasets.showEpisode.pattern,
                                 element: <Datasets />,
                             },
                         ],
@@ -175,27 +237,12 @@ export const router = createBrowserRouter([
                         ],
                     },
                     {
-                        path: paths.project.remoteServers.index.pattern,
-                        element: <RemoteServers />,
-                        loader: ({ params }) => {
-                            if (!featureFlags.remoteTrainers) {
-                                if (params.project_id === undefined) {
-                                    return redirect(paths.projects.index({}));
-                                }
-
-                                return redirect(paths.project.robots.index({ project_id: params.project_id }));
-                            }
-
-                            return null;
-                        },
-                    },
-                    {
                         // robots
                         element: (
                             <Grid
                                 areas={['header', 'content']}
                                 UNSAFE_style={{
-                                    gridTemplateRows: 'min-content auto',
+                                    gridTemplateRows: `min-content ${minmax(0, '1fr')}`,
                                 }}
                                 minHeight={0}
                                 height={'100%'}
@@ -241,6 +288,25 @@ export const router = createBrowserRouter([
                                     },
                                     {
                                         path: paths.project.robots.show.pattern,
+                                        loader: async ({ params }) => {
+                                            const { robot_id, project_id } = params;
+
+                                            if (project_id === undefined || robot_id === undefined) {
+                                                return redirect(paths.projects.index({}));
+                                            }
+
+                                            try {
+                                                await queryRobot(project_id, robot_id);
+                                            } catch (error: unknown) {
+                                                if (
+                                                    isObject(error) &&
+                                                    'http_status' in error &&
+                                                    error.http_status === 404
+                                                ) {
+                                                    return redirect(paths.project.robots.index({ project_id }));
+                                                }
+                                            }
+                                        },
                                         element: <Robot />,
                                     },
                                 ],
@@ -270,10 +336,6 @@ export const router = createBrowserRouter([
                                     {
                                         path: paths.project.cameras.show.pattern,
                                         element: <Camera />,
-                                    },
-                                    {
-                                        path: paths.project.cameras.webcam.pattern,
-                                        element: <CameraWebcam />,
                                     },
                                 ],
                             },
@@ -330,3 +392,16 @@ export const router = createBrowserRouter([
         ],
     },
 ]);
+
+function queryRobot(projectId: string, robotId: string) {
+    return queryClient.ensureQueryData(
+        $api.queryOptions('get', '/api/projects/{project_id}/robots/{robot_id}', {
+            params: {
+                path: {
+                    project_id: projectId,
+                    robot_id: robotId,
+                },
+            },
+        })
+    );
+}

@@ -27,9 +27,9 @@ from tempfile import TemporaryDirectory
 from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
+from jsonargparse import ArgumentParser
 from lightning_utilities import module_available
 
-from physicalai.config.serializable import dataclass_to_dict, dict_to_dataclass
 from physicalai.data import Observation
 from physicalai.data.lerobot import FormatConverter
 from physicalai.data.lerobot.dataset import _LeRobotDatasetAdapter  # noqa: PLC2701
@@ -52,7 +52,6 @@ if TYPE_CHECKING or module_available("lerobot"):
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.configs.types import FeatureType
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-    from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
 
     LEROBOT_AVAILABLE = True
 else:
@@ -61,9 +60,6 @@ else:
     LeRobotDataset = None
     LeRobotDatasetMetadata = None
     dataset_to_policy_features = None
-    get_policy_class = None
-    make_policy_config = None
-    make_pre_post_processors = None
     LEROBOT_AVAILABLE = False
 
 
@@ -78,6 +74,49 @@ def _load_dataset_to_policy_features() -> Any:  # noqa: ANN401
 
 
 dataset_to_policy_features = _load_dataset_to_policy_features()
+
+
+def _to_plain(value: object) -> object:  # noqa: PLR0911
+    """Convert nested dataclasses and tensors to checkpoint-safe plain values.
+
+    Returns:
+        A value containing only checkpoint-safe plain Python values.
+    """
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _to_plain(getattr(value, field.name)) for field in dataclasses.fields(value)}
+    if isinstance(value, dict):
+        return {_to_plain(key): _to_plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, torch.Tensor):
+        return value.tolist()
+    if hasattr(value, "value"):
+        return _to_plain(value.value)
+    return value
+
+
+def _parse_dataclass(config_cls: type[Any], values: dict[str, Any]) -> Any:  # noqa: ANN401
+    """Parse a dataclass through jsonargparse, including nested dataclasses.
+
+    Returns:
+        An instantiated configuration dataclass.
+    """
+    fields = {field.name: field for field in dataclasses.fields(config_cls)}
+    parser = ArgumentParser(exit_on_error=False)
+    parser.add_class_arguments(config_cls, "object")
+    filtered_values = {key: value for key, value in values.items() if key in fields}
+    # Some LeRobot releases annotate this legacy flag as ``int`` while
+    # serializing its boolean default. Normalize it before jsonargparse's
+    # strict type validation without changing the resulting config value.
+    for key, value in filtered_values.items():
+        if fields[key].type is int and isinstance(value, bool):
+            filtered_values[key] = int(value)
+    namespace = parser.parse_object({"object": filtered_values}, defaults=False)
+    return parser.instantiate(namespace).object
 
 
 _WARNED_UNSUPPORTED_NAMES: set[str] = set()
@@ -103,8 +142,11 @@ def _coerce_policy_config_kwargs(
     Raises:
         ValueError: If ``dtype`` is supplied with an unsupported string value.
     """
-    if not LEROBOT_AVAILABLE or get_policy_class is None:
+    if not LEROBOT_AVAILABLE:
         return policy_config, None
+
+    # Lazy: lerobot.policies.factory eagerly imports every policy (incl. GR00T -> Qwen3-VL processors).
+    from lerobot.policies.factory import get_policy_class  # noqa: PLC0415
 
     policy_cls = get_policy_class(policy_name)
     config_cls = getattr(policy_cls, "config_class", None)
@@ -313,12 +355,12 @@ class LeRobotPolicy(ExportablePolicyMixin, LeRobotFromConfig, Policy):
             checkpoint: Lightning checkpoint dictionary to modify in-place.
         """
         if self._config is not None:
-            config_dict = dataclass_to_dict(self._config)
+            config_dict = cast("dict[str, Any]", _to_plain(self._config))
             config_dict["type"] = self.policy_name
             checkpoint[CONFIG_KEY] = config_dict
             checkpoint[POLICY_NAME_KEY] = self.policy_name
             if self._dataset_stats is not None:
-                checkpoint[DATASET_STATS_KEY] = dataclass_to_dict(self._dataset_stats)
+                checkpoint[DATASET_STATS_KEY] = _to_plain(self._dataset_stats)
 
     def save_pretrained(
         self,
@@ -472,7 +514,11 @@ class LeRobotPolicy(ExportablePolicyMixin, LeRobotFromConfig, Policy):
             map_location: Device to map tensors to. If None, uses default device.
             hparams_file: Unused. Kept for Lightning compatibility.
             strict: Unused. Kept for Lightning compatibility.
-            weights_only: Whether to load only weights (default True for security).
+            weights_only: Whether to restrict deserialization to tensors and safe
+                primitives. When omitted, defaults to ``False`` because Lightning
+                checkpoints contain trusted LeRobot configuration/dataclass metadata
+                required to reconstruct the policy. Pass ``True`` explicitly when
+                loading a checkpoint that contains only weights and safe metadata.
             **kwargs: Additional arguments passed to the policy constructor.
 
         Returns:
@@ -481,6 +527,7 @@ class LeRobotPolicy(ExportablePolicyMixin, LeRobotFromConfig, Policy):
         Raises:
             KeyError: If checkpoint doesn't contain required model config.
             ImportError: If LeRobot is not installed.
+            TypeError: If the policy configuration cannot be reconstructed.
 
         Examples:
             Load checkpoint for inference:
@@ -512,7 +559,12 @@ class LeRobotPolicy(ExportablePolicyMixin, LeRobotFromConfig, Policy):
         checkpoint = torch.load(  # nosec B614
             checkpoint_path,
             map_location=map_location,
-            weights_only=weights_only if weights_only is not None else True,
+            # Lightning checkpoints contain trusted LeRobot config/dataclass
+            # metadata (for example FeatureType) that PyTorch's weights-only
+            # unpickler rejects. Preserve an explicit True for callers that need
+            # restricted deserialization, but use the Lightning-compatible full
+            # unpickler by default for these trusted checkpoints.
+            weights_only=False if weights_only is None else weights_only,
         )
 
         # Extract model config dict
@@ -531,10 +583,18 @@ class LeRobotPolicy(ExportablePolicyMixin, LeRobotFromConfig, Policy):
                 msg = f"Checkpoint missing '{POLICY_NAME_KEY}'. Cannot determine which LeRobot policy to reconstruct."
                 raise KeyError(msg)
 
+        config_dict = dict(config_dict)
+        config_dict.pop("type", None)
+
+        from lerobot.policies.factory import get_policy_class  # noqa: PLC0415
+
         # Reconstruct LeRobot config from dict
         policy_cls = get_policy_class(policy_name)
         config_cls = policy_cls.config_class  # type: ignore[attr-defined]
-        config = dict_to_dataclass(config_cls, config_dict)
+        if config_cls is None:
+            msg = f"Policy '{policy_name}' does not expose a configuration dataclass."
+            raise TypeError(msg)
+        config = _parse_dataclass(config_cls, config_dict)
         dataset_stats = checkpoint.get(DATASET_STATS_KEY)
 
         # All wrappers (LeRobotPolicy and every NamedLeRobotPolicy subclass)
@@ -638,7 +698,7 @@ class LeRobotPolicy(ExportablePolicyMixin, LeRobotFromConfig, Policy):
 
     @property
     def lerobot_policy(self) -> PreTrainedPolicy:
-        """Get the initialized LeRobot policy.
+        """The initialized LeRobot policy.
 
         Returns:
             The initialized LeRobot policy.
@@ -698,6 +758,8 @@ class LeRobotPolicy(ExportablePolicyMixin, LeRobotFromConfig, Policy):
                 )
                 raise ValueError(msg)
 
+            from lerobot.policies.factory import make_policy_config  # noqa: PLC0415
+
             # Remove dataset_stats from policy_config if present
             # (it should be passed to policy constructor, not config)
             clean_policy_config = {k: v for k, v in self._policy_config.items() if k != "dataset_stats"}
@@ -715,6 +777,8 @@ class LeRobotPolicy(ExportablePolicyMixin, LeRobotFromConfig, Policy):
             )
         else:
             module_cast_dtype = None
+
+        from lerobot.policies.factory import get_policy_class, make_pre_post_processors  # noqa: PLC0415
 
         # Get the policy class dynamically
         policy_cls = get_policy_class(self.policy_name)

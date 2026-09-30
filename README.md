@@ -27,10 +27,10 @@ Physical AI Studio is an end-to-end framework for teaching robots to perform tas
 ## Key Features
 
 - **End-to-End Pipeline** - From demonstration recording to robot deployment
-- **State-of-the-Art Policies** - Native policy implementations such as [ACT](https://arxiv.org/abs/2304.13705), [Pi0](https://www.physicalintelligence.company/download/pi0.pdf), [SmolVLA](https://huggingface.co/lerobot/smolvla_base), [GR00T](https://arxiv.org/abs/2503.14734) and [Pi0.5](https://arxiv.org/pdf/2504.16054), plus full [LeRobot](https://github.com/huggingface/lerobot) policy zoo
+- **State-of-the-Art Policies** - Native policy implementations such as [ACT](https://arxiv.org/abs/2304.13705), [SmolVLA](https://huggingface.co/lerobot/smolvla_base), [Pi0.5](https://arxiv.org/pdf/2504.16054), and RLDX-1, plus the full [LeRobot](https://github.com/huggingface/lerobot) policy zoo
 - **Flexible Interface** - Use Python API, CLI, or GUI
 - **Production Export** - Deploy to [OpenVINO](https://docs.openvino.ai/), [ONNX](https://onnx.ai/), or [Torch](https://docs.pytorch.org/executorch/stable/index.html) for any hardware
-- **Standardized Benchmarks** - Evaluate on benchmarks such as [LIBERO](https://libero-project.github.io/) and [PushT](https://diffusion-policy.cs.columbia.edu/)
+- **Standardized Benchmarks** - Evaluate on benchmarks such as [LIBERO](https://libero-project.github.io/), [PushT](https://diffusion-policy.cs.columbia.edu/), and [RoboCasa](https://robocasa.ai/)
 - **Built on Lightning** - [PyTorch Lightning](https://lightning.ai/docs/pytorch/stable/) for distributed training, mixed precision, and more
 
 ## Quick Start
@@ -41,9 +41,13 @@ For users who prefer a visual interface for end-to-end workflow:
 
 <!-- markdownlint-disable MD033 -->
 <p align="center">
-  <img src="docs/assets/application.gif" alt="Application demo" width="100%">
+  <a href="docs/assets/physical_ai_studio_full_overview.mp4">
+    <img src="docs/assets/physical_ai_studio_overview.gif" alt="Application demo" width="100%">
+  </a>
 </p>
 <!-- markdownlint-enable MD033 -->
+
+[Download the full demo video →](docs/assets/physical_ai_studio_full_overview.mp4)
 
 [Application Documentation →](./application/README.md)
 
@@ -65,7 +69,7 @@ docker compose up -d
 Application runs at <http://localhost:7860>. See the [Docker README](./application/docker/README.md) for
 hardware configuration (Intel XPU, NVIDIA CUDA) and device setup.
 
-If you plan to train Hugging Face Hub-backed policies (for example, SmolVLA, Pi0,
+If you plan to train Hugging Face Hub-backed policies (for example, SmolVLA, Pi0.5,
 and others), configure `HF_TOKEN` to avoid unauthenticated Hub access warnings. See
 [Hugging Face Integration](./application/backend/docs/huggingface_integration.md).
 
@@ -83,7 +87,7 @@ git clone https://github.com/open-edge-platform/physical-ai-studio.git
 cd physical-ai-studio
 
 # Install and run backend
-cd application/backend 
+cd application/backend
 
 # Start the backend, or use --extra cpu, --extra cuda
 uv run --extra xpu physicalai-studio serve  # or: ./run.sh
@@ -100,8 +104,9 @@ npm run start
 
 Open <http://localhost:3000> in your browser.
 
-If you plan to train Hugging Face Hub-backed policies (for example, SmolVLA, Pi0,
-and others), configure `HF_TOKEN` in your backend environment. See
+If you plan to train Hugging Face Hub-backed policies (for example, SmolVLA, Pi0.5,
+and others), configure a Hugging Face token in Settings > General > Hugging Face in the
+UI to avoid unauthenticated Hub access warnings. See
 [Hugging Face Integration](./application/backend/docs/huggingface_integration.md).
 
 ### Library (Python/CLI)
@@ -183,7 +188,7 @@ while not done:
 
 ```bash
 # Train
-physicalai fit --config configs/physicalai/act.yaml
+physicalai fit --config configs/physicalai/act/pusht/default.yaml
 
 # Evaluate
 physicalai benchmark --config configs/benchmark/libero.yaml --ckpt_path model.ckpt

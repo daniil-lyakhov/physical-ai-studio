@@ -1,51 +1,22 @@
 import { Suspense } from 'react';
 
-import {
-    ActionButton,
-    DialogTrigger,
-    Divider,
-    Flex,
-    Grid,
-    Icon,
-    Item,
-    Link,
-    Loading,
-    TabList,
-    Tabs,
-    View,
-} from '@geti-ui/ui';
-import { Manifest } from '@geti-ui/ui/icons';
+import { Flex, Grid, Item, Loading, TabList, Tabs, View } from '@geti-ui/ui';
 import { Outlet, useLocation } from 'react-router';
 
-import { featureFlags } from '../../config/feature-flags';
-import { JobStatus } from '../../features/jobs/footer/job-status';
-import { LogsDialog } from '../../features/logs/logs-dialog';
-import { ProjectsListPanel } from '../../features/projects/menu/projects-list-panel.component';
-import { useProjectId } from '../../features/projects/use-project';
+import { AppFooter } from '../../components/app-footer/app-footer';
+import { AppLogo } from '../../components/app-logo/app-logo';
+import { ProjectMenu } from '../../features/projects/menu/project-menu.component';
+import { useProject, useProjectId } from '../../features/projects/use-project';
 import { paths } from '../../router';
-import { ReactComponent as DatasetIcon } from './../../assets/icons/dataset-icon.svg';
-import { ReactComponent as ModelsIcon } from './../../assets/icons/models-icon.svg';
-import { ReactComponent as RobotIcon } from './../../assets/icons/robot-icon.svg';
 import { getMainPageInProjectUrl } from './project-navigation';
 
 const Header = ({ project_id }: { project_id: string }) => {
     return (
         <View backgroundColor={'gray-300'} gridArea={'header'}>
             <Flex height='100%' alignItems={'center'} marginX='1rem' gap='size-200'>
-                <Link href='/' isQuiet variant='overBackground'>
-                    <View marginEnd='size-200' maxWidth={'10ch'}>
-                        <span style={{ whiteSpace: 'nowrap' }}>Physical AI</span> <span>Studio</span>
-                    </View>
-                </Link>
+                <AppLogo />
 
-                <TabList
-                    height={'100%'}
-                    width={'100%'}
-                    UNSAFE_style={{
-                        '--spectrum-tabs-rule-height': '4px',
-                        '--spectrum-tabs-selection-indicator-color': 'var(--energy-blue)',
-                    }}
-                >
+                <TabList height={'100%'} width={'100%'}>
                     {[
                         <Item
                             textValue='Robot configuration'
@@ -53,73 +24,24 @@ const Header = ({ project_id }: { project_id: string }) => {
                             href={paths.project.robots.index({ project_id })}
                         >
                             <Flex alignItems='center' gap='size-100'>
-                                <RobotIcon />
                                 Robots
                             </Flex>
                         </Item>,
                         <Item textValue='Datasets' key={'datasets'} href={paths.project.datasets.index({ project_id })}>
                             <Flex alignItems='center' gap='size-100'>
-                                <DatasetIcon />
                                 Datasets
                             </Flex>
                         </Item>,
                         <Item textValue='Models' key={'models'} href={paths.project.models.index({ project_id })}>
                             <Flex alignItems='center' gap='size-100'>
-                                <ModelsIcon />
                                 Models
                             </Flex>
                         </Item>,
-                        ...(featureFlags.remoteTrainers
-                            ? [
-                                  <Item
-                                      textValue='Remote Trainers'
-                                      key={'remote-servers'}
-                                      href={paths.project.remoteServers.index({ project_id })}
-                                  >
-                                      Remote Trainers
-                                  </Item>,
-                              ]
-                            : []),
                     ]}
                 </TabList>
                 <Flex alignItems={'center'} height={'100%'} marginStart='auto' gap='size-100'>
-                    <ProjectsListPanel />
+                    <ProjectMenu />
                 </Flex>
-            </Flex>
-        </View>
-    );
-};
-
-const Footer = () => {
-    return (
-        <View
-            gridArea={'footer'}
-            borderTopColor={'gray-75'}
-            borderTopWidth={'thin'}
-            borderBottomColor={'gray-75'}
-            borderBottomWidth={'thin'}
-            paddingX='size-100'
-            paddingY='size-25'
-        >
-            <Flex alignItems={'center'} height='100%' gap='size-100'>
-                <View>
-                    <DialogTrigger type='fullscreen'>
-                        <ActionButton
-                            isQuiet
-                            UNSAFE_style={{
-                                paddingRight: 'var(--spectrum-global-dimension-size-100)',
-                            }}
-                        >
-                            <Icon>
-                                <Manifest />
-                            </Icon>
-                            Logs
-                        </ActionButton>
-                        {(close) => <LogsDialog close={close} />}
-                    </DialogTrigger>
-                </View>
-                <Divider orientation='vertical' size='S' />
-                <JobStatus />
             </Flex>
         </View>
     );
@@ -129,6 +51,9 @@ export const ProjectLayout = () => {
     const { project_id } = useProjectId();
     const { pathname } = useLocation();
 
+    // We want to check if the project exists before rendering the layout. If it doesn't, error boundary will catch it.
+    useProject();
+
     const pageName = getMainPageInProjectUrl(pathname);
 
     return (
@@ -136,20 +61,28 @@ export const ProjectLayout = () => {
             <Grid
                 areas={['header', 'subheader', 'content', 'footer']}
                 UNSAFE_style={{
+                    gridTemplateColumns: 'minmax(0, 1fr)',
                     gridTemplateRows:
                         // eslint-disable-next-line max-len
-                        'var(--spectrum-global-dimension-size-800, 4rem) min-content auto var(--spectrum-global-dimension-size-400)',
+                        'var(--spectrum-global-dimension-size-800, 4rem) min-content minmax(0, 1fr) var(--spectrum-global-dimension-size-400)',
                 }}
                 minHeight={0}
                 height={'100%'}
             >
                 <Header project_id={project_id} />
-                <View gridArea={'content'} maxHeight={'100vh'} minHeight={0} height='100%'>
+                <View
+                    gridArea={'content'}
+                    maxHeight={'100vh'}
+                    minWidth={0}
+                    minHeight={0}
+                    height='100%'
+                    backgroundColor={'gray-75'}
+                >
                     <Suspense fallback={<Loading mode='overlay' />}>
                         <Outlet />
                     </Suspense>
                 </View>
-                <Footer />
+                <AppFooter />
             </Grid>
         </Tabs>
     );

@@ -3,11 +3,6 @@
 
 # Backend-specific pre-commit configuration for prek workspace mode
 # This config applies only to files in application/backend/
-#
-# This is the canonical Python app setup for this repo. Keep
-# application/trainer/.pre-commit-config.yaml in sync with this file
-# (the Alembic migration check below is the one intentional exception,
-# since it is specific to the backend's database schema).
 
 repos:
   # ========================================================================== #
@@ -23,7 +18,7 @@ repos:
   # PYTHON LINTING & FORMATTING                                                #
   # ========================================================================== #
   - repo: https://github.com/charliermarsh/ruff-pre-commit
-    rev: "v0.11.11"
+    rev: "v0.16.7"
     hooks:
       # Run the linter with fixes (uses [tool.ruff] from pyproject.toml)
       - id: ruff

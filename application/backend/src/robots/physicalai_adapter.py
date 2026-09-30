@@ -3,9 +3,12 @@ from typing import Literal
 
 import numpy as np
 from loguru import logger
+from physicalai.robot import RobotError
 from physicalai.robot.interface import Robot, RobotObservation
 
 from robots.robot_client import RobotClient
+from robots.shared_robot_errors import translate_robot_error
+from runtime.features import feature_names, observation_to_dict
 
 
 @dataclass(frozen=True)
@@ -29,33 +32,28 @@ class PhysicalAIRobotAdapter(RobotClient):
         robot_type: str,
         robot_role: Literal["follower", "leader"],
         config: PhysicalAIRobotAdapterConfig | None = None,
+        display_name: str | None = None,
     ) -> None:
         resolved_config = config or PhysicalAIRobotAdapterConfig()
         self._robot = robot
         self._robot_type = robot_type
         self._robot_role = robot_role
         self._config = resolved_config
+        # Studio's human-readable name, for user-facing errors. The driver's own
+        # ``name`` is a transport identifier (see ``shared_robot_name``) and is
+        # meaningless to the user.
+        self._display_name = display_name
         self.is_controlled = False
 
     def _is_follower(self) -> bool:
         return self._robot_role == "follower"
 
     def _observation_to_state(self, observation: RobotObservation) -> dict[str, float]:
-        state: dict[str, float] = {}
-        for i, name in enumerate(self._robot.joint_names):
-            raw_position = float(observation.joint_positions[i])
-            state[f"{name}.pos"] = raw_position
-
-        if self._config.include_velocities:
-            sensor_data = observation.sensor_data
-            if sensor_data is None or "velocities" not in sensor_data:
-                msg = "Robot observation is missing velocity data"
-                raise RuntimeError(msg)
-            velocities = sensor_data["velocities"]
-            for i, name in enumerate(self._robot.joint_names):
-                state[f"{name}.vel"] = float(velocities[i])
-
-        return state
+        return observation_to_dict(
+            self._robot.joint_names,
+            observation,
+            include_velocities=self._config.include_velocities,
+        )
 
     def _state_to_action(self, joints: dict[str, float]) -> np.ndarray:
         action = np.empty(len(self._robot.joint_names), dtype=np.float32)
@@ -79,6 +77,9 @@ class PhysicalAIRobotAdapter(RobotClient):
         except TimeoutError:
             logger.error("Timeout connecting to robot")
             raise
+        except RobotError as e:
+            logger.error(f"Failed to connect to robot: {e}")
+            raise translate_robot_error(e, robot_name=self._display_name) from e
         except Exception as e:
             logger.error(f"Failed to connect to robot: {e}")
             raise
@@ -172,8 +173,4 @@ class PhysicalAIRobotAdapter(RobotClient):
         return forces
 
     def features(self) -> list[str]:
-        position_features = [f"{name}.pos" for name in self._robot.joint_names]
-        if not self._config.include_velocities:
-            return position_features
-        velocity_features = [f"{name}.vel" for name in self._robot.joint_names]
-        return position_features + velocity_features
+        return feature_names(self._robot.joint_names, include_velocities=self._config.include_velocities)

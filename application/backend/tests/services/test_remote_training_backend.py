@@ -10,25 +10,32 @@ download) runs for real.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from loguru import logger
+from pydantic import SecretStr
 
+from schemas.base_job import JobStatus
 from schemas.dataset import Snapshot
-from schemas.job import TrainJobPayload
+from schemas.job import RemoteTrainJobPayload, TrainingDevice
 from schemas.model import Model
+from services.job_service import JobService
 from services.training_backends._transfer_progress import TransferProgressLogger, format_bytes, format_throughput
 from services.training_backends.base import TrainingContext
+from services.training_backends.local import build_spec
 from services.training_backends.remote import SNAPSHOT_UPLOAD_PROGRESS, TRAINING_PROGRESS_END, RemoteTrainingError
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 REMOTE = "services.training_backends.remote"
+LOCAL = "services.training_backends.local"
 TRANSFER = "services.training_backends._transfer_progress"
 
 
@@ -100,6 +107,7 @@ class _Controller:
         self.artifact_headers: dict = {}
         self.artifact_batches: list[tuple[list[bytes], dict]] | None = None
         self.artifact_range_headers: list[str | None] = []
+        self.artifact_connection_errors_remaining = 0
         self.upload_offset = 0
         self.upload_ranges: list[str] = []
         self.posted_urls: list[str] = []
@@ -186,6 +194,9 @@ class _FakeClient:
                 raise httpx.ConnectError("All connection attempts failed")
             return _FakeStreamCtx(_FakeResponse(lines=self._c.event_lines()))
         self._c.artifact_range_headers.append(headers.get("Range") if headers else None)
+        if self._c.artifact_connection_errors_remaining:
+            self._c.artifact_connection_errors_remaining -= 1
+            raise httpx.ConnectError("VPN disconnected")
         if self._c.artifact_batches:
             chunks, artifact_headers = self._c.artifact_batches.pop(0)
             return _FakeStreamCtx(_FakeResponse(chunks=chunks, headers=artifact_headers))
@@ -200,16 +211,24 @@ class _FakeClient:
 def _settings() -> MagicMock:
     settings = MagicMock()
     settings.trainer_url = "https://trainer.test"
-    settings.trainer_request_timeout_s = 5.0
-    settings.trainer_download_read_timeout_s = 120.0
-    settings.trainer_stream_reconnect_max_s = 900.0
-    settings.trainer_stream_reconnect_backoff_max_s = 30.0
+    settings.trainer.request_timeout_s = 5.0
+    settings.trainer.download_read_timeout_s = 120.0
+    settings.trainer.stream_reconnect_max_s = 900.0
+    settings.trainer.stream_reconnect_backoff_max_s = 30.0
     settings.data_import_max_uncompressed_bytes = 10 * 1024 * 1024
     settings.data_import_min_free_bytes = 0
     return settings
 
 
-def _context(tmp_path: Path, *, should_stop: bool = False, remote_job_id: UUID | None = None) -> TrainingContext:
+def _context(
+    tmp_path: Path,
+    *,
+    should_stop: bool = False,
+    remote_job_id: UUID | None = None,
+    should_cancel_job: bool = False,
+    policy: str = "act",
+    **payload_overrides: object,
+) -> TrainingContext:
     snap = tmp_path / "snap"
     snap.mkdir()
     # A file in the snapshot dir gives the ZIP archive real bytes to stream.
@@ -221,13 +240,20 @@ def _context(tmp_path: Path, *, should_stop: bool = False, remote_job_id: UUID |
         path=str(tmp_path / "model"),
         name="m",
         snapshot_id=uuid4(),
-        policy="act",
+        policy=policy,
         properties={},
         train_job_id=uuid4(),
         version=1,
         created_at=None,
     )
-    payload = TrainJobPayload(project_id=uuid4(), dataset_id=uuid4(), policy="act", model_name="m")
+    payload = RemoteTrainJobPayload(
+        project_id=uuid4(),
+        dataset_id=uuid4(),
+        policy=policy,
+        model_name="m",
+        remote_trainer_id=uuid4(),
+        **payload_overrides,
+    )
     return TrainingContext(
         job=MagicMock(),
         model=model,
@@ -239,6 +265,7 @@ def _context(tmp_path: Path, *, should_stop: bool = False, remote_job_id: UUID |
         progress=MagicMock(),
         should_stop=lambda: should_stop,
         remote_job_id=remote_job_id,
+        should_cancel_job=lambda: should_cancel_job,
     )
 
 
@@ -247,6 +274,24 @@ def _backend(settings: MagicMock):
 
     with patch(f"{REMOTE}.get_settings", return_value=settings):
         return RemoteTrainingBackend("https://trainer.test")
+
+
+async def _submitted_body(settings: MagicMock, context: TrainingContext) -> dict:
+    """Run a job to completion and return the body it POSTed to /jobs."""
+    controller = _Controller(states=[{"status": "completed", "progress": 100}])
+    with (
+        patch(f"{REMOTE}.get_settings", return_value=settings),
+        patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
+        patch(f"{REMOTE}.SafeZipArchive", return_value=MagicMock()),
+        patch(f"{REMOTE}._EVENT_WAIT_TIMEOUT_S", 0.01),
+    ):
+        await _backend(settings).train(context)
+
+    return next(
+        body
+        for url, body in zip(controller.posted_urls, controller.posted_bodies, strict=False)
+        if url.endswith("/jobs") and body is not None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +332,33 @@ class TestRemoteTrainingBackend:
         assert SNAPSHOT_UPLOAD_PROGRESS + round(50 * span / 100) in reported
         # Progress reached 100% before the worker marks completion.
         assert max(reported) == 100
+
+    @pytest.mark.anyio
+    async def test_submit_excludes_local_run_options_from_trainer_payload(self, tmp_path):
+        body = await _submitted_body(_settings(), _context(tmp_path))
+
+        assert "run_options" not in body["spec"]
+
+    @pytest.mark.anyio
+    async def test_submit_sends_hf_token_as_top_level_field(self, tmp_path):
+        """The token travels outside `spec`, so the trainer never persists it with the job request."""
+        local_settings = MagicMock()
+        local_settings.huggingface.hf_token = SecretStr("hf-secret")
+        with patch(f"{LOCAL}.get_settings", return_value=local_settings):
+            body = await _submitted_body(_settings(), _context(tmp_path))
+
+        assert body["hf_token"] == "hf-secret"
+        assert "hf_token" not in body["spec"]
+
+    @pytest.mark.anyio
+    async def test_submit_sends_none_hf_token_when_unconfigured(self, tmp_path, monkeypatch):
+        local_settings = MagicMock()
+        local_settings.huggingface.hf_token = None
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        with patch(f"{LOCAL}.get_settings", return_value=local_settings):
+            body = await _submitted_body(_settings(), _context(tmp_path))
+
+        assert body["hf_token"] is None
 
     @pytest.mark.anyio
     async def test_completion_deletes_remote_job_artifacts(self, tmp_path):
@@ -359,6 +431,26 @@ class TestRemoteTrainingBackend:
             backend = _backend(settings)
             with pytest.raises(TrainingCanceledError):
                 await backend.train(context)
+
+    @pytest.mark.anyio
+    async def test_download_retries_after_vpn_outage(self, tmp_path):
+        settings = _settings()
+        context = _context(tmp_path)
+        controller = _Controller(states=[{"status": "completed", "progress": 100}])
+        controller.poll_state = {"status": "completed", "progress": 100}
+        controller.artifact_connection_errors_remaining = 4
+        safe_zip = MagicMock()
+
+        with (
+            patch(f"{REMOTE}.get_settings", return_value=settings),
+            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
+            patch(f"{REMOTE}.SafeZipArchive", return_value=safe_zip),
+            patch(f"{REMOTE}._RECONNECT_BACKOFF_S", 0),
+        ):
+            await asyncio.wait_for(_backend(settings).train(context), timeout=2)
+
+        assert controller.artifact_range_headers == [None] * 5
+        safe_zip.extract_to.assert_called_once()
 
     @pytest.mark.anyio
     async def test_truncated_artifact_download_raises(self, tmp_path):
@@ -443,31 +535,131 @@ class TestRemoteTrainingBackend:
         safe_zip.extract_to.assert_called_once()
 
     @pytest.mark.anyio
-    async def test_abandons_job_when_trainer_unreachable_past_budget(self, tmp_path):
-        """Persistent unreachability past the reconnect budget aborts the job."""
-        settings = _settings()
-        # Zero budget: the first failed reconnect+poll cycle exhausts it.
-        settings.trainer_stream_reconnect_max_s = 0.0
-        settings.trainer_stream_reconnect_backoff_max_s = 0.0
+    async def test_reports_disconnection_before_warning_threshold(self, tmp_path):
+        settings = _settings()  # The warning is 900s away; UI should not wait for it.
         context = _context(tmp_path)
         controller = _Controller(states=[])
         controller.raise_connection_error = True
+        controller.poll_state = {"status": "completed", "progress": 100}
 
-        from services.training_backends.remote import RemoteTrainingError
+        class RecoveringClient(_FakeClient):
+            async def get(self, url: str) -> _FakeResponse:
+                if url.endswith(f"/jobs/{controller.remote_job_id}") and controller.poll_count >= 1:
+                    controller.raise_connection_error = False
+                return await super().get(url)
 
         with (
             patch(f"{REMOTE}.get_settings", return_value=settings),
-            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
+            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: RecoveringClient(controller, **kw)),
+            patch(f"{REMOTE}._RECONNECT_BACKOFF_S", 0),
+        ):
+            await asyncio.wait_for(_backend(settings)._wait_for_completion(context, controller.remote_job_id), 2)
+
+        assert context.progress.call_args_list[0].kwargs["message"] == "Trainer unreachable; waiting to reconnect"
+        assert context.progress.call_args_list[-1].kwargs["message"] is None
+
+    @pytest.mark.anyio
+    async def test_recovery_clears_persisted_connection_warning_without_trainer_message(self, tmp_path):
+        settings = _settings()
+        context = _context(tmp_path)
+        controller = _Controller(states=[])
+        controller.raise_connection_error = True
+        controller.poll_state = {"status": "running", "progress": 50}
+        job = MagicMock(id=uuid4(), message="Training")
+        service = JobService(MagicMock())
+        service.repo.get_by_id = AsyncMock(return_value=job)
+
+        def persist(_job, updates):
+            job.message = updates.get("message", job.message)
+            return job
+
+        service.repo.update = AsyncMock(side_effect=persist)
+        pending = []
+
+        def report(progress, *, message=None, extra_info=None):
+            pending.append(
+                asyncio.create_task(
+                    service.update_job_status(job.id, JobStatus.RUNNING, message=message, progress=progress)
+                )
+            )
+
+        context.progress = report
+
+        class RecoveringClient(_FakeClient):
+            async def get(self, url: str) -> _FakeResponse:
+                if url.endswith(f"/jobs/{controller.remote_job_id}"):
+                    if controller.poll_count >= 1:
+                        controller.raise_connection_error = False
+                    if controller.poll_count >= 2:
+                        controller.poll_state = {"status": "completed", "progress": 100}
+                return await super().get(url)
+
+        with (
+            patch(f"{REMOTE}.get_settings", return_value=settings),
+            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: RecoveringClient(controller, **kw)),
+            patch(f"{REMOTE}._RECONNECT_BACKOFF_S", 0),
+        ):
+            await asyncio.wait_for(_backend(settings)._wait_for_completion(context, controller.remote_job_id), 2)
+            await asyncio.gather(*pending)
+
+        assert job.message == "Trainer connection restored"
+
+    @pytest.mark.anyio
+    async def test_reconnects_after_outage_exceeds_warning_threshold(self, tmp_path):
+        """Losing the VPN must not turn a completed remote job into a failed one."""
+        settings = _settings()
+        settings.trainer.stream_reconnect_max_s = 0.0
+        settings.trainer.stream_reconnect_backoff_max_s = 0.0
+        context = _context(tmp_path)
+        controller = _Controller(states=[])
+        controller.raise_connection_error = True
+        controller.poll_state = {"status": "completed", "progress": 100}
+        safe_zip = MagicMock()
+
+        class RecoveringClient(_FakeClient):
+            async def get(self, url: str) -> _FakeResponse:
+                if url.endswith(f"/jobs/{controller.remote_job_id}") and controller.poll_count >= 2:
+                    controller.raise_connection_error = False
+                return await super().get(url)
+
+        with (
+            patch(f"{REMOTE}.get_settings", return_value=settings),
+            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: RecoveringClient(controller, **kw)),
+            patch(f"{REMOTE}.SafeZipArchive", return_value=safe_zip),
             patch(f"{REMOTE}._EVENT_WAIT_TIMEOUT_S", 0.01),
             patch(f"{REMOTE}._RECONNECT_BACKOFF_S", 0),
         ):
-            backend = _backend(settings)
-            with pytest.raises(RemoteTrainingError, match="unreachable"):
-                await backend.train(context)
+            await asyncio.wait_for(_backend(settings).train(context), timeout=2)
 
-        # Both the stream and the poll fallback were attempted before giving up.
-        assert controller.event_stream_opens >= 1
-        assert controller.poll_count >= 1
+        assert controller.event_stream_opens >= 2
+        assert controller.poll_count >= 3
+        assert any(
+            call.kwargs.get("message") == "Trainer unreachable; waiting to reconnect"
+            for call in context.progress.call_args_list
+        )
+        safe_zip.extract_to.assert_called_once()
+
+    @pytest.mark.anyio
+    async def test_missing_remote_job_fails_instead_of_waiting_forever(self, tmp_path):
+        settings = _settings()
+        context = _context(tmp_path)
+        controller = _Controller(states=[])
+
+        class MissingJobClient(_FakeClient):
+            async def get(self, url: str) -> _FakeResponse:
+                if url.endswith(f"/jobs/{controller.remote_job_id}"):
+                    request = httpx.Request("GET", url)
+                    response = httpx.Response(404, request=request)
+                    raise httpx.HTTPStatusError("Not Found", request=request, response=response)
+                return await super().get(url)
+
+        with (
+            patch(f"{REMOTE}.get_settings", return_value=settings),
+            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: MissingJobClient(controller, **kw)),
+            patch(f"{REMOTE}._RECONNECT_BACKOFF_S", 0),
+            pytest.raises(RemoteTrainingError, match="no longer exists"),
+        ):
+            await asyncio.wait_for(_backend(settings)._wait_for_completion(context, controller.remote_job_id), 2)
 
     @pytest.mark.anyio
     async def test_reattaches_to_running_job_without_resubmitting(self, tmp_path):
@@ -613,24 +805,84 @@ class TestHttpDatasetTransfer:
         settings = _settings()
         context = _context(tmp_path)
 
-        controller = _Controller(states=[{"status": "completed", "progress": 100}])
-        with (
-            patch(f"{REMOTE}.get_settings", return_value=settings),
-            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
-            patch(f"{REMOTE}.SafeZipArchive", return_value=MagicMock()),
-            patch(f"{REMOTE}._EVENT_WAIT_TIMEOUT_S", 0.01),
-        ):
-            backend = _backend(settings)
-            await backend.train(context)
+        body = await _submitted_body(settings, context)
 
-        body = next(
-            body
-            for url, body in zip(controller.posted_urls, controller.posted_bodies, strict=False)
-            if url.endswith("/jobs") and body is not None
-        )
         assert body["dataset_transfer"] == "http"
         assert "repo_id" not in body
         assert "revision" not in body
+
+    @pytest.mark.anyio
+    async def test_submit_body_carries_the_shared_training_spec(self, tmp_path):
+        """The remote job trains from the same spec a local run would execute."""
+        settings = _settings()
+        context = _context(tmp_path)
+        context.payload = context.payload.model_copy(update={"max_epochs": 5, "batch_size": 16})
+
+        body = await _submitted_body(settings, context)
+
+        expected = build_spec(context).model_dump(mode="json", exclude={"run_options", "snapflow_start_epoch"}) | {
+            "device_type": None,
+            "device_index": None,
+        }
+        assert body["spec"] == expected
+        assert (body["spec"]["policy"], body["spec"]["max_epochs"], body["spec"]["batch_size"]) == ("act", 5, 16)
+
+    @pytest.mark.anyio
+    async def test_submit_body_includes_lora_fields_when_enabled(self, tmp_path):
+        """LoRA fields are always sent on the wire when a LoRA run was requested."""
+        settings = _settings()
+        context = _context(tmp_path)
+        context.model = context.model.model_copy(update={"policy": "pi05"})
+        context.payload = context.payload.model_copy(
+            update={"policy": "pi05", "lora_enabled": True, "lora_rank": 16, "lora_use_dora": True}
+        )
+
+        body = await _submitted_body(settings, context)
+
+        assert body["spec"]["lora_enabled"] is True
+        assert (body["spec"]["lora_rank"], body["spec"]["lora_use_dora"]) == (16, True)
+
+    @pytest.mark.anyio
+    async def test_submit_body_includes_lora_fields_when_disabled(self, tmp_path):
+        settings = _settings()
+        context = _context(tmp_path)
+
+        body = await _submitted_body(settings, context)
+
+        for key in ("lora_enabled", "lora_rank", "lora_alpha", "lora_dropout", "lora_use_dora"):
+            assert key in body["spec"]
+        assert body["spec"]["lora_enabled"] is False
+
+    @pytest.mark.anyio
+    async def test_submit_omits_an_unset_distillation_boundary(self, tmp_path):
+        """Trainers forbid unknown spec fields, so an ordinary run must stay
+        submittable against a trainer image that predates SnapFlow support."""
+        body = await _submitted_body(_settings(), _context(tmp_path))
+
+        assert "snapflow_start_epoch" not in body["spec"]
+
+    @pytest.mark.anyio
+    async def test_submit_sends_a_distillation_boundary_when_one_is_asked_for(self, tmp_path):
+        """A distillation run must fail loudly against an old trainer rather
+        than silently train without distilling, so the field is sent."""
+        context = _context(tmp_path, policy="pi05", max_epochs=8, snapflow_enabled=True, snapflow_distill_epochs=3)
+
+        body = await _submitted_body(_settings(), context)
+
+        assert body["spec"]["snapflow_start_epoch"] == 8
+        assert body["spec"]["max_epochs"] == 11
+
+    @pytest.mark.anyio
+    async def test_submit_body_omits_the_studios_device_selection(self, tmp_path):
+        """A device index names hardware on this host, not on the trainer's."""
+        settings = _settings()
+        context = _context(tmp_path)
+        context.payload = context.payload.model_copy(update={"device": TrainingDevice(type="cuda", index=1)})
+
+        body = await _submitted_body(settings, context)
+
+        assert body["spec"]["device_type"] is None
+        assert body["spec"]["device_index"] is None
 
     @pytest.mark.anyio
     async def test_http_persists_remote_job_id_after_upload(self, tmp_path):
@@ -854,8 +1106,38 @@ class TestModelDownloadCancellation:
 
         assert controller.cancelled is False
 
+    @pytest.mark.anyio
+    async def test_user_cancel_racing_shutdown_still_cancels_remote_job(self, tmp_path):
+        """A user cancel that overlaps a concurrent app shutdown must still cancel, not suspend.
 
-class TestSnapshotUploadHeartbeat:
+        Regression guard: stopping a job and then stopping the backend "soon
+        after" can make ``should_suspend`` true (app shutting down) at the same
+        moment the user's own interrupt made ``should_stop`` true. Suspend must
+        not win here, or the "canceled" job is left running on the trainer and
+        gets silently reattached to on the next startup.
+        """
+        from services.training_backends.base import TrainingCanceledError
+
+        settings = _settings()
+        context = _context(tmp_path, should_stop=True, should_cancel_job=True)
+        # A shutdown is *also* in flight at the same moment, but the user's own
+        # cancel of this specific job must take priority.
+        context.should_suspend = lambda: True
+        controller = _Controller(states=[])
+        controller.artifact_chunks = [b"a" * 500, b"b" * 500]
+        controller.artifact_headers = {"content-length": "1000"}
+        stream_timeout = httpx.Timeout(5.0)
+
+        with (
+            patch(f"{REMOTE}.get_settings", return_value=settings),
+            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
+        ):
+            backend = _backend(settings)
+            with pytest.raises(TrainingCanceledError):
+                await backend._stream_archive(context, controller.remote_job_id, tmp_path / "model.zip", stream_timeout)
+
+        assert controller.cancelled is True
+
     """The HTTP upload loop emits throttled byte heartbeats for large snapshots."""
 
     @pytest.mark.anyio
@@ -865,21 +1147,25 @@ class TestSnapshotUploadHeartbeat:
         # Give the archive real bytes so the streaming read loop runs and updates the heartbeat.
         (tmp_path / "snap" / "info.json").write_text("x" * 4096)
         controller = _Controller(states=[{"status": "completed", "progress": 100, "message": "Done"}])
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
 
-        with (
-            patch(f"{REMOTE}.get_settings", return_value=settings),
-            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
-            patch(f"{REMOTE}.SafeZipArchive", return_value=MagicMock()),
-            patch(f"{REMOTE}._EVENT_WAIT_TIMEOUT_S", 0.01),
-            # A negative interval forces a heartbeat on the first streamed chunk.
-            patch(f"{TRANSFER}._TRANSFER_LOG_INTERVAL_S", -1.0),
-            patch(f"{TRANSFER}.logger") as mock_logger,
-        ):
-            backend = _backend(settings)
-            await backend.train(context)
+        try:
+            with (
+                patch(f"{REMOTE}.get_settings", return_value=settings),
+                patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
+                patch(f"{REMOTE}.SafeZipArchive", return_value=MagicMock()),
+                patch(f"{REMOTE}._EVENT_WAIT_TIMEOUT_S", 0.01),
+                # A negative interval forces a heartbeat on the first streamed chunk.
+                patch(f"{TRANSFER}._TRANSFER_LOG_INTERVAL_S", -1.0),
+            ):
+                backend = _backend(settings)
+                await backend.train(context)
+        finally:
+            logger.remove(sink_id)
 
-        templates = [call for call in mock_logger.info.call_args_list if call.args and "progress:" in call.args[0]]
-        assert any(call.args[1] == "Dataset upload" for call in templates)
+        # Heartbeats go through the backend's trainer-prefixed logger, not the bare module logger.
+        assert any("progress:" in message and "Dataset upload" in message for message in messages)
 
 
 class TestModelDownloadProgress:
@@ -943,21 +1229,25 @@ class TestModelDownloadProgress:
         controller = _Controller(states=[{"status": "completed", "progress": 100, "message": "Done"}])
         controller.artifact_chunks = [b"a" * 500, b"b" * 500]
         controller.artifact_headers = {"content-length": "1000"}
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
 
-        with (
-            patch(f"{REMOTE}.get_settings", return_value=settings),
-            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
-            patch(f"{REMOTE}.SafeZipArchive", return_value=MagicMock()),
-            patch(f"{REMOTE}._EVENT_WAIT_TIMEOUT_S", 0.01),
-            # A negative interval makes every update cross the throttle threshold.
-            patch(f"{TRANSFER}._TRANSFER_LOG_INTERVAL_S", -1.0),
-            patch(f"{TRANSFER}.logger") as mock_logger,
-        ):
-            backend = _backend(settings)
-            await backend.train(context)
+        try:
+            with (
+                patch(f"{REMOTE}.get_settings", return_value=settings),
+                patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
+                patch(f"{REMOTE}.SafeZipArchive", return_value=MagicMock()),
+                patch(f"{REMOTE}._EVENT_WAIT_TIMEOUT_S", 0.01),
+                # A negative interval makes every update cross the throttle threshold.
+                patch(f"{TRANSFER}._TRANSFER_LOG_INTERVAL_S", -1.0),
+            ):
+                backend = _backend(settings)
+                await backend.train(context)
+        finally:
+            logger.remove(sink_id)
 
-        templates = [call for call in mock_logger.info.call_args_list if call.args and "progress:" in call.args[0]]
-        assert any(call.args[1] == "Model download" for call in templates)
+        # Heartbeats go through the backend's trainer-prefixed logger, not the bare module logger.
+        assert any("progress:" in message and "Model download" in message for message in messages)
 
     @pytest.mark.anyio
     async def test_download_resumes_with_range_after_short_response(self, tmp_path):
@@ -980,6 +1270,61 @@ class TestModelDownloadProgress:
             await backend.train(context)
 
         assert controller.artifact_range_headers == [None, "bytes=4-"]
+
+
+class TestTrainerNameLogPrefix:
+    """Every log line from a remote backend identifies which trainer produced it.
+
+    With several remote trainers running concurrently in one worker process,
+    an unprefixed line gives no way to tell which server it came from once
+    it's mixed into the process-wide worker/application log.
+    """
+
+    def _capture(self):
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
+        return messages, sink_id
+
+    def test_prefixes_log_lines_with_the_pinned_trainer_name(self):
+        from services.training_backends.remote import RemoteTrainingBackend
+
+        messages, sink_id = self._capture()
+        try:
+            backend = RemoteTrainingBackend("https://trainer.test", trainer_name="gpu-box-1")
+            backend._log.info("hello")
+        finally:
+            logger.remove(sink_id)
+
+        assert messages == ["[gpu-box-1] hello"]
+
+    def test_falls_back_to_the_base_url_when_no_name_is_pinned(self):
+        """Older persisted jobs (submitted before this field existed) have no pinned name."""
+        from services.training_backends.remote import RemoteTrainingBackend
+
+        messages, sink_id = self._capture()
+        try:
+            backend = RemoteTrainingBackend("https://trainer.test/")
+            backend._log.info("hello")
+        finally:
+            logger.remove(sink_id)
+
+        assert messages == ["[https://trainer.test] hello"]
+
+    def test_two_concurrent_backends_prefix_independently(self):
+        """Two trainers logging interleaved must stay individually attributable."""
+        from services.training_backends.remote import RemoteTrainingBackend
+
+        messages, sink_id = self._capture()
+        try:
+            backend_a = RemoteTrainingBackend("https://trainer-a.test", trainer_name="trainer-a")
+            backend_b = RemoteTrainingBackend("https://trainer-b.test", trainer_name="trainer-b")
+            backend_a._log.info("from a")
+            backend_b._log.info("from b")
+            backend_a._log.info("from a again")
+        finally:
+            logger.remove(sink_id)
+
+        assert messages == ["[trainer-a] from a", "[trainer-b] from b", "[trainer-a] from a again"]
 
 
 class TestByteFormatting:

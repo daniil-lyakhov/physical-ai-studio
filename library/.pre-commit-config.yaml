@@ -21,7 +21,7 @@ repos:
   # PYTHON LINTING & FORMATTING                                                #
   # ========================================================================== #
   - repo: https://github.com/charliermarsh/ruff-pre-commit
-    rev: "v0.12.11"
+    rev: "v0.16.7"
     hooks:
       # Run the linter with fixes (uses [tool.ruff] from pyproject.toml)
       - id: ruff
@@ -46,7 +46,7 @@ repos:
     hooks:
       - id: pyrefly-check
         name: Pyrefly (type checking)
-        entry: uv run --group dev pyrefly check
+        entry: uv run --no-sync pyrefly check
         language: system
         pass_filenames: false
 

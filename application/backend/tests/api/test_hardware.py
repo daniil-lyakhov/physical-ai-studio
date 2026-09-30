@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,16 +14,14 @@ from schemas import SerialPortInfo
 def _make_device(
     device_id="/dev/video0",
     name="Test Camera",
-    hardware_id=None,
-    id_stable=False,
+    hardware_fingerprint=None,
 ):
     return DeviceInfo(
         device_id=device_id,
         index=0,
         name=name,
         driver="uvc",
-        hardware_id=hardware_id,
-        id_stable=id_stable,
+        hardware_payload=hardware_fingerprint,
     )
 
 
@@ -35,26 +33,18 @@ def event_loop():
 
 
 class TestFingerprintFromDeviceInfo:
-    def test_stable_prefers_hardware_id(self):
-        info = _make_device(device_id="/dev/video0", hardware_id="/dev/v4l/by-id/usb-cam", id_stable=True)
-        assert _fingerprint_from_device_info(info) == "/dev/v4l/by-id/usb-cam"
+    def test_returns_hardware_payload(self):
+        info = _make_device(device_id="/dev/video0", hardware_fingerprint={"id": "usb-cam"})
+        assert _fingerprint_from_device_info(info) == {"id": "usb-cam"}
 
-    def test_unstable_falls_back_to_device_id(self):
-        info = _make_device(device_id="/dev/video0", hardware_id=None, id_stable=False)
-        assert _fingerprint_from_device_info(info) == "/dev/video0"
-
-    def test_stable_but_no_hardware_id_falls_back(self):
-        info = _make_device(device_id="/dev/video0", hardware_id=None, id_stable=True)
-        assert _fingerprint_from_device_info(info) == "/dev/video0"
-
-    def test_unstable_ignores_hardware_id(self):
-        info = _make_device(device_id="/dev/video0", hardware_id="/dev/v4l/by-id/usb-cam", id_stable=False)
-        assert _fingerprint_from_device_info(info) == "/dev/video0"
+    def test_returns_none_without_hardware_payload(self):
+        info = _make_device(device_id="/dev/video0", hardware_fingerprint=None)
+        assert _fingerprint_from_device_info(info) is None
 
 
 class TestGetCameras:
     def test_maps_uvc_to_usb_camera(self, event_loop):
-        devices = {"uvc": [_make_device(name="Logitech C920")]}
+        devices = {"uvc": [_make_device(name="Logitech C920", hardware_fingerprint={"serial": "abc"})]}
         with patch("api.hardware.discover_all", return_value=devices):
             cameras = event_loop.run_until_complete(get_cameras())
         assert len(cameras) == 1
@@ -67,15 +57,20 @@ class TestGetCameras:
             index=0,
             name="Intel RealSense D435",
             driver="realsense",
-            hardware_id="123456789",
-            id_stable=True,
+            hardware_payload={"serial": "123456789"},
         )
         devices = {"realsense": [rs_device]}
         with patch("api.hardware.discover_all", return_value=devices):
             cameras = event_loop.run_until_complete(get_cameras())
         assert len(cameras) == 1
         assert cameras[0].driver == "realsense"
-        assert cameras[0].fingerprint == "123456789"
+        assert cameras[0].fingerprint == {"serial": "123456789"}
+
+    def test_skips_devices_without_hardware_payload(self, event_loop):
+        devices = {"uvc": [_make_device()]}
+        with patch("api.hardware.discover_all", return_value=devices):
+            cameras = event_loop.run_until_complete(get_cameras())
+        assert cameras == []
 
     def test_skips_unknown_drivers(self, event_loop):
         devices = {"ip": [_make_device(name="IP cam")], "genicam": [_make_device(name="GenICam cam")]}
@@ -91,7 +86,7 @@ class TestGetCameras:
     def test_all_false_uses_only_usable(self, event_loop):
         def fake_discover(*, only_usable: bool = True):
             assert only_usable is True
-            return {"uvc": [_make_device(name="Cam A")]}
+            return {"uvc": [_make_device(name="Cam A", hardware_fingerprint={"serial": "abc"})]}
 
         with patch("api.hardware.discover_all", side_effect=fake_discover):
             cameras = event_loop.run_until_complete(get_cameras(all=False))
@@ -128,27 +123,23 @@ class TestHardwareApi:
         robot_manager.find_robots.assert_awaited_once()
 
     def test_identify_so101_uses_robot_manager_dependency(self):
-        robot_manager = _StubRobotManager([])
+        robot_manager = _StubRobotManager([SerialPortInfo(connection_string="/dev/ttyUSB0", serial_number=None)])
         app.dependency_overrides[get_robot_manager_service] = lambda: robot_manager
 
         try:
             client = TestClient(app)
-            with patch("robots.catalog.so101.identify_so101_robot_visually", new_callable=AsyncMock) as identify:
+            with patch("robots.catalog.so101.identify_so101_robot_visually", new_callable=Mock) as identify:
                 response = client.post(
                     "/api/robots/catalog/SO101_Follower/identify",
-                    params={"joint": "gripper"},
                     json={"connection_string": "/dev/ttyUSB0", "serial_number": ""},
                 )
         finally:
             app.dependency_overrides.clear()
 
         assert response.status_code == 200, response.text
-        identify.assert_awaited_once()
-        manager_arg, robot_arg, joint_arg = identify.await_args.args
-        assert manager_arg is robot_manager
-        assert robot_arg.type == "SO101_Follower"
-        assert robot_arg.payload.connection_string == "/dev/ttyUSB0"
-        assert joint_arg == "gripper"
+        identify.assert_called_once()
+        (connection_string,) = identify.call_args.args
+        assert connection_string == "/dev/ttyUSB0"
 
     def test_identify_trossen_calls_trossen_identifier(self):
         robot_manager = _StubRobotManager([])

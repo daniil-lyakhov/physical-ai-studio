@@ -9,7 +9,7 @@ service. The active backend is selected per job from its persisted execution
 target.
 """
 
-from schemas.job import TrainJobPayload
+from schemas.job import RemoteTrainJobPayload, TrainJobPayload
 from services.training_backends.base import (
     ProgressReporter,
     TrainingBackend,
@@ -19,16 +19,14 @@ from services.training_backends.base import (
 )
 
 
-def get_training_backend(payload: TrainJobPayload) -> TrainingBackend:
+async def get_training_backend(payload: TrainJobPayload) -> TrainingBackend:
     """Return the backend selected by a job's persisted execution target."""
-    from schemas.job import TrainingTarget
-
-    if payload.training_target is TrainingTarget.REMOTE:
+    if isinstance(payload, RemoteTrainJobPayload):
         from services.training_backends.remote import RemoteTrainingBackend
 
         if payload.remote_trainer_url is None:
             raise ValueError("Remote training job is missing its pinned trainer URL")
-        return RemoteTrainingBackend(payload.remote_trainer_url)
+        return RemoteTrainingBackend(payload.remote_trainer_url, trainer_name=payload.remote_trainer_name)
 
     from services.training_backends.local import LocalTrainingBackend
 

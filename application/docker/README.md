@@ -70,7 +70,7 @@ All configuration is done through the `.env` file. Copy `.env.example` to get st
 | `COMPOSE_PROFILES` | `cpu`                         | Hardware profile: `cpu`, `xpu`, or `cuda`                |
 | `PORT`             | `7860`                        | Host port to expose the web UI and API                   |
 | `REGISTRY`         | `ghcr.io/open-edge-platform/` | Container image registry                                 |
-| `IMAGE_TAG`        | `latest`                      | Image version tag                                        |
+| `IMAGE_TAG`        | `main`                        | Image version tag (`latest` is release-only; use `main` for the newest dev build) |
 | `APP_UID`          | `1000`                        | UID for the in-container user (match your host user)     |
 | `APP_GID`          | `1000`                        | GID for the in-container user (match your host user)     |
 | `VIDEO_GID`        | `video` (group name)          | Host GID for the `video` group (cameras)                 |
@@ -82,7 +82,7 @@ All configuration is done through the `.env` file. Copy `.env.example` to get st
 | `HTTPS_PROXY`      | *(empty)*                     | HTTPS proxy for builds and runtime                       |
 | `NO_PROXY`         | *(empty)*                     | Proxy exclusion list                                     |
 
-If you plan to train Hugging Face Hub-backed policies (for example, SmolVLA, Pi0,
+If you plan to train Hugging Face Hub-backed policies (for example, SmolVLA, Pi0.5,
 and others), set `HF_TOKEN` in `.env` to avoid unauthenticated Hub access warnings.
 See [Hugging Face Integration](../backend/docs/huggingface_integration.md) for token
 creation and setup details.
@@ -181,24 +181,19 @@ sudo usermod -aG render $USER   # Intel XPU only
 
 ## Volumes and Data Persistence
 
-The compose file defines two named volumes and one bind mount:
+The compose file defines one named volume:
 
 | Volume                       | Container path                                         | Purpose                                              |
 |------------------------------|--------------------------------------------------------|------------------------------------------------------|
-| `physical-ai-studio-data`    | `/app/data`                                            | Legacy data-dir mount kept for one-time migration    |
 | `physical-ai-studio-storage` | `/app/storage`                                         | Persistent storage, including app data and artifacts |
-| *(bind mount)*               | `~/.cache/huggingface/lerobot/calibration` (read-only) | Shared robot calibration data from the host          |
 
 Runtime defaults use `STORAGE_DIR=/app/storage`; the application database is stored under `$STORAGE_DIR/data`.
-`/app/data` stays mounted as a legacy database source so existing users can be migrated
-automatically. The container enables non-interactive migration with
-`AUTO_MIGRATE_STORAGE_DIR=true`.
 
 To inspect volume contents:
 
 ```bash
 # List files in a volume
-docker run --rm -v docker_physical-ai-studio-data:/data alpine ls -la /data
+docker run --rm -v docker_physical-ai-studio-storage:/storage alpine ls -la /storage
 
 # Back up a volume
 docker run --rm -v docker_physical-ai-studio-storage:/storage -v $(pwd):/backup alpine \
@@ -207,9 +202,9 @@ docker run --rm -v docker_physical-ai-studio-storage:/storage -v $(pwd):/backup 
 
 > [!NOTE]
 > Docker Compose prefixes volume names with the project name (the directory name
-> by default). When running from `application/docker/`, the actual volume names
-> are `docker_physical-ai-studio-data` and `docker_physical-ai-studio-storage`.
-> You can verify the exact volume names with `docker volume ls | grep physical-ai-studio`.
+> by default). When running from `application/docker/`, the actual volume name
+> is `docker_physical-ai-studio-storage`.
+> You can verify the exact volume name with `docker volume ls | grep physical-ai-studio`.
 
 To reset all data:
 
@@ -243,10 +238,11 @@ are passed as build arguments automatically.
 ## Remote training service (trainer)
 
 `docker-compose.trainer.yaml` in this directory is a separate, standalone
-Compose file for the remote training service under `application/trainer/`.
+Compose file for the remote training service under
+`application/backend/src/trainer/`.
 It does not start the Studio backend/UI images above, and this
 `docker-compose.yaml` does not reference the trainer images. See
-[`application/trainer/README.md`](../trainer/README.md) for setup, security
+[`application/backend/docs/remote-trainer.md`](../backend/docs/remote-trainer.md) for setup, security
 notes, and the manual container-startup guide.
 
 ## Troubleshooting

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -19,7 +19,8 @@ from physicalai.inference.data import InferenceFeature, InferenceFeatureDtype, I
 from physicalai.inference.manifest import ComponentSpec
 from safetensors.torch import load_file
 
-from physicalai.data.observation import ACTION, IMAGES, STATE, TASK, FeatureType
+from physicalai.data.constants import RTC_EXECUTION_HORIZON, RTC_INFERENCE_DELAY, RTC_MAX_GUIDANCE_WEIGHT
+from physicalai.data.observation import ACTION, IMAGES, PREV_CHUNK_LEFT_OVER, STATE, TASK, FeatureType
 from physicalai.export import ExportablePolicyMixin, ExportBackend
 from physicalai.export.backends import (
     ExportParameters,
@@ -28,11 +29,12 @@ from physicalai.export.backends import (
     TorchExportParameters,
 )
 from physicalai.policies.base import Policy
+from physicalai.policies.mixins import RTCPolicyMixin, SnapFlowPolicyMixin
 from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
 
 from .config import SmolVLAConfig
-from .model import SmolVLAModel
+from .model import SmolVLAModel, VLAFlowMatching
 from .pretrained_utils import extract_dataset_stats, fix_state_dict_keys
 
 if TYPE_CHECKING:
@@ -43,7 +45,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class SmolVLA(ExportablePolicyMixin, Policy):
+class SmolVLA(SnapFlowPolicyMixin, RTCPolicyMixin, ExportablePolicyMixin, Policy):
     """SmolVLA Policy - Hugging Face's flow matching VLA model.
 
     Lightning wrapper for training and inference with SmolVLA model.
@@ -54,6 +56,7 @@ class SmolVLA(ExportablePolicyMixin, Policy):
 
     Args:
         pretrained_name_or_path: HuggingFace repo ID or local path for pretrained weights and config.
+        dtype : Precision used for model weights. Can be either "bfloat16" or "float32". Default: "bfloat16".
         n_obs_steps: Number of observation steps to use. Default: 1.
         chunk_size: Size of action chunks for prediction. Default: 50.
         n_action_steps: Number of action steps to execute. Default: 50.
@@ -86,7 +89,8 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         optimizer_weight_decay: Weight decay for optimizer. Default: 1e-10.
         optimizer_grad_clip_norm: Gradient clipping norm value. Default: 10.
         scheduler_warmup_steps: Number of warmup steps for scheduler. Default: 1_000.
-        scheduler_decay_steps: Number of steps between learning rate decays. Default: 30_000.
+        scheduler_decay_steps: Explicit cosine decay horizon in steps. When ``None``, the horizon
+            follows the trainer's total step budget. Default: None.
         scheduler_decay_lr: Learning rate decay factor. Default: 2.5e-6.
         dataset_stats: Dataset normalization statistics for eager initialization. Default: None.
 
@@ -110,6 +114,7 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         self,
         # Pretrained model id
         pretrained_name_or_path: str | Path | None = None,
+        dtype: Literal["bfloat16", "float32"] = "bfloat16",
         # Input / output structure.
         n_obs_steps: int = 1,
         chunk_size: int = 50,
@@ -119,6 +124,8 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         max_action_dim: int = 32,
         # Image preprocessing
         resize_imgs_with_padding: tuple[int, int] = (512, 512),
+        image_key_reorder_map: dict[str, int] | None = None,
+        num_cameras: int = 0,
         *,
         # Architecture
         tokenizer_max_length: int = 48,
@@ -158,7 +165,7 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         optimizer_weight_decay: float = 1e-10,
         optimizer_grad_clip_norm: float = 10,
         scheduler_warmup_steps: int = 1_000,
-        scheduler_decay_steps: int = 30_000,
+        scheduler_decay_steps: int | None = None,
         scheduler_decay_lr: float = 2.5e-6,
         # Eager initialization (for checkpoint loading)
         dataset_stats: dict[str, dict[str, list[float] | str | tuple]] | None = None,
@@ -173,9 +180,12 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         if pretrained_name_or_path is not None:
             self.config, dataset_stats, weights_file = self._from_hf(
                 pretrained_name_or_path,
+                dtype=dtype,
                 tokenizer_max_length=tokenizer_max_length,
                 pad_language_to=pad_language_to,
                 use_random_input_noise=use_random_input_noise,
+                image_key_reorder_map=image_key_reorder_map,
+                num_cameras=num_cameras,
                 compile_model=compile_model,
                 snapflow_enabled=snapflow_enabled,
                 snapflow_alpha=snapflow_alpha,
@@ -198,19 +208,21 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         else:
             # Create config from explicit args (policy-level config)
             self.config = SmolVLAConfig(
+                dtype=dtype,
                 n_obs_steps=n_obs_steps,
                 chunk_size=chunk_size,
                 n_action_steps=n_action_steps,
                 max_state_dim=max_state_dim,
                 max_action_dim=max_action_dim,
                 resize_imgs_with_padding=resize_imgs_with_padding,
+                image_key_reorder_map=image_key_reorder_map or {},
+                num_cameras=num_cameras,
                 tokenizer_max_length=tokenizer_max_length,
                 vlm_model_name=vlm_model_name,
                 load_vlm_weights=load_vlm_weights,
                 add_image_special_tokens=add_image_special_tokens,
                 attention_mode=attention_mode,
                 prefix_length=prefix_length,
-                pad_language_to=pad_language_to,
                 num_expert_layers=num_expert_layers,
                 num_vlm_layers=num_vlm_layers,
                 self_attn_every_n_layers=self_attn_every_n_layers,
@@ -281,6 +293,7 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         """
         self.model = SmolVLAModel(
             dataset_stats,
+            dtype=self.config.dtype,
             chunk_size=self.config.chunk_size,
             max_state_dim=self.config.max_state_dim,
             max_action_dim=self.config.max_action_dim,
@@ -329,6 +342,9 @@ class SmolVLA(ExportablePolicyMixin, Policy):
                     msg = f"  - {k}"
                     logger.warning(msg)
 
+            # Apply dtype/precision
+            self.model._model.to_bfloat16_for_selected_params(self.config.dtype)  # noqa: SLF001
+
             # Apply requires_grad
             self.model._model.set_requires_grad()  # noqa: SLF001
             self.model._model.vlm_with_expert.set_requires_grad()  # noqa: SLF001
@@ -337,13 +353,19 @@ class SmolVLA(ExportablePolicyMixin, Policy):
 
         self._dataset_stats = dataset_stats
 
-    def _from_hf(  # noqa: PLR6301, PLR0913
-        self,
+        # Apply any RTC state requested before the model was built.
+        self._sync_rtc_to_model()
+
+    @staticmethod
+    def _from_hf(  # noqa: PLR0913
         pretrained_name_or_path: str | Path,
         *,
+        dtype: Literal["bfloat16", "float32"] = "bfloat16",
         tokenizer_max_length: int = 48,
         pad_language_to: str = "max_length",
         use_random_input_noise: bool = False,
+        image_key_reorder_map: dict[str, int] | None = None,
+        num_cameras: int = 0,
         compile_model: bool = False,
         snapflow_enabled: bool = False,
         snapflow_alpha: float = 0.5,
@@ -360,7 +382,7 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         optimizer_weight_decay: float = 1e-10,
         optimizer_grad_clip_norm: float = 10,
         scheduler_warmup_steps: int = 1_000,
-        scheduler_decay_steps: int = 30_000,
+        scheduler_decay_steps: int | None = None,
         scheduler_decay_lr: float = 2.5e-6,
     ) -> tuple[SmolVLAConfig, dict[str, dict[str, list[float] | str | tuple]] | None, Path | None]:
         """Template loader for SmolVLA pretrained config/weights from local path or HF Hub.
@@ -404,9 +426,12 @@ class SmolVLA(ExportablePolicyMixin, Policy):
             hf_config = json.load(f)
 
         # Apply only safe overrides
+        hf_config["dtype"] = dtype
         hf_config["tokenizer_max_length"] = tokenizer_max_length
         hf_config["pad_language_to"] = pad_language_to
         hf_config["use_random_input_noise"] = use_random_input_noise
+        hf_config["image_key_reorder_map"] = image_key_reorder_map or {}
+        hf_config["num_cameras"] = num_cameras
         hf_config["compile_model"] = compile_model
         hf_config["snapflow_enabled"] = snapflow_enabled
         hf_config["snapflow_alpha"] = snapflow_alpha
@@ -426,11 +451,27 @@ class SmolVLA(ExportablePolicyMixin, Policy):
         hf_config["scheduler_decay_steps"] = scheduler_decay_steps
         hf_config["scheduler_decay_lr"] = scheduler_decay_lr
 
-        config = SmolVLAConfig.from_dict(hf_config)
-
         dataset_stats = extract_dataset_stats(hf_config, preprocessor_file, preprocessor_dir)
 
+        # strict=False: ignore legacy config.json keys not present in SmolVLAConfig
+        config = SmolVLAConfig.from_dict(hf_config, strict=False)
+
         return config, dataset_stats, weights_file
+
+    @staticmethod
+    def _normalize_image_feature_name(name: str) -> str:
+        """Normalize flattened image feature names to camera suffixes.
+
+        Args:
+            name: Image feature name, possibly prefixed.
+
+        Returns:
+            The feature name with any known image prefix removed.
+        """
+        for prefix in ("observation.images.", "images.", f"{IMAGES}."):
+            if name.startswith(prefix):
+                return name[len(prefix) :]
+        return name
 
     def _update_preprocessor_stats(
         self,
@@ -451,6 +492,8 @@ class SmolVLA(ExportablePolicyMixin, Policy):
             max_action_dim=self.config.max_action_dim,
             stats=dataset_stats,
             image_resolution=self.config.resize_imgs_with_padding,
+            image_key_reorder_map=self.config.image_key_reorder_map,
+            num_cameras=self.config.num_cameras,
             max_token_len=self.config.tokenizer_max_length,
             token_pad_type=self.config.pad_language_to,
             tokenizer_name=self.config.vlm_model_name,
@@ -496,7 +539,42 @@ class SmolVLA(ExportablePolicyMixin, Policy):
 
         reformat_dataset_to_match_policy(self, datamodule)
 
-    def forward(self, batch: Observation) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Migrate legacy checkpoints missing target-time MLP parameters.
+
+        Older SmolVLA checkpoints were created before target-time conditioning
+        layers were introduced. Keep strict checkpoint loading enabled by
+        populating any missing target-time parameters from the current model
+        initialization.
+        """
+        super().on_load_checkpoint(checkpoint)
+
+        state_dict = checkpoint.get("state_dict")
+        if not isinstance(state_dict, dict) or self.model is None:
+            return
+
+        defaults = {
+            "model._model.target_time_mlp_in.weight": self.model._model.target_time_mlp_in.weight,  # noqa: SLF001
+            "model._model.target_time_mlp_in.bias": self.model._model.target_time_mlp_in.bias,  # noqa: SLF001
+            "model._model.target_time_mlp_out.weight": self.model._model.target_time_mlp_out.weight,  # noqa: SLF001
+            "model._model.target_time_mlp_out.bias": self.model._model.target_time_mlp_out.bias,  # noqa: SLF001
+        }
+
+        inserted: list[str] = []
+        for key, value in defaults.items():
+            if key in state_dict:
+                continue
+            state_dict[key] = value.detach().clone()
+            inserted.append(key)
+
+        if inserted:
+            logger.warning(
+                "Loaded legacy SmolVLA checkpoint missing %d target-time parameter(s): %s",
+                len(inserted),
+                ", ".join(inserted),
+            )
+
+    def forward(self, batch: Observation) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
         """Forward pass through the model.
 
         Processes the input batch and either trains the model or predicts actions
@@ -533,13 +611,15 @@ class SmolVLA(ExportablePolicyMixin, Policy):
             torch.Tensor: The predicted action chunk after post-processing.
 
         Raises:
-            ValueError: If the model has not been initialized.
+            ValueError: If the model has not been initialized, or if RTC is enabled
+                and the batch carries out-of-range RTC control values.
         """
         if self.model is None or self._preprocessor is None or self._postprocessor is None:
             msg = "Model is not initialized"
             raise ValueError(msg)
 
         processed_batch = self._preprocessor(batch.to(self.device).to_dict())
+        self._validate_rtc_inputs(processed_batch)
         chunk = self.model.predict_action_chunk(processed_batch)
         return self._postprocessor({ACTION: chunk})[ACTION]
 
@@ -561,7 +641,7 @@ class SmolVLA(ExportablePolicyMixin, Policy):
 
         return loss
 
-    def compute_val_loss(self, batch: Observation) -> tuple[torch.Tensor, dict[str, float]]:
+    def compute_val_loss(self, batch: Observation) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
         """Compute validation loss on a batch.
 
         Delegates to the model's ``compute_val_loss`` without toggling
@@ -585,6 +665,11 @@ class SmolVLA(ExportablePolicyMixin, Policy):
     def configure_optimizers(self) -> dict[str, Any]:
         """Configure optimizer and scheduler.
 
+        The cosine decay horizon defaults to the total training step budget
+        (``self.trainer.estimated_stepping_batches``, derived from ``max_steps``
+        or ``max_epochs``), so the LR reaches ``scheduler_decay_lr`` exactly at
+        the end of training. Set ``scheduler_decay_steps`` to override it.
+
         Returns:
             Optimizer configuration dict.
         """
@@ -597,9 +682,13 @@ class SmolVLA(ExportablePolicyMixin, Policy):
             lr=self.config.optimizer_lr,
             weight_decay=self.config.optimizer_weight_decay,
             betas=self.config.optimizer_betas,
+            eps=self.config.optimizer_eps,
         )
 
         num_decay_steps = self.config.scheduler_decay_steps
+        if num_decay_steps is None:
+            num_decay_steps = int(self.trainer.estimated_stepping_batches)
+
         scheduler = cosine_decay_with_warmup_scheduler(
             optimizer,
             peak_lr=self.config.optimizer_lr,
@@ -615,6 +704,26 @@ class SmolVLA(ExportablePolicyMixin, Policy):
                 "interval": "step",
             },
         }
+
+    @property
+    def inner_model(self) -> VLAFlowMatching:
+        """The unwrapped SmolVLA flow-matching module.
+
+        Raises:
+            RuntimeError: If accessed before ``setup()`` has initialized the model.
+        """
+        if self.model is None:
+            msg = "inner_model accessed before the model was initialized (setup() has not run yet)."
+            raise RuntimeError(msg)
+        return self.model._model  # noqa: SLF001
+
+    def freeze_vlm(self) -> None:
+        """Freeze the VLM so only the action expert and target-time embedding train."""
+        inner = self.inner_model
+        object.__setattr__(self.config, "train_expert_only", True)  # noqa: PLC2801
+        inner.vlm_with_expert.train_expert_only = True
+        inner.vlm_with_expert.set_requires_grad()
+        self.model.train()
 
     def configure_gradient_clipping(
         self,
@@ -659,15 +768,15 @@ class SmolVLA(ExportablePolicyMixin, Policy):
 
         Returns:
             A list of feature descriptors matching the model's expected input format,
-            covering the robot state, image observations, and language task. Returns
-            ``None`` if the underlying model or dataset stats have not been initialized
-            yet.
+            covering the robot state, image observations, the language task, and any
+            real-time chunking control tensors when :attr:`rtc_enabled` is ``True``.
+            Returns ``None`` if the underlying model or dataset stats have not been
+            initialized yet.
         """
         if self.model is None or self._dataset_stats is None:
             return None
 
         dataset_stats = self._dataset_stats
-
         schema: list[InferenceFeature] = []
 
         num_image_features = sum(1 for key in dataset_stats if str(FeatureType.VISUAL) in dataset_stats[key]["type"])
@@ -701,6 +810,37 @@ class SmolVLA(ExportablePolicyMixin, Policy):
                 dtype=InferenceFeatureDtype.STRING,
             ),
         )
+
+        if self.rtc_enabled:
+            action_shape = cast("tuple", self._dataset_stats[ACTION]["shape"])
+            schema.extend(
+                [
+                    InferenceFeature(
+                        ftype=InferenceFeatureType.COMMON,
+                        shape=(self.config.chunk_size, *action_shape),
+                        name=PREV_CHUNK_LEFT_OVER,
+                        dtype=InferenceFeatureDtype.FLOAT32,
+                    ),
+                    InferenceFeature(
+                        ftype=InferenceFeatureType.COMMON,
+                        shape=(),
+                        name=RTC_INFERENCE_DELAY,
+                        dtype=InferenceFeatureDtype.INT64,
+                    ),
+                    InferenceFeature(
+                        ftype=InferenceFeatureType.COMMON,
+                        shape=(),
+                        name=RTC_MAX_GUIDANCE_WEIGHT,
+                        dtype=InferenceFeatureDtype.FLOAT32,
+                    ),
+                    InferenceFeature(
+                        ftype=InferenceFeatureType.COMMON,
+                        shape=(),
+                        name=RTC_EXECUTION_HORIZON,
+                        dtype=InferenceFeatureDtype.INT64,
+                    ),
+                ],
+            )
 
         return schema
 
@@ -746,12 +886,21 @@ class SmolVLA(ExportablePolicyMixin, Policy):
             )
             raise ValueError(msg)
 
+        normalize_stats: dict[str, Any] = {STATE: self._dataset_stats[f"observation.{STATE}"]}
+        if self.rtc_enabled:
+            normalize_stats[PREV_CHUNK_LEFT_OVER] = self._dataset_stats[ACTION]
+
         base_preproc_specs = [
-            ComponentSpec(type="smolvla_resize", image_resolution=self.config.resize_imgs_with_padding),
+            ComponentSpec(
+                type="smolvla_resize",
+                image_resolution=self.config.resize_imgs_with_padding,
+                image_key_reorder_map=self.config.image_key_reorder_map,
+                num_cameras=self.config.num_cameras,
+            ),
             ComponentSpec(type="new_line"),
             ComponentSpec(
                 type="normalize",
-                stats={STATE: self._dataset_stats[f"observation.{STATE}"]},
+                stats=normalize_stats,
                 mode="mean_std",
             ),
         ]

@@ -1,26 +1,13 @@
 import { Suspense } from 'react';
 
-import {
-    ActionButton,
-    Button,
-    Divider,
-    Flex,
-    Grid,
-    Heading,
-    Icon,
-    Item,
-    Loading,
-    Menu,
-    MenuTrigger,
-    minmax,
-    View,
-} from '@geti-ui/ui';
-import { Add, MoreMenu } from '@geti-ui/ui/icons';
+import { ActionButton, Flex, Grid, Heading, Item, Loading, Menu, MenuTrigger, minmax, View } from '@geti-ui/ui';
+import { MoreMenu } from '@geti-ui/ui/icons';
 import { clsx } from 'clsx';
 import { NavLink, Outlet, useParams } from 'react-router';
 
 import { $api } from '../../api/client';
 import { SchemaEnvironmentOutput } from '../../api/openapi-spec';
+import { AddResourceButton } from '../../components/add-resource-button/add-resource-button';
 import { useProjectId } from '../../features/projects/use-project';
 import { paths } from '../../router';
 
@@ -40,7 +27,7 @@ const MenuActions = ({ environment_id }: { environment_id: string }) => {
 
     return (
         <MenuTrigger>
-            <ActionButton isQuiet UNSAFE_style={{ fill: 'var(--spectrum-gray-900)' }}>
+            <ActionButton isQuiet>
                 <MoreMenu />
             </ActionButton>
             <Menu
@@ -100,28 +87,12 @@ export const EnvironmentsList = () => {
     });
 
     return (
-        <Flex direction='column' gap='size-100'>
-            {/* TODO:  */}
-            <View isHidden>
-                <Flex justifyContent={'space-between'} alignItems={'end'}>
-                    <span>Step 3: create an environment</span>
-                    <Button>Next</Button>
-                </Flex>
-                <Divider size='S' marginY='size-200' />
-            </View>
+        <Flex direction='column' gap='size-200'>
+            <AddResourceButton to={paths.project.environments.new({ project_id })}>
+                Configure new environment
+            </AddResourceButton>
 
-            <Button
-                variant='secondary'
-                href={paths.project.environments.new({ project_id })}
-                UNSAFE_className={classes.addNewRobotButton}
-            >
-                <Icon marginEnd='size-50'>
-                    <Add />
-                </Icon>
-                Configure a new environment
-            </Button>
-
-            <Flex direction='column' gap='size-100'>
+            <Flex direction='column' gap='size-200'>
                 {environmentsQuery.data.map((environment) => {
                     const to = paths.project.environments.show({ project_id, environment_id: environment.id });
 
@@ -140,11 +111,17 @@ export const EnvironmentsList = () => {
 
 export const Layout = () => {
     return (
-        <Grid areas={['environments controls']} columns={[minmax('size-6000', 'auto'), '1fr']} height={'100%'}>
+        <Grid
+            areas={['environments controls']}
+            columns={['size-6000', minmax(0, '1fr')]}
+            rows={[minmax(0, '1fr')]}
+            height={'100%'}
+            minHeight={0}
+        >
             <View gridArea='environments' backgroundColor={'gray-100'} padding='size-400'>
                 <EnvironmentsList />
             </View>
-            <View gridArea='controls' backgroundColor={'gray-50'} minHeight={0}>
+            <View gridArea='controls' backgroundColor={'gray-50'} minHeight={0} minWidth={0} overflow='auto'>
                 <Suspense
                     fallback={
                         <Grid width='100%' height='100%'>

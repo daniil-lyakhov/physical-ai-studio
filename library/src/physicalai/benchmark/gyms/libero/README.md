@@ -29,7 +29,7 @@ The following example loads a pretrained Pi0.5 checkpoint and runs the full LIBE
 We use the LIBERO imitation learning training set provided by the LeRobot found [in hugging face datasets](https://huggingface.co/datasets/HuggingFaceVLA/libero). Please see the LeRobot implementation [on there LIBERO section in the LeRobot docs](https://huggingface.co/docs/lerobot/libero).
 
 ```bash
-uv sync --extra libero --extra pi0
+uv sync --extra libero --extra pi05
 ```
 
 ## Code
@@ -53,7 +53,7 @@ policy.eval()
 # Benchmark
 benchmark = LiberoBenchmark(
     task_suite="libero_10",
-    num_episodes=20,         # 20 episodes per task
+    num_episodes=20,  # 20 episodes per task
     seed=42,
     video_dir="./videos",
     record_mode="failures",  # Record only failed episodes
@@ -73,7 +73,7 @@ from physicalai.benchmark.gyms import LiberoBenchmark
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # LeRobot Weights
-policy = Pi05(pretrained_name_or_path="lerobot/pi05_libero_finetuned_v044")
+policy = Pi05(pretrained_name_or_path="lerobot/pi05_libero_finetuned")
 policy.eval()
 
 # Benchmark

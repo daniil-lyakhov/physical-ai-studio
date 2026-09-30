@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Self
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -43,6 +44,110 @@ class _Client:
 
 def _trainer() -> RemoteTrainer:
     return RemoteTrainer(id=uuid4(), name="trainer", url=AnyHttpUrl("https://trainer.test"))
+
+
+@pytest.mark.anyio
+async def test_check_remote_trainer_reports_starting_while_container_is_launching() -> None:
+    """A trainer whose background container launch is still in progress must
+    report `status='starting'`, not dial a tunnel nothing is listening on yet
+    and read the resulting connection failure as a generic 'unreachable'.
+    """
+    trainer = _trainer()
+
+    with (
+        patch.object(RemoteTrainerService, "get_remote_trainer", new=AsyncMock(return_value=trainer)),
+        patch(f"{MODULE}.persistent_trainer.get_launch_phase", return_value="Pulling trainer image…"),
+        patch(f"{MODULE}.httpx.AsyncClient") as async_client,
+    ):
+        result = await RemoteTrainerService(MagicMock()).check_remote_trainer(trainer.id)
+
+    assert result.status == "starting"
+    assert result.reason_code == "Pulling trainer image…"
+    assert result.devices == []
+    async_client.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_check_remote_trainer_reports_managed_prerequisite_failures() -> None:
+    trainer = _trainer()
+
+    with (
+        patch.object(RemoteTrainerService, "get_remote_trainer", new=AsyncMock(return_value=trainer)),
+        patch(f"{MODULE}.persistent_trainer.get_launch_phase", return_value=None),
+        patch(f"{MODULE}.persistent_trainer.get_launch_failure", return_value="docker_unavailable"),
+        patch(f"{MODULE}.httpx.AsyncClient") as async_client,
+    ):
+        result = await RemoteTrainerService(MagicMock()).check_remote_trainer(trainer.id)
+
+    assert result.status == "degraded"
+    assert result.reason_code == "docker_unavailable"
+    async_client.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_check_remote_trainer_reports_starting_within_grace_period_when_unreachable() -> None:
+    """A trainer that isn't actively launching (the phase already cleared) but
+    whose launch attempt began recently still reads as 'starting' rather than
+    'unreachable' - the container may simply not have finished warming up.
+    """
+    trainer = _trainer()
+    client = _Client([_Response({}, httpx.ConnectError("connection refused"))])
+
+    with (
+        patch.object(RemoteTrainerService, "get_remote_trainer", new=AsyncMock(return_value=trainer)),
+        patch(f"{MODULE}.persistent_trainer.get_launch_phase", return_value=None),
+        patch(f"{MODULE}.persistent_trainer.is_within_startup_grace_period", return_value=True) as in_grace,
+        patch(f"{MODULE}.persistent_trainer.mark_reachable") as mark_reachable,
+        patch(f"{MODULE}.httpx.AsyncClient", return_value=client),
+    ):
+        result = await RemoteTrainerService(MagicMock()).check_remote_trainer(trainer.id)
+
+    assert result.status == "starting"
+    in_grace.assert_called_once_with(trainer.id)
+    mark_reachable.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_check_remote_trainer_reports_unreachable_once_the_grace_period_has_elapsed() -> None:
+    """Past the startup grace period, a genuinely unreachable trainer is
+    reported as such - the whole point of the grace period is that it ends.
+    """
+    trainer = _trainer()
+    client = _Client([_Response({}, httpx.ConnectError("connection refused"))])
+
+    with (
+        patch.object(RemoteTrainerService, "get_remote_trainer", new=AsyncMock(return_value=trainer)),
+        patch(f"{MODULE}.persistent_trainer.get_launch_phase", return_value=None),
+        patch(f"{MODULE}.persistent_trainer.is_within_startup_grace_period", return_value=False),
+        patch(f"{MODULE}.httpx.AsyncClient", return_value=client),
+    ):
+        result = await RemoteTrainerService(MagicMock()).check_remote_trainer(trainer.id)
+
+    assert result.status == "unreachable"
+
+
+@pytest.mark.anyio
+async def test_check_remote_trainer_marks_reachable_once_healthy_again() -> None:
+    """A trainer that answers healthy clears its startup grace-period bookkeeping."""
+    trainer = _trainer()
+    client = _Client(
+        [
+            _Response({"status": "healthy"}),
+            _Response([{"type": "cuda", "name": "NVIDIA A100", "memory": None, "index": 0}]),
+            _Response({"total_bytes": 1, "free_bytes": 1}),
+        ]
+    )
+
+    with (
+        patch.object(RemoteTrainerService, "get_remote_trainer", new=AsyncMock(return_value=trainer)),
+        patch(f"{MODULE}.persistent_trainer.get_launch_phase", return_value=None),
+        patch(f"{MODULE}.persistent_trainer.mark_reachable") as mark_reachable,
+        patch(f"{MODULE}.httpx.AsyncClient", return_value=client),
+    ):
+        result = await RemoteTrainerService(MagicMock()).check_remote_trainer(trainer.id)
+
+    assert result.status == "healthy"
+    mark_reachable.assert_called_once_with(trainer.id)
 
 
 @pytest.mark.anyio
@@ -120,6 +225,35 @@ async def test_check_remote_trainer_reports_timeout_without_upstream_details() -
 
 
 @pytest.mark.anyio
+async def test_check_remote_trainer_requires_an_accelerator_for_studio_managed_trainers() -> None:
+    trainer = RemoteTrainer(
+        id=uuid4(),
+        name="managed",
+        url="http://127.0.0.1:8001",
+        connection_mode="ssh",
+        ssh_host_alias="gpu-box",
+        ssh_remote_port=8001,
+        ssh_local_port=8001,
+    )
+    client = _Client(
+        [
+            _Response({"status": "healthy"}),
+            _Response([]),
+            _Response({"total_bytes": 1, "free_bytes": 1}),
+        ]
+    )
+
+    with (
+        patch.object(RemoteTrainerService, "get_remote_trainer", new=AsyncMock(return_value=trainer)),
+        patch(f"{MODULE}.httpx.AsyncClient", return_value=client),
+    ):
+        result = await RemoteTrainerService(MagicMock()).check_remote_trainer(trainer.id)
+
+    assert result.status == "degraded"
+    assert result.reason_code == "container_accelerator_unavailable"
+
+
+@pytest.mark.anyio
 async def test_check_remote_trainer_reports_malformed_devices_as_degraded() -> None:
     trainer = _trainer()
     client = _Client([_Response({"status": "healthy"}), _Response({"not": "a list"})])
@@ -132,3 +266,47 @@ async def test_check_remote_trainer_reports_malformed_devices_as_degraded() -> N
 
     assert result.status == "degraded"
     assert result.reason_code == "invalid_devices_response"
+
+
+@pytest.mark.anyio
+async def test_check_remote_trainer_coalesces_concurrent_calls() -> None:
+    """Two callers checking the same trainer at once must trigger only one probe."""
+    trainer = _trainer()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    call_count = 0
+
+    class _SlowClient(_Client):
+        async def get(self, _url: str) -> _Response:
+            nonlocal call_count
+            if _url.endswith("/health"):
+                call_count += 1
+                started.set()
+                await release.wait()
+            return await super().get(_url)
+
+    client = _SlowClient(
+        [
+            _Response({"status": "healthy"}),
+            _Response([{"type": "cuda", "name": "NVIDIA A100", "memory": None, "index": 0}]),
+            _Response({"total_bytes": 1, "free_bytes": 1}),
+        ]
+    )
+
+    with (
+        patch.object(RemoteTrainerService, "get_remote_trainer", new=AsyncMock(return_value=trainer)),
+        patch(f"{MODULE}.httpx.AsyncClient", return_value=client) as async_client,
+    ):
+        service_a = RemoteTrainerService(MagicMock())
+        service_b = RemoteTrainerService(MagicMock())
+
+        task_a = asyncio.create_task(service_a.check_remote_trainer(trainer.id))
+        await started.wait()
+        task_b = asyncio.create_task(service_b.check_remote_trainer(trainer.id))
+        release.set()
+
+        result_a, result_b = await asyncio.gather(task_a, task_b)
+
+    assert call_count == 1
+    assert async_client.call_count == 1
+    assert result_a == result_b

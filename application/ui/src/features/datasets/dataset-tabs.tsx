@@ -1,8 +1,9 @@
 import { Suspense, useState } from 'react';
 
 import { ManagedTab, type ManagedTabAction } from '@geti-ui/blocks';
-import { ActionButton, DialogContainer, Flex, Icon, Item, Menu, MenuTrigger, TabList } from '@geti-ui/ui';
+import { ActionButton, DialogContainer, Icon, Item, Menu, MenuTrigger } from '@geti-ui/ui';
 import { Add } from '@geti-ui/ui/icons';
+import { Tab, TabList } from 'react-aria-components';
 import { useNavigate } from 'react-router';
 
 import { fetchClient } from '../../api/client';
@@ -13,6 +14,8 @@ import { NewDatasetForm } from '../../routes/datasets/new-dataset.component';
 import { useProjectId } from '../projects/use-project';
 import { DeleteDatasetDialog } from './delete-dataset-dialog';
 import { RenameDatasetDialog } from './rename-dataset-dialog';
+
+import styles from './dataset-tabs.module.css';
 
 type Dataset = SchemaDatasetOutput;
 
@@ -30,8 +33,8 @@ export const DatasetTabs = ({
     selectedDatasetId: string | undefined;
 }) => {
     const { project_id } = useProjectId();
-
-    const [action, setAction] = useState<null | 'rename' | 'delete' | 'add' | 'import'>(null);
+    const navigate = useNavigate();
+    const [action, setAction] = useState<null | 'rename' | 'delete' | 'create' | 'import'>(null);
     const selectedDataset = datasets.find((dataset) => dataset.id === selectedDatasetId);
 
     const openDatasetDownload = (datasetId: string) => {
@@ -55,8 +58,7 @@ export const DatasetTabs = ({
         }
     };
 
-    const navigate = useNavigate();
-    const onAddDataset = (dataset: SchemaDatasetOutput | undefined) => {
+    const handleCreateDataset = (dataset: SchemaDatasetOutput | undefined) => {
         setAction(null);
 
         if (dataset?.id) {
@@ -82,60 +84,57 @@ export const DatasetTabs = ({
     };
 
     return (
-        <Flex>
-            <TabList>
-                {datasets.map((dataset) => {
-                    return (
-                        <Item
-                            aria-label={dataset.name}
-                            key={dataset.id}
-                            href={paths.project.datasets.show({ project_id, dataset_id: dataset.id! })}
-                        >
-                            <ManagedTab
-                                label={dataset.name}
-                                isSelected={dataset.id === selectedDatasetId}
-                                actions={ACTIONS}
-                                onAction={onItemAction}
-                            />
-                        </Item>
-                    );
-                })}
-            </TabList>
+        <>
+            <div className={styles.tabBar}>
+                <TabList aria-label='Datasets' className={styles.tabList}>
+                    {datasets.map((dataset) => {
+                        const isSelected = dataset.id === selectedDatasetId;
 
-            <div
-                style={{
-                    display: 'flex',
-                    flex: '1 1 auto',
-                    alignItems: 'center',
-                    borderBottom: 'var(--spectrum-alias-border-size-thick) solid var(--spectrum-global-color-gray-300)',
-                }}
-            >
-                <MenuTrigger>
-                    <ActionButton
-                        isQuiet
-                        aria-label='Add dataset'
-                        onPress={() => {
-                            setAction('add');
-                        }}
-                    >
-                        <Icon>
-                            <Add />
-                        </Icon>
-                    </ActionButton>
-                    <Menu
-                        onAction={(key) => {
-                            if (key === 'add') {
-                                setAction('add');
-                            }
-                            if (key === 'import') {
-                                setAction('import');
-                            }
-                        }}
-                    >
-                        <Item key='add'>Add</Item>
-                        <Item key='import'>Import</Item>
-                    </Menu>
-                </MenuTrigger>
+                        return (
+                            <Tab className={styles.tab} id={dataset.id} key={dataset.id}>
+                                {isSelected ? (
+                                    <ManagedTab
+                                        label={dataset.name}
+                                        isSelected
+                                        actions={ACTIONS}
+                                        onAction={onItemAction}
+                                    />
+                                ) : (
+                                    dataset.name
+                                )}
+                            </Tab>
+                        );
+                    })}
+                </TabList>
+
+                <div className={styles.addActions}>
+                    <MenuTrigger>
+                        <ActionButton
+                            isQuiet
+                            aria-label='Create new dataset'
+                            onPress={() => {
+                                setAction('create');
+                            }}
+                        >
+                            <Icon>
+                                <Add />
+                            </Icon>
+                        </ActionButton>
+                        <Menu
+                            onAction={(key) => {
+                                if (key === 'create') {
+                                    setAction('create');
+                                }
+                                if (key === 'import') {
+                                    setAction('import');
+                                }
+                            }}
+                        >
+                            <Item key='create'>Create</Item>
+                            <Item key='import'>Import</Item>
+                        </Menu>
+                    </MenuTrigger>
+                </div>
             </div>
 
             <DialogContainer
@@ -144,9 +143,9 @@ export const DatasetTabs = ({
                 }}
             >
                 {action === 'import' && <ImportDatasetDialog onClose={() => setAction(null)} />}
-                {action === 'add' && (
+                {action === 'create' && (
                     <Suspense>
-                        <NewDatasetForm project_id={project_id} onDone={onAddDataset} />
+                        <NewDatasetForm project_id={project_id} onDone={handleCreateDataset} />
                     </Suspense>
                 )}
                 {action === 'rename' && selectedDataset !== undefined && (
@@ -164,6 +163,6 @@ export const DatasetTabs = ({
                     />
                 )}
             </DialogContainer>
-        </Flex>
+        </>
     );
 };
