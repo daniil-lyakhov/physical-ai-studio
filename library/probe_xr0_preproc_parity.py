@@ -96,6 +96,27 @@ def main() -> None:
     _report("pixel_values", train_out["pixel_values"].cpu().numpy(), np.asarray(runtime_out["pixel_values"]))
     _report("state", train_out["state"].cpu().numpy(), np.asarray(runtime_out["state"]))
 
+    # The training resize is antialiased bicubic (PIL-like); the runtime uses
+    # cv2.INTER_CUBIC, which does not prefilter. Re-run the deploy preprocessor
+    # with INTER_AREA (which does) to see how much of the pixel gap that closes.
+    import cv2
+    from physicalai.inference.preprocessors import xr0 as runtime_xr0
+
+    original_resize = runtime_xr0._resize_image  # noqa: SLF001
+
+    def _area_resize(image: np.ndarray, factor: int, max_pixels: int) -> np.ndarray:
+        resized = original_resize(image, factor=factor, max_pixels=max_pixels)
+        return cv2.resize(image, (resized.shape[1], resized.shape[0]), interpolation=cv2.INTER_AREA)
+
+    runtime_xr0._resize_image = _area_resize  # noqa: SLF001
+    try:
+        area_out: dict[str, object] = observation
+        for preprocessor in model.preprocessors:
+            area_out = preprocessor(area_out)
+    finally:
+        runtime_xr0._resize_image = original_resize  # noqa: SLF001
+    _report("pixel_values (INTER_AREA)", train_out["pixel_values"].cpu().numpy(), np.asarray(area_out["pixel_values"]))
+
 
 if __name__ == "__main__":
     main()
