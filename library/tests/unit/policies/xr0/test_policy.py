@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import types
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -23,8 +24,7 @@ from physicalai.export import ExportBackend
 from physicalai.export.backends import TorchExportParameters
 from physicalai.inference.data import InferenceFeatureDtype, InferenceFeatureType
 from physicalai.policies import get_physicalai_policy_class, get_policy
-from physicalai.policies.xr0 import XR0, XR0Config
-
+from physicalai.policies.xr0 import XR0, XR0Config, make_xr0_preprocessors
 
 
 def _minimal_export_stats() -> dict[str, dict[str, Any]]:
@@ -81,9 +81,31 @@ class TestXR0Config:
         assert "config" in policy.hparams
         assert policy.hparams["config"]["chunk_size"] == 30
 
+    def test_image_key_view_map_defaults_empty(self) -> None:
+        assert XR0().config.image_key_view_map == {}
+
+    def test_image_key_view_map_wiring(self) -> None:
+        view_map = {"images.top_camera": "ego", "images.pov_black_follower_camera": "wrist_left"}
+        policy = XR0(image_key_view_map=view_map)
+        assert policy.config.image_key_view_map == view_map
+        assert policy.hparams.image_key_view_map == view_map
+
 
 class TestXR0Policy:
     """Policy behaviour without an initialized model."""
+
+    def test_augmentation_only_on_training_forward(self) -> None:
+        policy = XR0(augment_images=True)
+        policy._preprocessor = MagicMock(return_value={})  # noqa: SLF001
+        policy.model = MagicMock()
+        obs = Observation(state=torch.randn(1, 8))
+
+        policy.forward(obs)
+        policy.compute_val_loss(obs)
+
+        assert policy.hparams.augment_images is True
+        assert policy._preprocessor.call_args_list[0].kwargs == {"augment_images": True}  # noqa: SLF001
+        assert policy._preprocessor.call_args_list[1].kwargs == {}  # noqa: SLF001
 
     @pytest.mark.parametrize("method", ["forward", "predict_action_chunk"])
     def test_methods_raise_without_model(self, method: str) -> None:
@@ -98,6 +120,46 @@ class TestXR0Policy:
         # eval forward routes to predict_action_chunk, which raises without a model
         with pytest.raises(ValueError, match="not initialized"):
             policy(obs)
+
+
+class TestSetActionStats:
+    """Installing per-timestep action statistics on the policy."""
+
+    def test_stats_are_stored_and_checkpointed(self) -> None:
+        policy = XR0(chunk_size=4, n_action_steps=4)
+        shape = (policy.config.chunk_size, policy.config.max_action_dim)
+        mean = torch.full(shape, 0.5)
+        std = torch.full(shape, 2.0)
+
+        policy.set_action_stats(mean, std)
+
+        assert torch.allclose(policy._action_mean, mean)  # noqa: SLF001
+        assert torch.allclose(policy._action_std, std)  # noqa: SLF001
+        # mirrored into hparams so they survive a checkpoint round-trip.
+        assert policy.hparams["action_mean"] == mean.tolist()
+        assert policy.hparams["action_std"] == std.tolist()
+
+    def test_non_float_input_is_converted(self) -> None:
+        policy = XR0(chunk_size=4, n_action_steps=4)
+        shape = (policy.config.chunk_size, policy.config.max_action_dim)
+        policy.set_action_stats(torch.zeros(shape, dtype=torch.float64), torch.ones(shape, dtype=torch.float64))
+        assert policy._action_mean.dtype is torch.float32  # noqa: SLF001
+
+    @pytest.mark.parametrize("bad", ["per_dim", "wrong_chunk", "wrong_width"])
+    def test_wrong_shape_raises(self, bad: str) -> None:
+        policy = XR0(chunk_size=4, n_action_steps=4)
+        chunk, width = policy.config.chunk_size, policy.config.max_action_dim
+        shapes = {
+            "per_dim": (width,),  # per-dimension stats are no longer accepted
+            "wrong_chunk": (chunk + 1, width),
+            "wrong_width": (chunk, width - 1),
+        }
+        good = torch.zeros(chunk, width)
+        bad_tensor = torch.zeros(shapes[bad])
+        with pytest.raises(ValueError, match="must have shape"):
+            policy.set_action_stats(bad_tensor, good.clone())
+        with pytest.raises(ValueError, match="must have shape"):
+            policy.set_action_stats(good.clone(), bad_tensor)
 
 
 class TestXR0Features:
@@ -147,6 +209,21 @@ class TestXR0Factory:
 
 class TestXR0Export:
     """Torch export hooks (no model download)."""
+
+    def test_openvino_export_preserves_image_view_map(self) -> None:
+        view_map = {"images.top_camera": "ego", "images.wrist_camera": "wrist_left"}
+        policy = XR0(image_key_view_map=view_map)
+        policy.model = object()  # type: ignore[assignment]
+        policy._preprocessor, policy._postprocessor = make_xr0_preprocessors()
+        policy._preprocessor._processor = types.SimpleNamespace(  # noqa: SLF001
+            image_processor=types.SimpleNamespace(
+                image_mean=[0.0] * 3, image_std=[1.0] * 3,
+                rescale_factor=1.0, patch_size=14, merge_size=2, temporal_patch_size=2,
+            ),
+        )
+
+        spec = policy.extra_export_args["openvino"].preprocessors_specs[0]
+        assert spec.model_dump()["image_key_view_map"] == view_map
 
     def test_supported_backends_torch_and_openvino(self) -> None:
         assert XR0.get_supported_export_backends() == [ExportBackend.TORCH, ExportBackend.OPENVINO]
@@ -270,21 +347,20 @@ class TestXR0DeltaMode:
         std: list[list[float]] | None,
         expect_stats: bool,
     ) -> None:
-        policy = XR0(action_mode="delta", action_delta_mean=mean, action_delta_std=std)
+        policy = XR0(action_mode="delta", action_mean=mean, action_std=std)
         if expect_stats:
             # Stored as float32 tensors for the preprocessor and mirrored into
             # hparams as plain lists so they round-trip through checkpoints.
-            assert isinstance(policy._action_delta_mean, torch.Tensor)
-            assert isinstance(policy._action_delta_std, torch.Tensor)
-            assert policy._action_delta_mean.dtype is torch.float32
-            assert policy._action_delta_std.dtype is torch.float32
-            assert policy.hparams["action_delta_mean"] == mean
-            assert policy.hparams["action_delta_std"] == std
+            assert isinstance(policy._action_mean, torch.Tensor)
+            assert isinstance(policy._action_std, torch.Tensor)
+            assert policy._action_mean.dtype is torch.float32
+            assert policy._action_std.dtype is torch.float32
+            assert policy.hparams["action_mean"] == mean
+            assert policy.hparams["action_std"] == std
         else:
-            assert policy._action_delta_mean is None
-            assert policy._action_delta_std is None
+            assert policy._action_mean is None
+            assert policy._action_std is None
             # ``save_hyperparameters`` still captures the init args, but they are
             # left as ``None`` (not overwritten with the mirrored lists).
-            assert policy.hparams["action_delta_mean"] is None
-            assert policy.hparams["action_delta_std"] is None
-
+            assert policy.hparams["action_mean"] is None
+            assert policy.hparams["action_std"] is None

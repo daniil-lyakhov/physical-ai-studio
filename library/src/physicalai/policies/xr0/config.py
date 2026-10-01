@@ -9,7 +9,7 @@ vision-language-action model (Qwen3-VL-4B backbone + DiT action expert).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from physicalai.config import Config
@@ -61,6 +61,11 @@ class XR0Config(Config):
             (256, 256).
         tokenizer_max_length: Maximum length for tokenizer output. Defaults to
             256.
+        image_key_view_map: Mapping from dataset image key to canonical XR0 view
+            name (``"ego"``, ``"base"``, ``"wrist_left"`` or ``"wrist_right"``).
+            Keys must match the flattened batch image keys (e.g.
+            ``"images.top_camera"``). The prompt uses canonical view order.
+            Defaults to an empty mapping, keeping the dataset's names and order.
         gradient_checkpointing: Enable gradient checkpointing for memory
             optimization. Defaults to True.
         compile_model: Whether to use torch.compile. Defaults to False.
@@ -83,8 +88,8 @@ class XR0Config(Config):
             per-step delta relative to the current state (``action[t] - state``),
             matching the pretrained XR0 flow head's delta prior; the inverse
             (``delta + state``) is applied at inference. Delta mode requires
-            per-timestep delta stats supplied via ``action_delta_mean`` /
-            ``action_delta_std``.
+            per-timestep delta stats supplied via ``action_mean`` /
+            ``action_std``.
         normalization_mode: Normalization method for state/action features.
             ``"QUANTILES"`` maps data to [-1, 1] using the 1st and 99th
             percentiles; ``"MEAN_STD"`` uses zero-mean unit-variance
@@ -138,6 +143,7 @@ class XR0Config(Config):
 
     image_resolution: tuple[int, int] = (256, 256)
     tokenizer_max_length: int = 256
+    image_key_view_map: dict[str, str] = field(default_factory=dict)
 
     gradient_checkpointing: bool = True
     compile_model: bool = False
