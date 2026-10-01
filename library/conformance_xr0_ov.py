@@ -182,7 +182,8 @@ def main() -> None:
 
         manifest = json.loads((Path(MODEL_PATH) / "manifest.json").read_text())
         ir_xml = Path(MODEL_PATH) / manifest["model"]["artifacts"]["openvino"]
-        outputs = _run_ir_with_pinned_noise(ir_xml, model._prepare_inputs(graph_inputs))  # noqa: SLF001
+        feed = model._prepare_inputs(graph_inputs)  # noqa: SLF001
+        outputs = _run_ir_with_pinned_noise(ir_xml, feed)
         noise = outputs.pop("noise")
         raw_action = np.asarray(outputs["action"]).copy()
 
@@ -196,6 +197,10 @@ def main() -> None:
             pred=pred,
             state=observation[STATE],
             target=target[: pred.shape[0]],
+            input_ids=feed["tokenized_prompt"],
+            attention_mask=feed["tokenized_prompt_mask"],
+            pixel_values=feed["pixel_values"],
+            model_state=feed["state"],
         )
         print(f"paired OpenVINO result saved to {PAIR_PATH}")
     else:

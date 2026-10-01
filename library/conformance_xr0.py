@@ -90,11 +90,27 @@ def main() -> None:
             msg = "The saved OpenVINO result used a different dataset frame; rerun both scripts with the same seed"
             raise ValueError(msg)
         noise = torch.from_numpy(pair["noise"].copy())
+        ov_inputs = {
+            key: pair[key].copy() for key in ("input_ids", "attention_mask", "pixel_values", "model_state")
+        }
 
     with torch.no_grad():
-        # Replay the noise from the OpenVINO run, not an independent draw.
+        # Use exactly the graph inputs and noise from the OpenVINO run; keep
+        # image_grid_thw from eager preprocessing (the same fixed image geometry).
         observation = batch.to(policy.device).to_dict()
         processed = policy._preprocessor(observation)  # noqa: SLF001
+        valid = int(ov_inputs["attention_mask"].sum())
+        eager_ids = processed["input_ids"].cpu().numpy().reshape(-1)
+        ov_ids = ov_inputs["input_ids"].reshape(-1)
+        print(f"input tokens: eager {len(eager_ids)}, OpenVINO valid {valid}, equal prefix: {np.array_equal(eager_ids, ov_ids[:valid])}")
+        eager_pixels = processed["pixel_values"].float().cpu().numpy()
+        if eager_pixels.shape != ov_inputs["pixel_values"].shape:
+            msg = f"Pixel shapes differ: PyTorch {eager_pixels.shape}, OpenVINO {ov_inputs['pixel_values'].shape}"
+            raise ValueError(msg)
+        print(f"input pixel max abs difference: {np.abs(eager_pixels - ov_inputs['pixel_values']).max():.6f}")
+        for name, key in (("input_ids", "input_ids"), ("attention_mask", "attention_mask"),
+                          ("pixel_values", "pixel_values"), ("state", "model_state")):
+            processed[name] = torch.from_numpy(ov_inputs[key]).to(policy.device)
         noise = noise.to(device=policy.device, dtype=torch.float32)
         actions = policy.model._run(processed, return_loss=False, noise=noise)  # noqa: SLF001
         pred = policy._postprocessor({ACTION: actions, STATE: observation[STATE]})[ACTION]  # noqa: SLF001
