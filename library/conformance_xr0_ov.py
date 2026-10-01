@@ -41,10 +41,12 @@ PRECISION_HINT = "f32"
 # training used antialiased bicubic, so the deployed model sees aliased images.
 # INTER_AREA prefilters on downscale; flip this to measure the action impact.
 USE_AREA_RESIZE = True
-# The IR draws its rectified-flow noise internally. It is dumped here so
-# conformance_xr0.py can replay the exact same noise through the eager model,
-# making the two runs directly comparable instead of two independent samples.
-NOISE_PATH = Path("xr0_shared_noise.npy")
+# False: original Runtime inference. True: pin and capture the IR's noise for
+# a paired Torch/OpenVINO comparison; changing the seed changes the prediction.
+PIN_NOISE = False
+# The paired prediction, noise and observation are saved together so Torch can
+# verify it is comparing the same frame, not just replaying an unrelated draw.
+PAIR_PATH = Path("xr0_conformance_pair.npz")
 # The export bakes ``global_seed=0`` / ``op_seed=0``, which OpenVINO reads as
 # "fresh seed every run". Non-zero seeds make the drawn noise reproducible.
 OV_RANDOM_UNIFORM_GLOBAL_SEED = 42
@@ -145,6 +147,8 @@ def main() -> None:
     dm = LeRobotDataModule(
         root=DATASET_ROOT,
         train_batch_size=1,
+        num_workers=0,
+        pin_memory=False,
         episodes=[EPISODE],
         val_split=0.0,
         data_format="physicalai",
@@ -169,21 +173,35 @@ def main() -> None:
         _patch_area_resize()
     model = InferenceModel(MODEL_PATH, device=DEVICE, INFERENCE_PRECISION_HINT=PRECISION_HINT)
 
-    # Drive the exported pipeline by hand so the IR's internal noise can be
-    # pinned and dumped: preprocessors -> IR (fixed seed) -> postprocessors.
-    graph_inputs: dict = observation
-    for preprocessor in model.preprocessors:
-        graph_inputs = preprocessor(graph_inputs)
+    if PIN_NOISE:
+        # Diagnostic only: expose the graph's sampled noise and replay it in
+        # Torch. This does not change the exported IR on disk.
+        graph_inputs: dict = observation
+        for preprocessor in model.preprocessors:
+            graph_inputs = preprocessor(graph_inputs)
 
-    manifest = json.loads((Path(MODEL_PATH) / "manifest.json").read_text())
-    ir_xml = Path(MODEL_PATH) / manifest["model"]["artifacts"]["openvino"]
-    outputs = _run_ir_with_pinned_noise(ir_xml, graph_inputs)
-    np.save(NOISE_PATH, outputs.pop("noise"))
-    print(f"noise dumped to {NOISE_PATH}")
+        manifest = json.loads((Path(MODEL_PATH) / "manifest.json").read_text())
+        ir_xml = Path(MODEL_PATH) / manifest["model"]["artifacts"]["openvino"]
+        outputs = _run_ir_with_pinned_noise(ir_xml, model._prepare_inputs(graph_inputs))  # noqa: SLF001
+        noise = outputs.pop("noise")
+        raw_action = np.asarray(outputs["action"]).copy()
 
-    for postprocessor in model.postprocessors:
-        outputs = postprocessor(outputs)
-    pred = np.asarray(outputs["action"]).reshape(-1, outputs["action"].shape[-1])[..., :ACTION_DIM]
+        for postprocessor in model.postprocessors:
+            outputs = postprocessor(outputs)
+        pred = np.asarray(outputs["action"]).reshape(-1, outputs["action"].shape[-1])[..., :ACTION_DIM]
+        np.savez(
+            PAIR_PATH,
+            noise=noise,
+            raw_action=raw_action,
+            pred=pred,
+            state=observation[STATE],
+            target=target[: pred.shape[0]],
+        )
+        print(f"paired OpenVINO result saved to {PAIR_PATH}")
+    else:
+        # Original deployment path (fresh noise); ignore any saved noise file.
+        PAIR_PATH.unlink(missing_ok=True)
+        pred = model.predict_action_chunk(observation)[..., :ACTION_DIM]
 
     target = target[: pred.shape[0]]
     err = np.abs(pred - target)
