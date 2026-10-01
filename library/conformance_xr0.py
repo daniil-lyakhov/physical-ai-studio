@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from physicalai.data import LeRobotDataModule
+from physicalai.data.observation import ACTION, STATE
 from physicalai.policies import XR0
 from physicalai.train.utils import reformat_dataset_to_match_policy
 
@@ -25,6 +26,10 @@ ACTION_DIM = 6
 # Shared with conformance_xr0_ov.py so both pick the *same* shuffled frame
 # (same reference target) and the same rectified-flow noise -> fair 1-to-1.
 SEED = 0
+# Noise the IR drew, dumped by conformance_xr0_ov.py. Replaying it here removes
+# sampling as a source of eager-vs-OV difference. Falls back to a seeded draw
+# when the file is absent (run the OV script first to get a matched pair).
+NOISE_PATH = Path("xr0_shared_noise.npy")
 
 
 IMAGE_KEY_VIEW_MAP = {
@@ -70,12 +75,27 @@ def main() -> None:
     target = batch.action[..., :ACTION_DIM].reshape(-1, ACTION_DIM).cpu().numpy()
 
     with torch.no_grad():
-        # Seed again so the flow noise (torch.randn inside _sample_noise) is
-        # reproducible run-to-run.
-        torch.manual_seed(SEED)
-        pred = policy.predict_action_chunk(batch)
+        # Replay the IR's noise (or a seeded draw) instead of letting
+        # ``_sample_noise`` sample freely, so both backends denoise from the
+        # identical starting point.
+        observation = batch.to(policy.device).to_dict()
+        processed = policy._preprocessor(observation)  # noqa: SLF001
+        if NOISE_PATH.exists():
+            noise = torch.from_numpy(np.load(NOISE_PATH))
+            print(f"replaying noise from {NOISE_PATH} {tuple(noise.shape)}")
+        else:
+            generator = torch.Generator().manual_seed(SEED)
+            noise = torch.randn(
+                (1, policy.model.action_shape[-2], policy.model.action_shape[-1]),
+                generator=generator,
+            )
+            print(f"{NOISE_PATH} not found -- using a seeded draw {tuple(noise.shape)}")
+        noise = noise.to(device=policy.device, dtype=torch.float32)
+        actions = policy.model._run(processed, return_loss=False, noise=noise)  # noqa: SLF001
+        pred = policy._postprocessor({ACTION: actions, STATE: observation[STATE]})[ACTION]  # noqa: SLF001
     pred = pred[..., :ACTION_DIM].reshape(-1, ACTION_DIM).cpu().numpy()
 
+    target = target[: pred.shape[0]]
     err = np.abs(pred - target)
     print(f"pred shape {pred.shape}  target shape {target.shape}")
     print(f"per-dim MAE: {np.round(err.mean(0), 4)}")

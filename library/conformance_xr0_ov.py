@@ -12,9 +12,14 @@ run inside ``predict_action_chunk``, so we only feed it a raw observation.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
+import openvino as ov
 import torch
 from lerobot.datasets.feature_utils import check_delta_timestamps, get_delta_indices
+from openvino.preprocess import PrePostProcessor
 
 from physicalai.data import LeRobotDataModule
 from physicalai.inference import InferenceModel
@@ -36,6 +41,14 @@ PRECISION_HINT = "f32"
 # training used antialiased bicubic, so the deployed model sees aliased images.
 # INTER_AREA prefilters on downscale; flip this to measure the action impact.
 USE_AREA_RESIZE = True
+# The IR draws its rectified-flow noise internally. It is dumped here so
+# conformance_xr0.py can replay the exact same noise through the eager model,
+# making the two runs directly comparable instead of two independent samples.
+NOISE_PATH = Path("xr0_shared_noise.npy")
+# The export bakes ``global_seed=0`` / ``op_seed=0``, which OpenVINO reads as
+# "fresh seed every run". Non-zero seeds make the drawn noise reproducible.
+OV_RANDOM_UNIFORM_GLOBAL_SEED = 42
+OV_RANDOM_UNIFORM_OP_SEED = 7
 # Must match conformance_xr0.py so both scripts select the same shuffled frame
 # (identical reference target) for a fair comparison.
 SEED = 0
@@ -70,6 +83,64 @@ def _patch_area_resize() -> None:
     runtime_xr0._resize_image = _area_resize  # noqa: SLF001
 
 
+def _find_noise_node(model: ov.Model) -> ov.Node:
+    """Locate the Box-Muller Gaussian-noise node in the exported IR.
+
+    ``torch.randn`` lowers to a ``RandomUniform`` followed by
+    ``sqrt(-2*log(u1)) * cos(2*pi*u2)``; the final ``Multiply`` is the noise.
+
+    Returns:
+        The ``Multiply`` node producing the rectified-flow starting noise.
+
+    Raises:
+        RuntimeError: If the Box-Muller ``Multiply`` cannot be found.
+    """
+    for op in model.get_ops():
+        if op.get_type_name() != "Multiply":
+            continue
+        parents = {op.input_value(i).get_node().get_type_name() for i in range(len(op.inputs()))}
+        if {"Sqrt", "Cos"} <= parents:
+            return op
+    msg = "Could not locate the Box-Muller noise node (Sqrt*Cos) in the IR."
+    raise RuntimeError(msg)
+
+
+def _run_ir_with_pinned_noise(ir_xml: Path, graph_inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Run the IR with a pinned noise seed, returning its outputs plus the noise.
+
+    Returns:
+        The graph outputs keyed by name, with the drawn noise under ``"noise"``.
+
+    Raises:
+        RuntimeError: If the IR has no ``RandomUniform`` node to pin.
+    """
+    core = ov.Core()
+    model = core.read_model(ir_xml)
+
+    for op in model.get_ops():
+        if op.get_type_name() == "RandomUniform":
+            op.set_attribute("global_seed", OV_RANDOM_UNIFORM_GLOBAL_SEED)
+            op.set_attribute("op_seed", OV_RANDOM_UNIFORM_OP_SEED)
+            break
+    else:
+        msg = "Could not locate a RandomUniform node to pin the noise seed in the IR."
+        raise RuntimeError(msg)
+
+    output_names = [output.get_any_name() for output in model.outputs]
+    feed = {name: graph_inputs[name] for name in (inp.get_any_name() for inp in model.inputs)}
+    # Expose the noise as an extra output, cast to f32 so NumPy can read it.
+    model.add_outputs(_find_noise_node(model).output(0))
+    ppp = PrePostProcessor(model)
+    ppp.output(len(output_names)).tensor().set_element_type(ov.Type.f32)
+    model = ppp.build()
+
+    compiled = core.compile_model(model, DEVICE, {"INFERENCE_PRECISION_HINT": PRECISION_HINT})
+    result = compiled(feed)
+    outputs = {name: np.asarray(result[compiled.output(i)]) for i, name in enumerate(output_names)}
+    outputs["noise"] = np.asarray(result[compiled.output(len(output_names))])
+    return outputs
+
+
 def main() -> None:
     dm = LeRobotDataModule(
         root=DATASET_ROOT,
@@ -97,8 +168,24 @@ def main() -> None:
     if USE_AREA_RESIZE:
         _patch_area_resize()
     model = InferenceModel(MODEL_PATH, device=DEVICE, INFERENCE_PRECISION_HINT=PRECISION_HINT)
-    pred = model.predict_action_chunk(observation)[..., :ACTION_DIM]
 
+    # Drive the exported pipeline by hand so the IR's internal noise can be
+    # pinned and dumped: preprocessors -> IR (fixed seed) -> postprocessors.
+    graph_inputs: dict = observation
+    for preprocessor in model.preprocessors:
+        graph_inputs = preprocessor(graph_inputs)
+
+    manifest = json.loads((Path(MODEL_PATH) / "manifest.json").read_text())
+    ir_xml = Path(MODEL_PATH) / manifest["model"]["artifacts"]["openvino"]
+    outputs = _run_ir_with_pinned_noise(ir_xml, graph_inputs)
+    np.save(NOISE_PATH, outputs.pop("noise"))
+    print(f"noise dumped to {NOISE_PATH}")
+
+    for postprocessor in model.postprocessors:
+        outputs = postprocessor(outputs)
+    pred = np.asarray(outputs["action"]).reshape(-1, outputs["action"].shape[-1])[..., :ACTION_DIM]
+
+    target = target[: pred.shape[0]]
     err = np.abs(pred - target)
     print(f"pred shape {pred.shape}  target shape {target.shape}")
     print(f"per-dim MAE: {np.round(err.mean(0), 4)}")
