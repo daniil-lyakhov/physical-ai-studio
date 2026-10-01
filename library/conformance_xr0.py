@@ -18,7 +18,7 @@ from physicalai.train.utils import reformat_dataset_to_match_policy
 
 CKPT = "experiments/xr0_Put-the-yellow-ball-to-the-black-box/checkpoints/last.ckpt"
 CHECKPOINT = "/home/devuser/dlyakhov/physical-ai-studio/library/experiments/Put_different_box_10/checkpoints/last.ckpt"
-N_ACTION_STEPS = 30
+N_ACTION_STEPS = 10  # Match export_xr0_local.py; the IR trims 30 predictions to 10.
 
 DATASET_ROOT = "/home/devuser/dlyakhov/datasets/Put-different-balls-to-the-box"
 EPISODE = 3
@@ -35,7 +35,9 @@ IMAGE_KEY_VIEW_MAP = {
     "images.pov_black_follower_camera": "wrist_left",
 }
 def main() -> None:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Prefer the Intel GPU for a same-machine PyTorch vs OpenVINO comparison.
+    device = "xpu" if torch.xpu.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"PyTorch inference device: {device}")
 
     datamodule = LeRobotDataModule(root=str(DATASET_ROOT), data_format="physicalai")
     datamodule.setup("fit")
@@ -59,6 +61,8 @@ def main() -> None:
     dm = LeRobotDataModule(
         root=DATASET_ROOT,
         train_batch_size=1,
+        num_workers=0,
+        pin_memory=False,
         episodes=[EPISODE],
         val_split=0.0,
         data_format="physicalai",
@@ -94,14 +98,24 @@ def main() -> None:
         noise = noise.to(device=policy.device, dtype=torch.float32)
         actions = policy.model._run(processed, return_loss=False, noise=noise)  # noqa: SLF001
         pred = policy._postprocessor({ACTION: actions, STATE: observation[STATE]})[ACTION]  # noqa: SLF001
-    pred = pred[..., :ACTION_DIM].reshape(-1, ACTION_DIM).cpu().numpy()
+    # Eager _postprocessor keeps all 30 steps; the exported Runtime also trims
+    # the chunk to n_action_steps. Compare the steps the robot would execute.
+    pred = pred[..., :ACTION_DIM].reshape(-1, ACTION_DIM).cpu().numpy()[: len(ov_pred)]
 
     raw_action = actions.float().cpu().numpy()
     if raw_action.shape != ov_raw_action.shape:
         msg = f"Raw action shapes differ: PyTorch {raw_action.shape}, OpenVINO {ov_raw_action.shape}"
         raise ValueError(msg)
+    if not np.isfinite(raw_action).all() or not np.isfinite(ov_raw_action).all():
+        raise ValueError("Raw model action contains NaN or infinity")
     raw_err = np.abs(raw_action - ov_raw_action)
     print(f"raw model OpenVINO vs PyTorch: MAE {raw_err.mean():.4f}   max abs {raw_err.max():.4f}")
+    torch_active = raw_action.reshape(-1, raw_action.shape[-1])[:, :ACTION_DIM]
+    ov_active = ov_raw_action.reshape(-1, ov_raw_action.shape[-1])[:, :ACTION_DIM]
+    active_err = np.abs(torch_active - ov_active)
+    print(f"raw active-joint per-dim MAE: {np.round(active_err.mean(0), 4)}")
+    for t in (0, torch_active.shape[0] // 2, torch_active.shape[0] - 1):
+        print(f"  raw t={t}: OpenVINO {np.round(ov_active[t], 4)}  PyTorch {np.round(torch_active[t], 4)}")
 
     if pred.shape != ov_pred.shape:
         msg = f"Output shapes differ: PyTorch {pred.shape}, OpenVINO {ov_pred.shape}; check n_action_steps"

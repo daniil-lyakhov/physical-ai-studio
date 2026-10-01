@@ -201,7 +201,31 @@ def main() -> None:
     else:
         # Original deployment path (fresh noise); ignore any saved noise file.
         PAIR_PATH.unlink(missing_ok=True)
-        pred = model.predict_action_chunk(observation)[..., :ACTION_DIM]
+        # Capture the runner output from the *same* inference; a second call
+        # would draw different noise and could not be compared to this pred.
+        original_predict = model.adapter.predict
+        raw_outputs: dict[str, np.ndarray] = {}
+
+        def capture_raw(inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+            outputs = original_predict(inputs)
+            raw_outputs["action"] = np.array(outputs["action"], copy=True)
+            return outputs
+
+        model.adapter.predict = capture_raw
+        try:
+            pred = model.predict_action_chunk(observation)[..., :ACTION_DIM]
+        finally:
+            model.adapter.predict = original_predict
+        raw_action = raw_outputs["action"]
+
+    # These are normalized delta actions, before denormalization, state
+    # addition and chunk trimming. Do not compare them with absolute targets.
+    raw_active = raw_action.reshape(-1, raw_action.shape[-1])[:, :ACTION_DIM]
+    if not np.isfinite(raw_action).all():
+        raise ValueError("OpenVINO raw model action contains NaN or infinity")
+    print(f"raw OpenVINO action: shape {raw_action.shape}, range [{raw_active.min():.4f}, {raw_active.max():.4f}]")
+    for t in (0, raw_active.shape[0] // 2, raw_active.shape[0] - 1):
+        print(f"  raw t={t}: {np.round(raw_active[t], 4)}")
 
     target = target[: pred.shape[0]]
     err = np.abs(pred - target)
