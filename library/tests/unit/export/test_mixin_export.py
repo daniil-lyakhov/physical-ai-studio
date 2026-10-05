@@ -670,6 +670,50 @@ class TestToExecutorch:
             # Assert CompileSpec was called with ("device", b"GPU")
             mock_compile_spec.assert_called_once_with("device", b"GPU")
 
+    def test_to_executorch_compresses_openvino_weights_before_lowering(self, tmp_path: Path) -> None:
+        """INT8 compression re-exports the program before delegate lowering."""
+        model = ModelWithSampleInput()
+        wrapper = ExportWrapper(model)
+        mocks = self._mock_executorch_modules()
+        aten_program = MagicMock()
+        compressed_module = MagicMock()
+        compressed_program = MagicMock()
+        nncf = MagicMock()
+        nncf.CompressWeightsMode.INT8_SYM = "int8_sym"
+        nncf.compress_weights.return_value = compressed_module
+
+        with (
+            patch.dict("sys.modules", {**mocks["modules"], "nncf": nncf}),
+            patch("torch.export.export", side_effect=[aten_program, compressed_program]) as export,
+        ):
+            wrapper.to_executorch(
+                tmp_path / "model.pte",
+                delegate="openvino",
+                delegate_config={"compress_weights": "int8_sym"},
+            )
+
+        nncf.compress_weights.assert_called_once_with(aten_program.module.return_value, mode="int8_sym")
+        assert export.call_count == 2
+        assert export.call_args.args[0] is compressed_module
+        assert set(export.call_args.args[1][0]) == {"input_tensor"}
+        assert export.call_args.args[1][0]["input_tensor"].device.type == "cpu"
+        assert mocks["mock_to_edge"].call_args.args == (compressed_program,)
+
+    def test_to_executorch_compression_requires_nncf(self, tmp_path: Path) -> None:
+        """Requesting compression without NNCF gives an install hint."""
+        wrapper = ExportWrapper(ModelWithSampleInput())
+        mocks = self._mock_executorch_modules()
+        with (
+            patch.dict("sys.modules", {**mocks["modules"], "nncf": None}),
+            patch("torch.export.export", return_value=MagicMock()),
+            pytest.raises(ImportError, match=r"physicalai-train\[nncf\]"),
+        ):
+            wrapper.to_executorch(
+                tmp_path / "model.pte",
+                delegate="openvino",
+                delegate_config={"compress_weights": "int8_sym"},
+            )
+
     def test_export_dispatches_to_executorch(self, tmp_path):
         """Test that export() dispatcher calls to_executorch()."""
         model = ModelWithSampleInput(input_dim=10, output_dim=5)
