@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fine-tune XR0 on LIBERO-10 gym task 1 from local LeRobot demonstrations.
+"""Fine-tune XR0 conservatively on one LIBERO-10 gym task 1 demonstration.
 
 Run on the training server with a local dataset directory and fine-tune the
 Xiaomi-Robotics-0-Pretrain base checkpoint from Hugging Face. XR0 loads its
@@ -12,6 +12,9 @@ downloaded by this script. The gym emits image2 instead of wrist_image;
 rename that gym view before evaluating this checkpoint.
 Gym task 1 is "put both the cream cheese box and the butter in the basket";
 its LeRobot task_index is not the same as the gym task ID.
+This run uses the lowest-index matching episode and has no validation split.
+Compare intermediate checkpoints on separate evaluation data: training loss on
+one episode cannot measure generalization.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 from lerobot.datasets.io_utils import load_episodes
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 from physicalai.data import FeatureType, LeRobotDataModule
 from physicalai.policies import XR0
@@ -35,13 +38,13 @@ CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-Pretrain"
 
 
 def _task_episodes(data_root: Path) -> list[int]:
-    """Select only episodes for LIBERO-10 gym task 1 from local metadata.
+    """Select the lowest-index LIBERO-10 gym task 1 episode from local metadata.
 
     Returns:
-        Sorted episode indices for the selected task.
+        A list containing the selected episode index.
 
     Raises:
-        ValueError: If an episode mixes tasks or there are too few episodes to split.
+        ValueError: If an episode mixes tasks or none match the task.
     """
     selected = []
     for episode in load_episodes(data_root):
@@ -53,14 +56,14 @@ def _task_episodes(data_root: Path) -> list[int]:
             raise ValueError(msg)
         selected.append(int(episode["episode_index"]))
 
-    if len(selected) <= 1:
-        msg = f"Need at least two LIBERO-10 task 1 episodes for train/validation, found {len(selected)}"
+    if not selected:
+        msg = "No LIBERO-10 task 1 episodes found in the local dataset"
         raise ValueError(msg)
-    return sorted(selected)
+    return [min(selected)]
 
 
 def main() -> None:
-    """Fine-tune on demonstrations, selecting the checkpoint with the best held-out loss.
+    """Fine-tune on one demonstration and save intermediate checkpoints.
 
     Raises:
         ValueError: If the dataset does not expose flat LIBERO actions.
@@ -83,8 +86,7 @@ def main() -> None:
         episodes=_task_episodes(data_root),
         data_format="physicalai",
         train_batch_size=16,
-        val_split=0.1,
-        val_split_seed=42,
+        val_split=0.0,
         num_workers=0,
     )
     policy = XR0(
@@ -96,9 +98,9 @@ def main() -> None:
         normalize_state=False,
         action_mode="delta",
         augment_images=True,
-        freeze_vision_encoder=True,
-        optimizer_lr=2.5e-5,
-        scheduler_warmup_steps=500,
+        freeze_vision_encoder=False,
+        optimizer_lr=1e-5,
+        scheduler_warmup_steps=20,
         scheduler_decay_steps=None,
     )
 
@@ -131,17 +133,22 @@ def main() -> None:
     policy.set_action_stats(mean, std)
 
     trainer = Trainer(
-        experiment_name="xr0_libero_task_1",
-        max_steps=10_000,
+        experiment_name="xr0_libero_task_1_one_episode_transfer",
+        max_steps=300,
         accelerator="gpu",
         devices=1,
         precision="bf16-mixed",
         accumulate_grad_batches=1,
-        val_check_interval=min(1_000, len(datamodule.train_dataloader())),
-        check_val_every_n_epoch=None,
+        limit_val_batches=0,
+        log_every_n_steps=10,
         callbacks=[
-            ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=1, save_last=True),
-            EarlyStopping(monitor="val/loss", mode="min", patience=5),
+            ModelCheckpoint(
+                monitor=None,
+                save_top_k=-1,
+                save_last=True,
+                every_n_train_steps=50,
+                filename="step-{step:06d}",
+            ),
         ],
     )
     trainer.fit(model=policy, datamodule=datamodule)
