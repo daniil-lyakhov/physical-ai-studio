@@ -74,7 +74,7 @@ def main() -> None:
         freeze_vision_encoder=False,
         optimizer_lr=5e-5,
         optimizer_weight_decay=0.01,
-        scheduler_warmup_steps=2_000,
+        scheduler_warmup_steps=1_200,
         scheduler_decay_steps=None,
     )
 
@@ -108,11 +108,11 @@ def main() -> None:
 
     trainer = Trainer(
         experiment_name="xr0_libero_10_full",
-        max_steps=30_000,
+        max_steps=24_000,
         accelerator="gpu",
         devices=1,
         precision="bf16-mixed",
-        accumulate_grad_batches=1,
+        accumulate_grad_batches=4,
         limit_val_batches=0,
         log_every_n_steps=10,
         callbacks=[
