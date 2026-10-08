@@ -94,6 +94,15 @@ class XR0Config(Config):
             ``"QUANTILES"`` maps data to [-1, 1] using the 1st and 99th
             percentiles; ``"MEAN_STD"`` uses zero-mean unit-variance
             normalization. Defaults to ``"QUANTILES"``.
+        optimizer_type: Which AdamW implementation to use. ``"adamw4bit"``
+            (default) and ``"adamw8bit"`` are torchao's low-bit variants, which
+            keep the Adam moments quantized and cut optimizer memory roughly 4x
+            and 2x respectively versus fp32 moments. Both also apply stochastic
+            rounding to the parameter update when ``dtype="bfloat16"``, without
+            which updates smaller than half a bf16 ULP round away and large
+            parameters never move. ``"adamw"`` selects :class:`torch.optim.AdamW`.
+            The low-bit variants require the ``torchao`` dependency, which ships
+            with the ``cu128`` and ``xpu`` extras.
         optimizer_lr: Learning rate for the optimizer. Defaults to 1e-4.
         optimizer_betas: Beta coefficients for Adam optimizer. Defaults to
             (0.9, 0.95).
@@ -157,6 +166,7 @@ class XR0Config(Config):
 
     normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES"
 
+    optimizer_type: Literal["adamw", "adamw4bit", "adamw8bit"] = "adamw4bit"
     optimizer_lr: float = 1.0e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
@@ -182,6 +192,10 @@ class XR0Config(Config):
 
         if self.dtype not in {"bfloat16", "float16", "float32"}:
             msg = f"Invalid dtype: {self.dtype}"
+            raise ValueError(msg)
+
+        if self.optimizer_type not in {"adamw", "adamw4bit", "adamw8bit"}:
+            msg = f"Invalid optimizer_type: {self.optimizer_type}"
             raise ValueError(msg)
 
         if self.dit_hidden_size % self.dit_head_dim != 0:

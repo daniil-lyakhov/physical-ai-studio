@@ -41,6 +41,62 @@ logger = logging.getLogger(__name__)
 _DTYPES: dict[str, torch.dtype] = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 
+def _build_optimizer(config: XR0Config, param_groups: list[dict[str, Any]]) -> torch.optim.Optimizer:
+    """Build the AdamW variant selected by ``config.optimizer_type``.
+
+    torchao's low-bit variants hold the Adam moments in int4/int8 blocks of 128
+    elements, cutting optimizer memory roughly 4x/2x versus fp32 moments.
+    Parameters whose element count is not a multiple of the block size keep
+    plain fp32 moments, so the saving is approximate.
+
+    They also enable stochastic rounding of the bf16 parameter update whenever
+    the weights are bf16. This matters more than the memory: with
+    round-to-nearest, an AdamW step smaller than half a bf16 ULP is discarded
+    entirely, which freezes every parameter whose magnitude exceeds roughly
+    ``lr * 2**8``. Stochastic rounding makes the update unbiased in expectation
+    so small updates accumulate instead of vanishing.
+
+    Args:
+        config: Policy config supplying the optimizer hyperparameters.
+        param_groups: Parameter groups carrying their weight-decay overrides.
+
+    Returns:
+        The configured optimizer.
+
+    Raises:
+        ImportError: If a low-bit optimizer is requested but torchao is missing.
+    """
+    if config.optimizer_type == "adamw":
+        return torch.optim.AdamW(
+            param_groups,
+            lr=config.optimizer_lr,
+            betas=config.optimizer_betas,
+            eps=config.optimizer_eps,
+        )
+
+    # torchao ships only with the `cu128` / `xpu` extras, so import it lazily to
+    # keep CPU-only installs working.
+    try:
+        from torchao.optim import AdamW4bit, AdamW8bit  # noqa: PLC0415
+    except ImportError as exc:
+        msg = (
+            f"optimizer_type={config.optimizer_type!r} requires the 'torchao' package. "
+            "Install a hardware extra that provides it (`uv sync --extra cu128` or "
+            "`uv sync --extra xpu`), or set optimizer_type='adamw'."
+        )
+        raise ImportError(msg) from exc
+
+    # Explicit mapping rather than getattr(): no dynamic attribute lookup.
+    optimizer_cls = AdamW4bit if config.optimizer_type == "adamw4bit" else AdamW8bit
+    return optimizer_cls(
+        param_groups,
+        lr=config.optimizer_lr,
+        betas=config.optimizer_betas,
+        eps=config.optimizer_eps,
+        bf16_stochastic_round=config.dtype == "bfloat16",
+    )
+
+
 class XR0ExportablePolicyMixin(ExportablePolicyMixin):
     """Export mixin that owns the XR0 self-contained OpenVINO baking.
 
@@ -227,6 +283,8 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             both action modes.
         action_std: Per-timestep action std, same shape as ``action_mean``.
         normalization_mode: Normalization method for state/action features.
+        optimizer_type: AdamW implementation: ``"adamw4bit"`` (default),
+            ``"adamw8bit"`` or ``"adamw"``. The low-bit variants need torchao.
         optimizer_lr: Learning rate.
         optimizer_betas: Adam beta coefficients.
         optimizer_eps: Optimizer epsilon.
@@ -290,6 +348,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         action_mean: Sequence[float] | torch.Tensor | None = None,
         action_std: Sequence[float] | torch.Tensor | None = None,
         normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES",
+        optimizer_type: Literal["adamw", "adamw4bit", "adamw8bit"] = "adamw4bit",
         optimizer_lr: float = 1.0e-4,
         optimizer_betas: tuple[float, float] = (0.9, 0.95),
         optimizer_eps: float = 1e-8,
@@ -348,6 +407,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             normalize_state=normalize_state,
             action_mode=action_mode,
             normalization_mode=normalization_mode,
+            optimizer_type=optimizer_type,
             optimizer_lr=optimizer_lr,
             optimizer_betas=optimizer_betas,
             optimizer_eps=optimizer_eps,
@@ -669,14 +729,12 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             else:
                 decay_params.append(param)
 
-        optimizer = torch.optim.AdamW(
+        optimizer = _build_optimizer(
+            self.config,
             [
                 {"params": decay_params, "weight_decay": self.config.optimizer_weight_decay},
                 {"params": no_decay_params, "weight_decay": 0.0},
             ],
-            lr=self.config.optimizer_lr,
-            betas=self.config.optimizer_betas,
-            eps=self.config.optimizer_eps,
         )
 
         num_training_steps = int(self.trainer.estimated_stepping_batches)
