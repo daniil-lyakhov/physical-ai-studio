@@ -12,7 +12,9 @@ In **Models → Train model**, select that dataset and **Pi0.5**, then follow th
 
 ## 3. Export with the OpenVINO delegate
 
-Studio can automatically produce a **portable ExecuTorch** export after training on installations with the optional dependency. To use **ExecuTorch *with the OpenVINO delegate***, export the checkpoint explicitly through the Python API:
+In Studio, open the trained model and look at its **Model formats** card: each backend — PyTorch, OpenVINO, ONNX, **ExecuTorch** — gets its own tile with an **Export** button. The ExecuTorch tile adds a **delegate** picker: choose **portable**, **XNNPACK**, or **OpenVINO**, select the target device, and Studio builds the delegated `.pte` for you in one click.
+
+The same export is a single call through the Python API:
 
 ```python
 from physicalai.policies import Pi05
@@ -27,11 +29,11 @@ policy.export(
 )
 ```
 
-This produces `pi05.pte` and `manifest.json`, which carries the policy's input/output contract — including the language input Pi0.5 expects at inference. `device="GPU"` targets the Intel XPU; use `"CPU"` on a machine without an Intel GPU. The OpenVINO delegate needs `physicalai-train[xpu,executorch-openvino]` **and** an ExecuTorch build with the OpenVINO partitioner — a standard ExecuTorch installation alone is not enough. See the [backend comparison notebook](library/notebooks/export/backend_comparison.ipynb) for the build workflow. Compare the exported policy's actions against the checkpoint on recorded observations, and measure latency before driving motors.
+This produces `pi05.pte` and `manifest.json`, which carries the policy's input/output contract — including the language input Pi0.5 expects at inference. `device="GPU"` targets the Intel XPU.
 
 ## 4. Run the exported policy on the robot
 
-ExecuTorch is a first-class format in Studio. Open the model, pick the **ExecuTorch** export, and hit **Run model**: choose the environment, enter the task string, and Studio wires the cameras and the follower arm to the `.pte` policy for you. Our demo runs on an Intel XPU machine, so the OpenVINO delegate executes the model on the integrated GPU while Studio streams observations and action chunks in real time. Keep an operator on the stop control, watch the predicted actions before actuation, then run at a safe speed.
+Back in Studio, hit **Run model** on the ExecuTorch format: choose the environment, enter the task string, and Studio wires the cameras and the follower arm to the `.pte` policy for you. Our demo runs on an Intel XPU machine, so the OpenVINO delegate executes the model on the integrated GPU while Studio streams observations and action chunks in real time.
 
 The same artifact loads from Python — `InferenceModel` picks the ExecuTorch backend from the `.pte` extension and reads the input/output contract from `manifest.json`:
 
@@ -43,11 +45,14 @@ policy = InferenceModel("./pi05-executorch-openvino")
 obs, info = env.reset()
 done = False
 while not done:
-    action = policy.select_action(obs | {"task": "pick up the brown cube and place it in the black box"})
+    obs["task"] = "pick up the brown cube and place it in the black box"
+    action = policy.select_action(obs)
     obs, reward, terminated, truncated, info = env.step(action)
     done = terminated or truncated
 ```
 
-That is the full loop: **Studio → Pi0.5 → ExecuTorch with OpenVINO → robot**, one workflow from demonstration to edge inference on real hardware.
+## Conclusion
 
+We started with an empty dataset and an idle arm, and ended with a Pi0.5 policy running through ExecuTorch on an Intel XPU, picking up a cube. Every step — recording, training, exporting, running — happened in Physical AI Studio, and the only code we wrote was two short snippets that mirror what the UI already does.
 
+If you want to try it, start with the [installation guide](application/docs/01-installation.md) and the [recording guide](application/docs/05-recording-datasets.md), then record your own task. A few dozen good demonstrations are enough to see the whole loop work end to end.
