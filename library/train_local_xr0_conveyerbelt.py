@@ -1,0 +1,255 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+"""Train / fine-tune the XR0 policy on the SO-101 conveyor-belt LeRobot dataset.
+
+Fine-tunes XR0 (Qwen3-VL-4B backbone + 16-layer DiT action expert) from the
+Xiaomi pretrained checkpoint on ``iMaxxgx/mj_so101_conveyor_belt``: a
+single-task, 100-episode SO-101 dataset of 148,799 frames at 30 fps (~83 min),
+with 6-DoF joint-position actions, a matching 6-DoF proprioceptive state, and
+two 480x640 views (an ``overview`` scene camera and a ``gripper`` wrist camera).
+
+The dataset is pulled straight from the HuggingFace Hub on first run and cached
+under ``HF_LEROBOT_HOME``; no manual download step is required.
+
+XR0 is a large VLA model, so this uses a small batch size, gradient
+checkpointing, and bf16 mixed precision to fit on a single GPU.
+
+Usage:
+    python train_local_xr0_conveyerbelt.py
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from lightning.pytorch.callbacks import ModelCheckpoint
+
+from physicalai.data import LeRobotDataModule
+from physicalai.policies import XR0
+from physicalai.policies.xr0.pretrained_utils import compute_action_chunk_stats
+from physicalai.train import Trainer
+from physicalai.train.utils import reformat_dataset_to_match_policy
+
+# Dataset to fine-tune on. With `DATASET_ROOT = None` the datamodule resolves
+# `REPO_ID` against the HuggingFace Hub and caches it under HF_LEROBOT_HOME
+# (~/.cache/huggingface/lerobot/<repo_id>), downloading on first use. Point
+# `DATASET_ROOT` at a local folder (the one containing meta/) to skip the Hub
+# entirely and train from disk.
+REPO_ID = "iMaxxgx/mj_so101_conveyor_belt"
+DATASET_ROOT: Path | None = None
+
+# Pin the Hub revision to a branch name. Left as None, LeRobot defaults the
+# revision to its CODEBASE_VERSION ("v3.0") and resolves it through
+# `get_safe_version`, which requires the dataset repo to carry a matching
+# version *tag*. This repo has none, so that lookup raises
+# RevisionNotFoundError -- which the installed huggingface_hub then masks with
+# a confusing "HfHubHTTPError.__init__() missing ... 'response'" TypeError.
+# A non-version string short-circuits the tag lookup entirely
+# (`is_valid_version("main")` is False) and pulls straight from the branch.
+REVISION = "main"
+
+# Pretrained XR0 checkpoint to fine-tune from.
+CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-Pretrain"
+
+# Smoke test: overfit a few batches for a handful of steps to confirm the
+# training loop runs end-to-end and the loss decreases before committing to a
+# full run. Flip to False for real fine-tuning.
+SMOKE_TEST = False
+
+# Training hyperparameters. XR0 is far larger than ACT, so keep the micro-batch
+# small and recover the effective batch through gradient accumulation:
+#   8 samples/forward x 4 accumulation steps = effective batch 32.
+# The small micro-batch is what bounds activation memory, which matters here
+# because the fp32 weights below already roughly double the parameter and
+# gradient footprint.
+BATCH_SIZE = 8
+ACCUMULATE_GRAD_BATCHES = 4
+
+# Schedule sizing: 148,799 frames at an effective batch of 32 is ~4.65k
+# optimizer steps per epoch, so 20k steps is ~4.3 passes over the data. That is
+# a sane budget for fine-tuning a 4.7B VLA on a single task with only 100
+# episodes; pushing much further mostly buys memorization. Raise it if val/loss
+# is still falling at the end.
+MAX_STEPS = 300 if SMOKE_TEST else 20_000
+# ~7.5% of the run spent warming up, matching the original XR0 recipe's
+# 2k-of-30k ratio.
+WARMUP_STEPS = 20 if SMOKE_TEST else 1_500
+
+# Action-chunk geometry. The flow head always predicts ``chunk_size`` timesteps;
+# only the first ``N_ACTION_STEPS`` are executed before replanning. These MUST
+# differ, otherwise ``extra_export_args`` emits no ``action_chunk_trimmer`` and
+# the exported policy runs a full 1 s chunk open-loop on the robot.
+# At 30 fps: 30 predicted = 1.0 s, 10 executed = 0.33 s between replans.
+CHUNK_SIZE = 30
+N_ACTION_STEPS = 10
+
+# The SO-101 arm exposes 6 joint targets (shoulder pan/lift, elbow flex, wrist
+# flex/roll, gripper), which sizes the per-timestep action statistics computed
+# before training.
+ACTION_DIM = 6
+
+# Cap the delta-stats pass. The train loader shuffles, so this is a random
+# sample: 3000 x 8 = 24k chunks is far more than enough for a per-timestep
+# mean/std, and avoids decoding every video frame in the dataset an extra time.
+STATS_MAX_BATCHES = 8 if SMOKE_TEST else 3_000
+
+# An epoch is ~4.65k optimizer steps, so epoch-granular validation would run
+# only ~4 times in the whole job. Validate on a step cadence instead (~20 times
+# total), capped to a fixed number of batches so the eval loop does not
+# dominate.
+#
+# NB: Lightning counts ``val_check_interval`` in *dataloader batches*, not
+# optimizer steps, so it has to be scaled by the accumulation factor.
+VAL_CHECK_INTERVAL_STEPS = 1_000
+VAL_CHECK_INTERVAL = VAL_CHECK_INTERVAL_STEPS * ACCUMULATE_GRAD_BATCHES
+LIMIT_TRAIN_BATCHES = 4 if SMOKE_TEST else None
+LIMIT_VAL_BATCHES = 2 if SMOKE_TEST else 100
+LOG_EVERY_N_STEPS = 1 if SMOKE_TEST else 50
+
+# Single episode to overfit during the smoke test.
+OVERFIT_EPISODE = 3
+
+# Checkpoints are tens of GB at this model size, so keep them off the repo
+# volume. `Trainer` also defaults `default_root_dir` to a relative
+# "experiments", hence passing EXPERIMENTS_ROOT explicitly below so the
+# TensorBoard logs land next to the checkpoints.
+EXPERIMENTS_ROOT = Path("/mnt/data/experiments")
+EXPERIMENT_NAME = "xr0_so101_conveyor_belt"
+EXPERIMENT_DIR = EXPERIMENTS_ROOT / EXPERIMENT_NAME
+
+# The dataset's camera keys are rig-specific and mean nothing to the pretrained
+# checkpoint, whose prompt is built from the canonical view names "ego",
+# "base", "wrist_left" and "wrist_right". Mapping them makes the fine-tuning
+# prompt read "# Ego View" / "# Left-Wrist View", exactly like the data
+# Xiaomi-Robotics-0-Pretrain was trained on.
+#
+# `overview` is a fixed camera framing the whole workspace, which is closest to
+# the scene-level "ego" head view in the pretraining rig ("base" there is a
+# low chassis-mounted view). `gripper` is wrist-mounted, and the single arm is
+# mapped to the left wrist since "wrist_left" comes first in the prompt order.
+IMAGE_KEY_VIEW_MAP = {
+    "images.overview": "ego",
+    "images.gripper": "wrist_left",
+}
+
+
+def main() -> None:
+    """Run XR0 fine-tuning on the conveyor-belt dataset."""
+    datamodule = LeRobotDataModule(
+        # `root=None` resolves `repo_id` against the Hub (downloading into the
+        # local LeRobot cache); when `root` is set it is only used as a name.
+        repo_id=REPO_ID,
+        root=str(DATASET_ROOT) if DATASET_ROOT is not None else None,
+        revision=REVISION,
+        train_batch_size=BATCH_SIZE,
+        episodes=[OVERFIT_EPISODE] if SMOKE_TEST else None,
+        # 5% of ~149k frames is ~7.4k held-out frames, plenty to track
+        # generalization without spending a tenth of the data on it.
+        val_split=0.0 if SMOKE_TEST else 0.05,
+        val_split_seed=42,
+        data_format="physicalai",
+    )
+
+    # Fine-tune from the pretrained base checkpoint. `sdpa` avoids the hard
+    # dependency on flash-attention; gradient checkpointing keeps memory in check.
+    # `MEAN_STD` matches the state/action normalization used by the original
+    # Xiaomi XR0 training pipeline. `normalize_state=False` keeps the raw
+    # proprioceptive state that the delta postprocessor re-adds at
+    # inference/export time.
+    policy = XR0(
+        pretrained_name_or_path=CHECKPOINT,
+        vlm_attn_implementation="sdpa",
+        gradient_checkpointing=True,
+        # Keep parameters in fp32. The default "bfloat16" stores weights in
+        # bf16, and Lightning's bf16-mixed autocasts operations without
+        # creating fp32 master weights, so any AdamW update smaller than half a
+        # bf16 ULP rounds away entirely. Measured on a bf16 run here: every
+        # tensor with magnitude >= 1.0 came out 100% bit-identical, and
+        # corr(log10 magnitude, unchanged_fraction) was +0.92. In fp32 that
+        # correlation drops to ~0.00.
+        #
+        # This roughly doubles weight + gradient memory. If it does not fit,
+        # the alternative is dtype="bfloat16" with the default
+        # optimizer_type="adamw4bit", whose torchao bf16_stochastic_round makes
+        # sub-ULP updates land probabilistically instead of being discarded.
+        dtype="float32",
+        chunk_size=CHUNK_SIZE,
+        n_action_steps=N_ACTION_STEPS,
+        normalization_mode="MEAN_STD",
+        normalize_state=False,
+        augment_images=True,
+        # SO-101 actions are absolute joint positions in the same units as the
+        # proprioceptive state (both are the same six `*.pos` channels), so
+        # `action[t] - state` is a well-defined residual and matches the
+        # pretrained flow head's delta prior. (This would not hold for an
+        # embodiment whose actions are end-effector velocity commands, where
+        # the subtraction mixes incompatible spaces.)
+        action_mode="delta",
+        image_key_view_map=IMAGE_KEY_VIEW_MAP,
+        # Fine-tuning, not pretraining: half the config's default LR and a
+        # tenth of its weight decay, so the pretrained features get nudged
+        # rather than overwritten.
+        optimizer_lr=5e-5,
+        optimizer_weight_decay=0.01,
+        # Decay over the whole run; cutting the cosine short (or long) leaves
+        # the final steps at the wrong LR.
+        scheduler_warmup_steps=WARMUP_STEPS,
+        scheduler_decay_steps=MAX_STEPS,
+    )
+
+    # Estimate the per-timestep action mean/std from the fine-tuning data.
+    # The pretrained model was built eagerly above, so its action delta indices
+    # are available to configure the dataset's action chunking; stats are then
+    # accumulated over the chunked targets and installed into the normalization
+    # used by the pre/post-processors during `fit`.
+    datamodule.setup("fit")
+    reformat_dataset_to_match_policy(policy, datamodule)
+    action_mean, action_std = compute_action_chunk_stats(
+        datamodule,
+        chunk_size=policy.config.chunk_size,
+        action_dim=ACTION_DIM,
+        max_action_dim=policy.config.max_action_dim,
+        action_mode=policy.config.action_mode,
+        max_batches=STATS_MAX_BATCHES,
+        setup_stage=None,
+    )
+    policy.set_action_stats(action_mean, action_std)
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=EXPERIMENT_DIR / "checkpoints",
+        filename="xr0-{step:06d}",
+        # Written at every validation, i.e. every VAL_CHECK_INTERVAL_STEPS
+        # optimizer steps. Monitoring ``step`` with ``mode="max"`` makes
+        # ``save_top_k`` a rolling window over the most recent checkpoints
+        # rather than a best-of selection, so only the newest 3 survive
+        # (plus ``last.ckpt`` for resuming). ``val/loss`` is still logged for
+        # the training curves, it just no longer drives retention.
+        save_top_k=1 if SMOKE_TEST else 3,
+        save_last=True,
+        monitor="step",
+        mode="max",
+    )
+
+    trainer = Trainer(
+        experiment_name=EXPERIMENT_NAME,
+        default_root_dir=str(EXPERIMENTS_ROOT),
+        max_steps=MAX_STEPS,
+        accelerator="gpu",
+        devices=[3],
+        precision="bf16-mixed",
+        # Speeds up the matmuls that stay in fp32 under bf16-mixed.
+        allow_tf32=True,
+        accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
+        callbacks=[checkpoint_callback],
+        log_every_n_steps=LOG_EVERY_N_STEPS,
+        val_check_interval=None if SMOKE_TEST else VAL_CHECK_INTERVAL,
+        limit_train_batches=LIMIT_TRAIN_BATCHES,
+        limit_val_batches=LIMIT_VAL_BATCHES,
+    )
+
+    trainer.fit(model=policy, datamodule=datamodule)
+
+
+if __name__ == "__main__":
+    main()
