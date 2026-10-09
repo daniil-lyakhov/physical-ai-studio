@@ -1,6 +1,10 @@
 # From robot demonstrations to edge inference with ExecuTorch and OpenVINO
 
-Record a task, train a policy, and put it back on the robot: Physical AI Studio connects the entire workflow. ExecuTorch packages the trained model for edge inference; its OpenVINO delegate runs supported parts of the model on Intel hardware. Here is the path from a pick-and-place demonstration to a supervised robot trial using the **Pi0.5** vision-language-action model as a concrete example.
+Robot manipulation has moved from hand-written motion planners to learned policies. Vision-language-action models such as Pi0.5 take camera frames, joint states, and a plain-language instruction, and predict a chunk of future actions — you demonstrate the behaviour instead of programming it. The hard part is rarely the model; it is capturing clean synchronized data, training on it, and then getting a multi-billion-parameter transformer to run fast enough on the machine next to the robot. That chain usually spans half a dozen tools, and every handoff is a chance for the input contract to drift.
+
+**Physical AI Studio** keeps it in one application: record, train, export, and run the result back on the robot, with a Python API underneath for anything you want to automate. For deployment it builds on **ExecuTorch**, PyTorch's edge runtime, which packages a trained model into a self-contained `.pte` file with no Python interpreter at inference time. Its **OpenVINO delegate** routes supported subgraphs to Intel CPUs, GPUs, and NPUs, and falls back to portable kernels for the rest.
+
+Here is that path end to end — a pick-and-place demonstration turned into a Pi0.5 policy, exported through ExecuTorch with the OpenVINO delegate, and run on an Intel XPU.
 
 ## 1. Capture the task in Studio
 
