@@ -39,6 +39,16 @@ from physicalai.train.utils import reformat_dataset_to_match_policy
 REPO_ID = "iMaxxgx/mj_so101_conveyor_belt"
 DATASET_ROOT: Path | None = None
 
+# Pin the Hub revision to a branch name. Left as None, LeRobot defaults the
+# revision to its CODEBASE_VERSION ("v3.0") and resolves it through
+# `get_safe_version`, which requires the dataset repo to carry a matching
+# version *tag*. This repo has none, so that lookup raises
+# RevisionNotFoundError -- which the installed huggingface_hub then masks with
+# a confusing "HfHubHTTPError.__init__() missing ... 'response'" TypeError.
+# A non-version string short-circuits the tag lookup entirely
+# (`is_valid_version("main")` is False) and pulls straight from the branch.
+REVISION = "main"
+
 # Pretrained XR0 checkpoint to fine-tune from.
 CHECKPOINT = "XiaomiRobotics/Xiaomi-Robotics-0-Pretrain"
 
@@ -131,6 +141,7 @@ def main() -> None:
         # local LeRobot cache); when `root` is set it is only used as a name.
         repo_id=REPO_ID,
         root=str(DATASET_ROOT) if DATASET_ROOT is not None else None,
+        revision=REVISION,
         train_batch_size=BATCH_SIZE,
         episodes=[OVERFIT_EPISODE] if SMOKE_TEST else None,
         # 5% of ~149k frames is ~7.4k held-out frames, plenty to track
