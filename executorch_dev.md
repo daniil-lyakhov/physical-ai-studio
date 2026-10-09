@@ -18,6 +18,8 @@ In **Models → Train model**, select that dataset and **Pi0.5**, then follow th
 
 In Studio, open the trained model and look at its **Model formats** card: each backend — PyTorch, OpenVINO, ONNX, **ExecuTorch** — gets its own tile with an **Export** button. The ExecuTorch tile adds a **delegate** picker: choose **portable**, **XNNPACK**, or **OpenVINO**, select the target device, and Studio builds the delegated `.pte` for you in one click.
 
+![Export your policy to the ExecuTorch with OpenVINO provider via Physical AI Studio](docs/physical-ai-export.png)
+
 The same export is a single call through the Python API:
 
 ```python
