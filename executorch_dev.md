@@ -6,9 +6,13 @@ Record a task, train a policy, and put it back on the robot: Physical AI Studio 
 
 Follow the [Studio installation guide](application/docs/01-installation.md), connect a leader and follower arm and cameras, then create an environment and dataset. Teleoperate the pick-and-place task, return the robot home at the end of each episode, and keep only clean demonstrations. Pi0.5 is language-conditioned, so give the dataset a specific task string such as “pick up the brown cube and place it in the black box.” Start with around 50 consistent episodes; the [recording guide](application/docs/05-recording-datasets.md) shows how to review camera footage and joint traces before training.
 
+![Recording a dataset in Physical AI Studio](docs/physical-ai-record.png)
+
 ## 2. Train a policy
 
 In **Models → Train model**, select that dataset and **Pi0.5**, then follow the loss curve and logs. Pi0.5 pulls its backbone from Hugging Face Hub, so configure a read-scoped token in **Settings → General → Hugging Face** first. Save the checkpoint and training settings, and test the policy on held-out trials before exporting.
+
+![Training a policy in Physical AI Studio](docs/physical-ai-train.png)
 
 ## 3. Export with the OpenVINO delegate
 
@@ -50,6 +54,8 @@ while not done:
     obs, reward, terminated, truncated, info = env.step(action)
     done = terminated or truncated
 ```
+
+![The SO-101 follower arm running the exported Pi0.5 policy](docs/so101.gif)
 
 ## Conclusion
 

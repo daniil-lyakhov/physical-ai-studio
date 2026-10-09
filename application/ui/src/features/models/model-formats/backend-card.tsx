@@ -1,16 +1,4 @@
-import {
-    Badge,
-    Button,
-    Content,
-    ContextualHelp,
-    DialogTrigger,
-    Divider,
-    Flex,
-    Heading,
-    Icon,
-    Text,
-    View,
-} from '@geti-ui/ui';
+import { Button, DialogTrigger, Divider, Flex, Heading, Icon, Text, View } from '@geti-ui/ui';
 import { DownloadIcon } from '@geti-ui/ui/icons';
 
 import { fetchClient } from '../../../api/client';
@@ -50,25 +38,6 @@ export const InferenceBackendLogo = ({
                     {backend.description}
                 </Text>
             </Flex>
-        </Flex>
-    );
-};
-
-export const Unavailable = ({ backend }: { backend: InferenceBackendConfig }) => {
-    return (
-        <Flex direction='column' gap='size-100' alignItems={'end'}>
-            <Badge variant={'negative'} UNSAFE_style={{ padding: 0, opacity: 0.9 }}>
-                Unavailable
-            </Badge>
-            <ContextualHelp variant='help'>
-                <Heading>Export missing</Heading>
-                <Content>
-                    <Text>
-                        This model does not include an exported model for {backend.label}. Try retraining the model to
-                        restart the model export.
-                    </Text>
-                </Content>
-            </ContextualHelp>
         </Flex>
     );
 };
@@ -143,16 +112,8 @@ export const BackendCard = ({ modelDetail, backendType, model }: BackendCardProp
         >
             <Flex direction='column' justifyContent='space-between' gap='size-200'>
                 <View paddingX='size-200'>
-                    <Flex justifyContent={'space-between'}>
-                        <Flex direction='column' gap='size-100' marginEnd='size-200' justifyContent='center'>
-                            <InferenceBackendLogo backend={backend} isAvailable={isAvailable || isExecuTorch} />
-                        </Flex>
-
-                        {isExecuTorch ? (
-                            <Badge variant='info'>UI preview</Badge>
-                        ) : (
-                            !isAvailable && <Unavailable backend={backend} />
-                        )}
+                    <Flex direction='column' gap='size-100' marginEnd='size-200' justifyContent='center'>
+                        <InferenceBackendLogo backend={backend} isAvailable={isAvailable || isExecuTorch} />
                     </Flex>
                 </View>
 
