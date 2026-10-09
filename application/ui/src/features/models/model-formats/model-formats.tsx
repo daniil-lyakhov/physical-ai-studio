@@ -20,6 +20,8 @@ const ModelFormatsContents = ({ model }: { model: SchemaModel }) => {
     const { data: policyBackends } = $api.useSuspenseQuery('get', '/api/policies/backends');
 
     const backends = (policyBackends[model.policy] ?? []).filter(isExportBackend);
+    // Preview the ExecuTorch tile even for policies without a working export path yet.
+    const displayedBackends = backends.includes('executorch') ? backends : [...backends, 'executorch' as const];
 
     return (
         <Grid
@@ -29,7 +31,7 @@ const ModelFormatsContents = ({ model }: { model: SchemaModel }) => {
                 gridTemplateColumns: cardGridColumns,
             }}
         >
-            {backends.map((backendType) => {
+            {displayedBackends.map((backendType) => {
                 return (
                     <BackendCard key={backendType} backendType={backendType} model={model} modelDetail={modelDetail} />
                 );

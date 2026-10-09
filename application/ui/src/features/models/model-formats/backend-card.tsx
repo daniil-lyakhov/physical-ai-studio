@@ -16,6 +16,7 @@ import { DownloadIcon } from '@geti-ui/ui/icons';
 import { fetchClient } from '../../../api/client';
 import type { components, SchemaModel } from '../../../api/openapi-spec';
 import { INFERENCE_BACKENDS, type InferenceBackendConfig } from '../inference-backends';
+import { ExecuTorchExportDialog } from './executorch-export-dialog';
 import { RuntimeExportDialog } from './runtime-export-dialog';
 
 type BackendExportDetail = components['schemas']['BackendExportDetail'];
@@ -126,6 +127,7 @@ interface BackendCardProps {
 export const BackendCard = ({ modelDetail, backendType, model }: BackendCardProps) => {
     const exportDetail = modelDetail.exports.find(({ type }) => type === backendType);
     const isAvailable = exportDetail !== undefined;
+    const isExecuTorch = backendType === 'executorch';
     const backend = INFERENCE_BACKENDS[backendType];
     const downloadUrl = fetchClient.PATH('/api/models/{model_id}/exports/{backend}/download', {
         params: { path: { model_id: model.id!, backend: backendType } },
@@ -143,10 +145,14 @@ export const BackendCard = ({ modelDetail, backendType, model }: BackendCardProp
                 <View paddingX='size-200'>
                     <Flex justifyContent={'space-between'}>
                         <Flex direction='column' gap='size-100' marginEnd='size-200' justifyContent='center'>
-                            <InferenceBackendLogo backend={backend} isAvailable={isAvailable} />
+                            <InferenceBackendLogo backend={backend} isAvailable={isAvailable || isExecuTorch} />
                         </Flex>
 
-                        {isAvailable === false && <Unavailable backend={backend} />}
+                        {isExecuTorch ? (
+                            <Badge variant='info'>UI preview</Badge>
+                        ) : (
+                            !isAvailable && <Unavailable backend={backend} />
+                        )}
                     </Flex>
                 </View>
 
@@ -156,9 +162,15 @@ export const BackendCard = ({ modelDetail, backendType, model }: BackendCardProp
                     <Flex gap='size-400' marginTop='size-100' width='100%'>
                         <ModelFormatSize exportDetail={exportDetail} />
                         <ModelPrecision exportDetail={exportDetail} />
-                        {isAvailable && (
+                        {(isAvailable || isExecuTorch) && (
                             <View marginStart='auto' alignSelf={'center'}>
                                 <Flex gap='size-100'>
+                                    {isExecuTorch && (
+                                        <DialogTrigger>
+                                            <Button variant='accent'>Export</Button>
+                                            {(close) => <ExecuTorchExportDialog close={close} />}
+                                        </DialogTrigger>
+                                    )}
                                     {backendType === 'openvino' && (
                                         <DialogTrigger>
                                             <Button
@@ -176,25 +188,27 @@ export const BackendCard = ({ modelDetail, backendType, model }: BackendCardProp
                                             )}
                                         </DialogTrigger>
                                     )}
-                                    <Button
-                                        href={downloadUrl}
-                                        aria-label={`Download ${backend.label} export`}
-                                        UNSAFE_style={{
-                                            color: 'inherit',
-                                            display: 'inline-flex',
-                                            textDecoration: 'none',
-                                            paddingInline: 'var(--spectrum-global-dimension-size-200)',
-                                            alignItems: 'center',
-                                        }}
-                                        target='_blank'
-                                        rel='noopener noreferrer'
-                                        variant='secondary'
-                                    >
-                                        <Icon marginEnd='size-100'>
-                                            <DownloadIcon />
-                                        </Icon>
-                                        <span>Download</span>
-                                    </Button>
+                                    {isAvailable && (
+                                        <Button
+                                            href={downloadUrl}
+                                            aria-label={`Download ${backend.label} export`}
+                                            UNSAFE_style={{
+                                                color: 'inherit',
+                                                display: 'inline-flex',
+                                                textDecoration: 'none',
+                                                paddingInline: 'var(--spectrum-global-dimension-size-200)',
+                                                alignItems: 'center',
+                                            }}
+                                            target='_blank'
+                                            rel='noopener noreferrer'
+                                            variant='secondary'
+                                        >
+                                            <Icon marginEnd='size-100'>
+                                                <DownloadIcon />
+                                            </Icon>
+                                            <span>Download</span>
+                                        </Button>
+                                    )}
                                 </Flex>
                             </View>
                         )}
