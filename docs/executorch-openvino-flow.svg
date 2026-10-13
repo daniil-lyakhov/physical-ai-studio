@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 430" width="1200" height="430" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8FA3BF"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0068B5"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0B2D5B" flood-opacity="0.10"/>
+    </filter>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0071C5"/>
+      <stop offset="1" stop-color="#004A86"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="430" rx="20" fill="#F5F8FC"/>
+
+  <!-- Lane labels -->
+  <text x="40" y="52" font-size="13" font-weight="700" letter-spacing="1.5" fill="#0068B5">EXPORT</text>
+  <text x="108" y="52" font-size="13" fill="#6B7C93">once, on the dev machine</text>
+  <text x="40" y="262" font-size="13" font-weight="700" letter-spacing="1.5" fill="#0068B5">INFERENCE</text>
+  <text x="136" y="262" font-size="13" fill="#6B7C93">every control step, on the robot PC</text>
+
+  <!-- Export lane -->
+  <g filter="url(#shadow)">
+    <rect x="40"  y="72" width="192" height="88" rx="14" fill="#FFFFFF" stroke="#D5DFEC"/>
+    <rect x="272" y="72" width="192" height="88" rx="14" fill="#FFFFFF" stroke="#D5DFEC"/>
+    <rect x="504" y="72" width="192" height="88" rx="14" fill="#FFFFFF" stroke="#D5DFEC"/>
+    <rect x="736" y="72" width="192" height="88" rx="14" fill="#FFFFFF" stroke="#D5DFEC"/>
+    <rect x="968" y="72" width="192" height="88" rx="14" fill="#0B2D5B"/>
+  </g>
+  <g text-anchor="middle">
+    <text x="136"  y="110" font-size="17" font-weight="700" fill="#0B2D5B">Pi0.5 checkpoint</text>
+    <text x="136"  y="134" font-size="13" fill="#5A6B82">LoRA merged · eval mode</text>
+    <text x="368"  y="110" font-size="17" font-weight="700" fill="#0B2D5B">torch.export</text>
+    <text x="368"  y="134" font-size="13" fill="#5A6B82">one static ATen graph</text>
+    <text x="600"  y="110" font-size="17" font-weight="700" fill="#0B2D5B">NNCF</text>
+    <text x="600"  y="134" font-size="13" fill="#5A6B82">INT8_SYM weights</text>
+    <text x="832"  y="110" font-size="17" font-weight="700" fill="#0B2D5B">OpenVINO delegate</text>
+    <text x="832"  y="134" font-size="13" fill="#5A6B82">partition · compile for GPU</text>
+    <text x="1064" y="110" font-size="17" font-weight="700" fill="#FFFFFF">pi05.pte</text>
+    <text x="1064" y="134" font-size="13" fill="#B9CCE6">+ manifest.json</text>
+  </g>
+  <g stroke="#8FA3BF" stroke-width="2" marker-end="url(#arrow)">
+    <line x1="234" y1="116" x2="268" y2="116"/>
+    <line x1="466" y1="116" x2="500" y2="116"/>
+    <line x1="698" y1="116" x2="732" y2="116"/>
+    <line x1="930" y1="116" x2="964" y2="116"/>
+  </g>
+
+  <!-- Handoff: .pte loaded by runtime -->
+  <path d="M1064 162 V 212 H 600 V 278" fill="none" stroke="#0068B5" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrow-accent)"/>
+  <rect x="770" y="200" width="124" height="24" rx="12" fill="#E3EEF9"/>
+  <text x="832" y="216" font-size="12" font-weight="600" text-anchor="middle" fill="#0068B5">precompiled blob</text>
+
+  <!-- Inference lane -->
+  <g filter="url(#shadow)">
+    <rect x="40"  y="282" width="192" height="88" rx="14" fill="#FFFFFF" stroke="#D5DFEC"/>
+    <rect x="272" y="282" width="192" height="88" rx="14" fill="#FFFFFF" stroke="#D5DFEC"/>
+    <rect x="504" y="282" width="192" height="88" rx="14" fill="url(#accent)"/>
+    <rect x="736" y="282" width="192" height="88" rx="14" fill="#FFFFFF" stroke="#D5DFEC"/>
+    <rect x="968" y="282" width="192" height="88" rx="14" fill="#FFFFFF" stroke="#D5DFEC"/>
+  </g>
+  <g text-anchor="middle">
+    <text x="136"  y="320" font-size="17" font-weight="700" fill="#0B2D5B">Observation</text>
+    <text x="136"  y="344" font-size="13" fill="#5A6B82">cameras · joints · task</text>
+    <text x="368"  y="320" font-size="17" font-weight="700" fill="#0B2D5B">Preprocess</text>
+    <text x="368"  y="344" font-size="13" fill="#5A6B82">normalize · resize · tokenize</text>
+    <text x="600"  y="320" font-size="17" font-weight="700" fill="#FFFFFF">ExecuTorch</text>
+    <text x="600"  y="344" font-size="13" fill="#D6E6F7">OpenVINO on Intel GPU</text>
+    <text x="832"  y="320" font-size="17" font-weight="700" fill="#0B2D5B">Postprocess</text>
+    <text x="832"  y="344" font-size="13" fill="#5A6B82">denormalize · trim chunk</text>
+    <text x="1064" y="320" font-size="17" font-weight="700" fill="#0B2D5B">Action chunk</text>
+    <text x="1064" y="344" font-size="13" fill="#5A6B82">sent to the robot</text>
+  </g>
+  <g stroke="#8FA3BF" stroke-width="2" marker-end="url(#arrow)">
+    <line x1="234" y1="326" x2="268" y2="326"/>
+    <line x1="466" y1="326" x2="500" y2="326"/>
+    <line x1="698" y1="326" x2="732" y2="326"/>
+    <line x1="930" y1="326" x2="964" y2="326"/>
+  </g>
+
+  <text x="600" y="404" font-size="12" text-anchor="middle" fill="#8A99AE">Python pre/post-processing comes from manifest.json · the .pte holds only tensor math</text>
+</svg>
