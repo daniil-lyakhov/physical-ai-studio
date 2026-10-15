@@ -59,7 +59,7 @@ def main() -> None:
     policy = XR0(
         pretrained_name_or_path=CHECKPOINT,
         vlm_attn_implementation="sdpa",
-        # Keep parameters in fp32. The default "bfloat16" stores weights in bf16, and
+        # Keep parameters in fp32. Explicit "bfloat16" stores weights in bf16, and
         # Lightning's bf16-mixed autocasts operations without creating fp32 master
         # weights, so AdamW updates smaller than half a bf16 ULP round away entirely.
         dtype="float32",

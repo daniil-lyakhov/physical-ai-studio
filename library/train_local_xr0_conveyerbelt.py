@@ -154,7 +154,7 @@ def main() -> None:
         pretrained_name_or_path=CHECKPOINT,
         vlm_attn_implementation="sdpa",
         gradient_checkpointing=True,
-        # Keep parameters in fp32. The default "bfloat16" stores weights in
+        # Keep parameters in fp32. Explicit "bfloat16" stores weights in
         # bf16, and Lightning's bf16-mixed autocasts operations without
         # creating fp32 master weights, so any AdamW update smaller than half a
         # bf16 ULP rounds away entirely. Measured on a bf16 run here: every
