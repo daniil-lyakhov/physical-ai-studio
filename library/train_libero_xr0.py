@@ -23,9 +23,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 from physicalai.data import FeatureType, LeRobotDataModule
 from physicalai.policies import XR0
-from physicalai.policies.xr0.pretrained_utils import compute_action_chunk_stats
 from physicalai.train import Trainer
-from physicalai.train.utils import reformat_dataset_to_match_policy
 
 _LIBERO_ACTION_DIM = 7
 _LIBERO_STATE_DIM = 8
@@ -69,7 +67,24 @@ def main() -> None:
         image_key_view_map={"images.image": "ego", "images.wrist_image": "wrist_right"},
         normalization_mode="MEAN_STD",
         normalize_state=False,
-        action_mode="delta",
+        # MUST stay "absolute" for LIBERO. Delta mode trains on
+        # `action - state[:min(action_dim, state_dim)]`, which only means
+        # something when the action and state share a coordinate system. Here
+        # they do not: LIBERO actions are *relative* OSC commands in [-1, 1]
+        # (LiberoGym control_mode="relative"), while the 8-dim state is an
+        # *absolute* eef pose -- position in metres (z ~ 1.0 on the table) plus
+        # axis-angle orientation in radians (+-pi) plus gripper qpos.
+        # Subtracting one from the other makes the regression target dominated
+        # by -state rather than by the command. The round trip is still
+        # self-consistent (inference re-adds state), but the model spends its
+        # capacity echoing a negated state it already gets as an input, and a
+        # small relative error on that dominant term lands as a large absolute
+        # error in an action whose whole range is [-1, 1]. Symptom: rollouts
+        # look correct for ~2 s near the fixed home pose, then go random, at
+        # every checkpoint regardless of training length.
+        # (Delta IS correct for SO-101, where actions are joint targets in the
+        # same units as the joint-position state -- see train_local_xr0.py.)
+        action_mode="absolute",
         augment_images=True,
         freeze_vision_encoder=False,
         optimizer_lr=5e-5,
@@ -78,9 +93,8 @@ def main() -> None:
         scheduler_decay_steps=None,
     )
 
-    # LeRobot's frame-level action stats cannot normalize XR0's 30-step chunks.
+    # Validate the local LIBERO schema before loading video batches in fit().
     datamodule.setup("fit")
-    reformat_dataset_to_match_policy(policy, datamodule)
     observation_features = datamodule.train_dataset.observation_features
     image_keys = {key for key, feature in observation_features.items() if feature.ftype == FeatureType.VISUAL}
     state_feature = observation_features.get("state")
@@ -95,17 +109,6 @@ def main() -> None:
     if action_feature is None or tuple(action_feature.shape) != (_LIBERO_ACTION_DIM,):
         msg = "Expected a flat 7-D LIBERO action feature named 'action'"
         raise ValueError(msg)
-    mean, std = compute_action_chunk_stats(
-        datamodule,
-        chunk_size=policy.config.chunk_size,
-        action_dim=_LIBERO_ACTION_DIM,
-        max_action_dim=policy.config.max_action_dim,
-        action_mode=policy.config.action_mode,
-        setup_stage=None,
-        device="cpu",
-    )
-    policy.set_action_stats(mean, std)
-
     trainer = Trainer(
         experiment_name="xr0_libero_10_full",
         max_steps=24_000,
