@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+import openvino
 import torch
 from physicalai.inference.data import InferenceFeature, InferenceFeatureDtype, InferenceFeatureType
 from physicalai.inference.manifest import ComponentSpec
@@ -23,6 +24,7 @@ from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
 
 from .config import XR0Config
+from .export_precision import convert_bf16_onnx_to_fp16
 from .model import XR0Model
 from .preprocessor import make_xr0_preprocessors
 from .pretrained_utils import (
@@ -130,13 +132,44 @@ class XR0ExportablePolicyMixin(ExportablePolicyMixin):
                 :meth:`_get_default_export_input_sample` when ``None``.
             **export_kwargs: Additional keyword arguments forwarded to the OpenVINO
                 conversion process.
+
+        Raises:
+            ValueError: If a separate BF16 export instance was not loaded.
         """
+        if self.model is None or self.config.dtype != "bfloat16" or self.model._dtype != torch.bfloat16:  # noqa: SLF001
+            msg = (
+                "XR0 OpenVINO export requires a separately loaded BF16 policy "
+                "(load_from_checkpoint(..., dtype='bfloat16'))."
+            )
+            raise ValueError(msg)
         self._bake_ingraph_export()
         super().to_openvino(
             output_path,
             input_sample,
             **export_kwargs,
         )
+
+    @staticmethod
+    def _prepare_openvino_onnx(model_path: Path) -> Path:
+        """Trace XR0 in BF16, then convert the ONNX graph to FP16 for OpenVINO.
+
+        Returns:
+            Path to the rewritten ONNX graph.
+        """
+        return convert_bf16_onnx_to_fp16(model_path)
+
+    @staticmethod
+    def _validate_openvino_model(model: openvino.Model) -> None:
+        """Refuse to publish an XR0 IR containing BF16 dataflow.
+
+        Raises:
+            ValueError: If an OpenVINO node still emits BF16 values.
+        """
+        for op in model.get_ordered_ops():
+            for output in op.outputs():
+                if output.get_element_type() == openvino.Type.bf16:
+                    msg = f"XR0 OpenVINO export still contains BF16 at {op.get_friendly_name()}"
+                    raise ValueError(msg)
 
     def prepare_ingraph_export(self, processed: dict[str, torch.Tensor]) -> None:
         """Bake the fixed image geometry into the VLM for a self-contained export.
@@ -317,8 +350,13 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         self,
         pretrained_name_or_path: str | Path | None = None,
         vlm_model_id: str = "Qwen/Qwen3-VL-4B-Instruct",
+<<<<<<< HEAD
         vlm_attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "sdpa",
         dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16",
+=======
+        vlm_attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "flash_attention_2",
+        dtype: Literal["bfloat16", "float16", "float32"] = "float32",
+>>>>>>> 0c7ef8b1 (CLI support)
         n_obs_steps: int = 1,
         chunk_size: int = 30,
         n_action_steps: int = 30,

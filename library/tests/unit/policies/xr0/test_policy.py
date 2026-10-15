@@ -73,6 +73,8 @@ class TestXR0Config:
 
     def test_lazy_initialization(self) -> None:
         policy = XR0()
+        assert policy.config.dtype == XR0Config().dtype == "float32"
+        assert policy.hparams["dtype"] == "float32"
         assert policy.model is None
         assert policy._preprocessor is None
         assert policy._postprocessor is None
@@ -236,15 +238,21 @@ class TestActionStatsSetup:
 
         def initialize(self: XR0, dataset_stats: dict[str, dict[str, Any]]) -> None:
             self._dataset_stats = dataset_stats
-            self.model = torch.nn.Linear(1, 1)
+            self.model = torch.nn.Linear(1, 1).to(getattr(torch, self.config.dtype))
 
         monkeypatch.setattr(XR0, "_initialize_model", initialize)
-        restored = XR0.load_from_checkpoint(checkpoint, map_location="cpu", weights_only=False, n_action_steps=1)
+        restored = XR0.load_from_checkpoint(
+            checkpoint, map_location="cpu", weights_only=False, n_action_steps=1, dtype="bfloat16"
+        )
 
         assert restored._dataset_stats == stats
         assert restored.config.action_mode == "delta"
         assert restored.config.n_action_steps == 1
-        assert torch.equal(restored.model.weight, policy.model.weight)
+        assert restored.config.dtype == "bfloat16"
+        assert policy.config.dtype == "float32"
+        assert restored.model.weight.dtype == torch.bfloat16
+        assert policy.model.weight.dtype == torch.float32
+        assert torch.equal(restored.model.weight, policy.model.weight.to(torch.bfloat16))
 
 
 class TestXR0Features:
