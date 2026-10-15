@@ -545,8 +545,10 @@ def compute_action_chunk_stats(  # noqa: PLR0914
             state = _feature_tensor(state_field)[: action.shape[0]].to(device=compute_device, dtype=torch.float64)
             if state.ndim == _TEMPORAL_STATE_NDIM:  # (B, T, D) -> current (last) frame
                 state = state[:, -1, :]
-            # Not in-place: ``target`` is a view of the caller's action tensor.
-            target = target - state[..., :action_dim].unsqueeze(1)  # noqa: PLR6104
+            # Do not modify the dataset's action tensor through ``target``.
+            target = target.clone()
+            overlap = min(action_dim, state.shape[-1])
+            target[..., :overlap] -= state[..., :overlap].unsqueeze(1)
 
         sum_1 += target.sum(dim=0)
         sum_2 += (target * target).sum(dim=0)

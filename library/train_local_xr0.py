@@ -23,9 +23,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 
 from physicalai.data import LeRobotDataModule
 from physicalai.policies import XR0
-from physicalai.policies.xr0.pretrained_utils import compute_action_chunk_stats
 from physicalai.train import Trainer
-from physicalai.train.utils import reformat_dataset_to_match_policy
 
 # Local LeRobot dataset (the folder that contains meta/, data/, videos/).
 DATASET_ROOT = Path("/home/devuser/dlyakhov/datasets/Put-different-balls-to-the-box")
@@ -62,10 +60,6 @@ WARMUP_STEPS = 20 if SMOKE_TEST else 2_000
 # At 30 fps: 30 predicted = 1.0 s, 10 executed = 0.33 s between replans.
 CHUNK_SIZE = 30
 N_ACTION_STEPS = 10
-
-# The local SO-101 arm exposes 6 joint targets, which sizes the per-timestep
-# action statistics computed before training.
-ACTION_DIM = 6
 
 # Cap the delta-stats pass. The train loader shuffles, so this is a random
 # sample: 3000 x 8 = 24k chunks is far more than enough for a per-timestep
@@ -155,6 +149,7 @@ def main() -> None:
         # would not hold for an embodiment whose actions are end-effector
         # velocity commands, where the subtraction mixes incompatible spaces.)
         action_mode="delta",
+        action_stats_max_batches=STATS_MAX_BATCHES,
         image_key_view_map=IMAGE_KEY_VIEW_MAP,
         # Fine-tuning, not pretraining: half the config's default LR and a
         # tenth of its weight decay, so the pretrained features get nudged
@@ -166,24 +161,6 @@ def main() -> None:
         scheduler_warmup_steps=WARMUP_STEPS,
         scheduler_decay_steps=MAX_STEPS,
     )
-
-    # Estimate the per-timestep action mean/std from the fine-tuning data.
-    # The pretrained model was built eagerly above, so its action delta indices
-    # are available to configure the dataset's action chunking; stats are then
-    # accumulated over the chunked targets and installed into the normalization
-    # used by the pre/post-processors during `fit`.
-    datamodule.setup("fit")
-    reformat_dataset_to_match_policy(policy, datamodule)
-    action_mean, action_std = compute_action_chunk_stats(
-        datamodule,
-        chunk_size=policy.config.chunk_size,
-        action_dim=ACTION_DIM,
-        max_action_dim=policy.config.max_action_dim,
-        action_mode=policy.config.action_mode,
-        max_batches=STATS_MAX_BATCHES,
-        setup_stage=None,
-    )
-    policy.set_action_stats(action_mean, action_std)
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=EXPERIMENT_DIR / "checkpoints",
