@@ -4,7 +4,9 @@
 """Export an XR0 checkpoint trained by ``train_local_xr0.py`` to OpenVINO.
 
 Lightning restores the training configuration, dataset and action-chunk stats,
-and model weights from the checkpoint. Override only the execution horizon.
+and model weights from the FP32 checkpoint. Build a separate BF16 model for
+tracing; XR0 converts the ONNX trace to FP16 for OpenVINO inference. Override
+the execution horizon without modifying the training checkpoint.
 Writes an OpenVINO IR plus ``manifest.json`` for ``InferenceModel(...)``.
 
 Usage:
@@ -35,6 +37,7 @@ def main() -> None:
         map_location="cpu",
         weights_only=False,
         n_action_steps=N_ACTION_STEPS,
+        dtype="bfloat16",
     )
 
     policy.to_openvino(str(EXPORT_DIR))

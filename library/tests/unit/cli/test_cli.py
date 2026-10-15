@@ -359,3 +359,26 @@ class TestDispatch:
 
         assert exit_code == 0
         fake_policy.export.assert_called_once_with("exports/act", backend="openvino")
+
+    def test_xr0_openvino_requires_trusted_local_checkpoint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only an explicitly trusted XR0 checkpoint is loaded unsafely."""
+        monkeypatch.chdir(tmp_path)
+        checkpoint = tmp_path / "model.ckpt"
+        checkpoint.touch()
+        parser = export_module.register().parser
+        args = [
+            "--policy=physicalai.policies.XR0",
+            f"--ckpt_path={checkpoint}",
+            "--backend=openvino",
+            "--output_dir=export",
+        ]
+        with pytest.raises(ValueError, match="trust_local_checkpoint"):
+            export_module.run(parser, parser.parse_args(args))
+
+        fake_policy = MagicMock()
+        with patch("physicalai.policies.XR0.load_from_checkpoint", return_value=fake_policy) as load:
+            assert export_module.run(parser, parser.parse_args([*args, "--trust_local_checkpoint"])) == 0
+        load.assert_called_once_with(checkpoint, map_location="cpu", weights_only=False, dtype="bfloat16")
+        fake_policy.export.assert_called_once_with("export", backend="openvino")
