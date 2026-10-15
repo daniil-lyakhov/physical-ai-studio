@@ -823,9 +823,8 @@ def make_xr0_preprocessors(
         max_state_dim: Padded state dimension.
         max_action_dim: Padded action dimension.
         stats: Dataset statistics as nested dicts (LeRobot format). The action
-            entry must carry per-timestep ``(chunk_size, D)`` mean/std; compute
-            them with
-            :func:`~physicalai.policies.xr0.stats.compute_action_chunk_stats`.
+            entry must carry per-timestep ``(chunk_size, D)`` mean/std;
+            :meth:`XR0.setup` collects them during training.
         chunk_size: Number of predicted action timesteps.
         state_len: Number of state timesteps.
         image_factor: Patch-alignment factor for image resizing.

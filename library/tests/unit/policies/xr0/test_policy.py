@@ -12,19 +12,24 @@ hyperparameter capture, error handling, and the policy factory.
 from __future__ import annotations
 
 import types
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import lightning.pytorch as L
 import pytest
 import torch
 
 from physicalai.data import Feature, FeatureType, Observation
+from physicalai.data.dataset import Dataset
+from physicalai.data.lerobot.dataset import _LeRobotDatasetAdapter  # noqa: PLC2701
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK
 from physicalai.export import ExportBackend
 from physicalai.export.backends import TorchExportParameters
 from physicalai.inference.data import InferenceFeatureDtype, InferenceFeatureType
 from physicalai.policies import get_physicalai_policy_class, get_policy
 from physicalai.policies.xr0 import XR0, XR0Config, make_xr0_preprocessors
+from physicalai.train.utils import reformat_dataset_to_match_policy
 
 
 def _minimal_export_stats() -> dict[str, dict[str, Any]]:
@@ -122,44 +127,115 @@ class TestXR0Policy:
             policy(obs)
 
 
-class TestSetActionStats:
-    """Installing per-timestep action statistics on the policy."""
+class TestActionStatsSetup:
+    """Training stats come from chunked data, not LeRobot frame metadata."""
 
-    def test_stats_are_stored_and_checkpointed(self) -> None:
-        policy = XR0(chunk_size=4, n_action_steps=4)
-        shape = (policy.config.chunk_size, policy.config.max_action_dim)
-        mean = torch.full(shape, 0.5)
-        std = torch.full(shape, 2.0)
+    def test_lazy_chunking_uses_chunk_size_not_execution_horizon(self) -> None:
+        policy = XR0(chunk_size=4, n_action_steps=2)
+        raw = types.SimpleNamespace(
+            features={ACTION: {}, "observation.state": {}},
+            fps=30,
+            tolerance_s=1e-4,
+            delta_indices={},
+        )
+        dataset = _LeRobotDatasetAdapter.from_lerobot(raw)
 
-        policy.set_action_stats(mean, std)
+        reformat_dataset_to_match_policy(policy, types.SimpleNamespace(train_dataset=dataset))
 
-        assert torch.allclose(policy._action_mean, mean)  # noqa: SLF001
-        assert torch.allclose(policy._action_std, std)  # noqa: SLF001
-        # mirrored into hparams so they survive a checkpoint round-trip.
+        assert dataset.delta_indices[ACTION] == [0, 1, 2, 3]
+
+    @pytest.mark.parametrize("mode", ["absolute", "delta"])
+    def test_setup_collects_and_checkpoints_stats(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        import physicalai.policies.xr0.policy as xr0_policy  # noqa: PLC0415
+
+        policy = XR0(chunk_size=2, n_action_steps=1, max_action_dim=4, action_mode=mode)
+        dataset = MagicMock(spec=Dataset)
+        dataset.observation_features = {"state": Feature(name="state", ftype=FeatureType.STATE, shape=(1,))}
+        dataset.action_features = {ACTION: Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(2,))}
+        dataset.stats = {
+            ACTION: {"shape": (2,), "mean": [100.0, 100.0], "std": [1.0, 1.0]},
+            "observation.state": {"shape": (1,), "mean": [0.0], "std": [1.0]},
+        }
+        actions = torch.tensor([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])
+        states = torch.tensor([[1.0], [3.0]])
+        datamodule = types.SimpleNamespace(
+            train_dataset=dataset, train_dataloader=lambda: [{ACTION: actions, STATE: states}]
+        )
+        policy._trainer = types.SimpleNamespace(datamodule=datamodule)  # noqa: SLF001
+        sequence: list[str] = []
+
+        def reformat(_policy: XR0, _data: object) -> None:
+            sequence.append("chunked")
+
+        def initialize(stats: dict[str, dict[str, Any]]) -> None:
+            sequence.append("initialized")
+            assert stats[ACTION]["mean"] == policy.hparams["dataset_stats"][ACTION]["mean"]
+
+        monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", reformat)
+        monkeypatch.setattr(policy, "_initialize_model", initialize)
+        policy.setup("fit")
+
+        target = actions.clone()
+        if mode == "delta":
+            target[..., :1] -= states[:, None, :]
+        assert sequence == ["chunked", "initialized"]
+        assert torch.allclose(torch.tensor(policy.hparams["dataset_stats"][ACTION]["mean"]), target.mean(0))
+        assert torch.allclose(
+            torch.tensor(policy.hparams["dataset_stats"][ACTION]["std"]), target.std(0, unbiased=False)
+        )
+        assert dataset.stats[ACTION]["mean"] == [100.0, 100.0]
+        assert policy.action_delta_indices == [0, 1]
+
+    def test_explicit_stats_skip_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import physicalai.policies.xr0.policy as xr0_policy  # noqa: PLC0415
+
+        mean = torch.zeros(2, 4)
+        std = torch.ones(2, 4)
+        policy = XR0(chunk_size=2, n_action_steps=1, max_action_dim=4, action_mean=mean, action_std=std)
+        dataset = MagicMock(spec=Dataset)
+        dataset.observation_features = {"state": Feature(name="state", ftype=FeatureType.STATE, shape=(3,))}
+        dataset.action_features = {ACTION: Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(2,))}
+        dataset.stats = {ACTION: {"shape": (2,), "mean": [0.0, 0.0], "std": [1.0, 1.0]}}
+        datamodule = types.SimpleNamespace(train_dataset=dataset, train_dataloader=MagicMock())
+        policy._trainer = types.SimpleNamespace(datamodule=datamodule)  # noqa: SLF001
+        monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", lambda *_args: None)
+        monkeypatch.setattr(policy, "_initialize_model", lambda _stats: None)
+
+        policy.setup("fit")
+
+        datamodule.train_dataloader.assert_not_called()
         assert policy.hparams["action_mean"] == mean.tolist()
         assert policy.hparams["action_std"] == std.tolist()
 
-    def test_non_float_input_is_converted(self) -> None:
-        policy = XR0(chunk_size=4, n_action_steps=4)
-        shape = (policy.config.chunk_size, policy.config.max_action_dim)
-        policy.set_action_stats(torch.zeros(shape, dtype=torch.float64), torch.ones(shape, dtype=torch.float64))
-        assert policy._action_mean.dtype is torch.float32  # noqa: SLF001
+    def test_checkpoint_restores_stats_without_dataset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        stats = _minimal_export_stats()
+        stats[ACTION]["mean"] = [[2.0] * 6] * 2
+        stats[ACTION]["std"] = [[0.5] * 6] * 2
+        policy = XR0(chunk_size=2, n_action_steps=2, action_mode="delta")
+        policy.hparams["dataset_stats"] = stats
+        policy.hparams["input_features"], policy.hparams["output_features"] = XR0._stats_to_features(stats)
+        policy.model = torch.nn.Linear(1, 1)
+        checkpoint = tmp_path / "xr0.ckpt"
+        torch.save(
+            {
+                "pytorch-lightning_version": L.__version__,
+                "hyper_parameters": dict(policy.hparams),
+                "state_dict": policy.state_dict(),
+            },
+            checkpoint,
+        )
 
-    @pytest.mark.parametrize("bad", ["per_dim", "wrong_chunk", "wrong_width"])
-    def test_wrong_shape_raises(self, bad: str) -> None:
-        policy = XR0(chunk_size=4, n_action_steps=4)
-        chunk, width = policy.config.chunk_size, policy.config.max_action_dim
-        shapes = {
-            "per_dim": (width,),  # per-dimension stats are no longer accepted
-            "wrong_chunk": (chunk + 1, width),
-            "wrong_width": (chunk, width - 1),
-        }
-        good = torch.zeros(chunk, width)
-        bad_tensor = torch.zeros(shapes[bad])
-        with pytest.raises(ValueError, match="must have shape"):
-            policy.set_action_stats(bad_tensor, good.clone())
-        with pytest.raises(ValueError, match="must have shape"):
-            policy.set_action_stats(good.clone(), bad_tensor)
+        def initialize(self: XR0, dataset_stats: dict[str, dict[str, Any]]) -> None:
+            self._dataset_stats = dataset_stats
+            self.model = torch.nn.Linear(1, 1)
+
+        monkeypatch.setattr(XR0, "_initialize_model", initialize)
+        restored = XR0.load_from_checkpoint(checkpoint, map_location="cpu", weights_only=False, n_action_steps=1)
+
+        assert restored._dataset_stats == stats
+        assert restored.config.action_mode == "delta"
+        assert restored.config.n_action_steps == 1
+        assert torch.equal(restored.model.weight, policy.model.weight)
 
 
 class TestXR0Features:
