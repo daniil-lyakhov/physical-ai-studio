@@ -12,19 +12,24 @@ hyperparameter capture, error handling, and the policy factory.
 from __future__ import annotations
 
 import types
+from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
+import lightning.pytorch as L
 import pytest
 import torch
 
 from physicalai.data import Feature, FeatureType, Observation
+from physicalai.data.dataset import Dataset
+from physicalai.data.lerobot.dataset import _LeRobotDatasetAdapter  # noqa: PLC2701
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK
 from physicalai.export import ExportBackend
 from physicalai.export.backends import TorchExportParameters
 from physicalai.inference.data import InferenceFeatureDtype, InferenceFeatureType
 from physicalai.policies import get_physicalai_policy_class, get_policy
-from physicalai.policies.xr0 import XR0, XR0Config
-
+from physicalai.policies.xr0 import XR0, XR0Config, make_xr0_preprocessors
+from physicalai.train.utils import reformat_dataset_to_match_policy
 
 
 def _minimal_export_stats() -> dict[str, dict[str, Any]]:
@@ -59,6 +64,8 @@ class TestXR0Config:
 
     def test_lazy_initialization(self) -> None:
         policy = XR0()
+        assert policy.config.dtype == XR0Config().dtype == "float32"
+        assert policy.hparams["dtype"] == "float32"
         assert policy.model is None
         assert policy._preprocessor is None
         assert policy._postprocessor is None
@@ -81,9 +88,31 @@ class TestXR0Config:
         assert "config" in policy.hparams
         assert policy.hparams["config"]["chunk_size"] == 30
 
+    def test_image_key_view_map_defaults_empty(self) -> None:
+        assert XR0().config.image_key_view_map == {}
+
+    def test_image_key_view_map_wiring(self) -> None:
+        view_map = {"images.top_camera": "ego", "images.pov_black_follower_camera": "wrist_left"}
+        policy = XR0(image_key_view_map=view_map)
+        assert policy.config.image_key_view_map == view_map
+        assert policy.hparams.image_key_view_map == view_map
+
 
 class TestXR0Policy:
     """Policy behaviour without an initialized model."""
+
+    def test_augmentation_only_on_training_forward(self) -> None:
+        policy = XR0(augment_images=True)
+        policy._preprocessor = MagicMock(return_value={})  # noqa: SLF001
+        policy.model = MagicMock()
+        obs = Observation(state=torch.randn(1, 8))
+
+        policy.forward(obs)
+        policy.compute_val_loss(obs)
+
+        assert policy.hparams.augment_images is True
+        assert policy._preprocessor.call_args_list[0].kwargs == {"augment_images": True}  # noqa: SLF001
+        assert policy._preprocessor.call_args_list[1].kwargs == {}  # noqa: SLF001
 
     @pytest.mark.parametrize("method", ["forward", "predict_action_chunk"])
     def test_methods_raise_without_model(self, method: str) -> None:
@@ -98,6 +127,123 @@ class TestXR0Policy:
         # eval forward routes to predict_action_chunk, which raises without a model
         with pytest.raises(ValueError, match="not initialized"):
             policy(obs)
+
+
+class TestActionStatsSetup:
+    """Training stats come from chunked data, not LeRobot frame metadata."""
+
+    def test_lazy_chunking_uses_chunk_size_not_execution_horizon(self) -> None:
+        policy = XR0(chunk_size=4, n_action_steps=2)
+        raw = types.SimpleNamespace(
+            features={ACTION: {}, "observation.state": {}},
+            fps=30,
+            tolerance_s=1e-4,
+            delta_indices={},
+        )
+        dataset = _LeRobotDatasetAdapter.from_lerobot(raw)
+
+        reformat_dataset_to_match_policy(policy, types.SimpleNamespace(train_dataset=dataset))
+
+        assert dataset.delta_indices[ACTION] == [0, 1, 2, 3]
+
+    @pytest.mark.parametrize("mode", ["absolute", "delta"])
+    def test_setup_collects_and_checkpoints_stats(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        import physicalai.policies.xr0.policy as xr0_policy  # noqa: PLC0415
+
+        policy = XR0(chunk_size=2, n_action_steps=1, max_action_dim=4, action_mode=mode)
+        dataset = MagicMock(spec=Dataset)
+        dataset.observation_features = {"state": Feature(name="state", ftype=FeatureType.STATE, shape=(1,))}
+        dataset.action_features = {ACTION: Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(2,))}
+        dataset.stats = {
+            ACTION: {"shape": (2,), "mean": [100.0, 100.0], "std": [1.0, 1.0]},
+            "observation.state": {"shape": (1,), "mean": [0.0], "std": [1.0]},
+        }
+        actions = torch.tensor([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]])
+        states = torch.tensor([[1.0], [3.0]])
+        datamodule = types.SimpleNamespace(
+            train_dataset=dataset, train_dataloader=lambda: [{ACTION: actions, STATE: states}]
+        )
+        policy._trainer = types.SimpleNamespace(datamodule=datamodule)  # noqa: SLF001
+        sequence: list[str] = []
+
+        def reformat(_policy: XR0, _data: object) -> None:
+            sequence.append("chunked")
+
+        def initialize(stats: dict[str, dict[str, Any]]) -> None:
+            sequence.append("initialized")
+            assert stats[ACTION]["mean"] == policy.hparams["dataset_stats"][ACTION]["mean"]
+
+        monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", reformat)
+        monkeypatch.setattr(policy, "_initialize_model", initialize)
+        policy.setup("fit")
+
+        target = actions.clone()
+        if mode == "delta":
+            target[..., :1] -= states[:, None, :]
+        assert sequence == ["chunked", "initialized"]
+        assert torch.allclose(torch.tensor(policy.hparams["dataset_stats"][ACTION]["mean"]), target.mean(0))
+        assert torch.allclose(
+            torch.tensor(policy.hparams["dataset_stats"][ACTION]["std"]), target.std(0, unbiased=False)
+        )
+        assert dataset.stats[ACTION]["mean"] == [100.0, 100.0]
+        assert policy.action_delta_indices == [0, 1]
+
+    def test_explicit_stats_skip_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import physicalai.policies.xr0.policy as xr0_policy  # noqa: PLC0415
+
+        mean = torch.zeros(2, 4)
+        std = torch.ones(2, 4)
+        policy = XR0(chunk_size=2, n_action_steps=1, max_action_dim=4, action_mean=mean, action_std=std)
+        dataset = MagicMock(spec=Dataset)
+        dataset.observation_features = {"state": Feature(name="state", ftype=FeatureType.STATE, shape=(3,))}
+        dataset.action_features = {ACTION: Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(2,))}
+        dataset.stats = {ACTION: {"shape": (2,), "mean": [0.0, 0.0], "std": [1.0, 1.0]}}
+        datamodule = types.SimpleNamespace(train_dataset=dataset, train_dataloader=MagicMock())
+        policy._trainer = types.SimpleNamespace(datamodule=datamodule)  # noqa: SLF001
+        monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", lambda *_args: None)
+        monkeypatch.setattr(policy, "_initialize_model", lambda _stats: None)
+
+        policy.setup("fit")
+
+        datamodule.train_dataloader.assert_not_called()
+        assert policy.hparams["action_mean"] == mean.tolist()
+        assert policy.hparams["action_std"] == std.tolist()
+
+    def test_checkpoint_restores_stats_without_dataset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        stats = _minimal_export_stats()
+        stats[ACTION]["mean"] = [[2.0] * 6] * 2
+        stats[ACTION]["std"] = [[0.5] * 6] * 2
+        policy = XR0(chunk_size=2, n_action_steps=2, action_mode="delta")
+        policy.hparams["dataset_stats"] = stats
+        policy.hparams["input_features"], policy.hparams["output_features"] = XR0._stats_to_features(stats)
+        policy.model = torch.nn.Linear(1, 1)
+        checkpoint = tmp_path / "xr0.ckpt"
+        torch.save(
+            {
+                "pytorch-lightning_version": L.__version__,
+                "hyper_parameters": dict(policy.hparams),
+                "state_dict": policy.state_dict(),
+            },
+            checkpoint,
+        )
+
+        def initialize(self: XR0, dataset_stats: dict[str, dict[str, Any]]) -> None:
+            self._dataset_stats = dataset_stats
+            self.model = torch.nn.Linear(1, 1).to(getattr(torch, self.config.dtype))
+
+        monkeypatch.setattr(XR0, "_initialize_model", initialize)
+        restored = XR0.load_from_checkpoint(
+            checkpoint, map_location="cpu", weights_only=False, n_action_steps=1, dtype="bfloat16"
+        )
+
+        assert restored._dataset_stats == stats
+        assert restored.config.action_mode == "delta"
+        assert restored.config.n_action_steps == 1
+        assert restored.config.dtype == "bfloat16"
+        assert policy.config.dtype == "float32"
+        assert restored.model.weight.dtype == torch.bfloat16
+        assert policy.model.weight.dtype == torch.float32
+        assert torch.equal(restored.model.weight, policy.model.weight.to(torch.bfloat16))
 
 
 class TestXR0Features:
@@ -147,6 +293,21 @@ class TestXR0Factory:
 
 class TestXR0Export:
     """Torch export hooks (no model download)."""
+
+    def test_openvino_export_preserves_image_view_map(self) -> None:
+        view_map = {"images.top_camera": "ego", "images.wrist_camera": "wrist_left"}
+        policy = XR0(image_key_view_map=view_map)
+        policy.model = object()  # type: ignore[assignment]
+        policy._preprocessor, policy._postprocessor = make_xr0_preprocessors()
+        policy._preprocessor._processor = types.SimpleNamespace(  # noqa: SLF001
+            image_processor=types.SimpleNamespace(
+                image_mean=[0.0] * 3, image_std=[1.0] * 3,
+                rescale_factor=1.0, patch_size=14, merge_size=2, temporal_patch_size=2,
+            ),
+        )
+
+        spec = policy.extra_export_args["openvino"].preprocessors_specs[0]
+        assert spec.model_dump()["image_key_view_map"] == view_map
 
     def test_supported_backends_torch_and_openvino(self) -> None:
         assert XR0.get_supported_export_backends() == [ExportBackend.TORCH, ExportBackend.OPENVINO]
@@ -270,21 +431,20 @@ class TestXR0DeltaMode:
         std: list[list[float]] | None,
         expect_stats: bool,
     ) -> None:
-        policy = XR0(action_mode="delta", action_delta_mean=mean, action_delta_std=std)
+        policy = XR0(action_mode="delta", action_mean=mean, action_std=std)
         if expect_stats:
             # Stored as float32 tensors for the preprocessor and mirrored into
             # hparams as plain lists so they round-trip through checkpoints.
-            assert isinstance(policy._action_delta_mean, torch.Tensor)
-            assert isinstance(policy._action_delta_std, torch.Tensor)
-            assert policy._action_delta_mean.dtype is torch.float32
-            assert policy._action_delta_std.dtype is torch.float32
-            assert policy.hparams["action_delta_mean"] == mean
-            assert policy.hparams["action_delta_std"] == std
+            assert isinstance(policy._action_mean, torch.Tensor)
+            assert isinstance(policy._action_std, torch.Tensor)
+            assert policy._action_mean.dtype is torch.float32
+            assert policy._action_std.dtype is torch.float32
+            assert policy.hparams["action_mean"] == mean
+            assert policy.hparams["action_std"] == std
         else:
-            assert policy._action_delta_mean is None
-            assert policy._action_delta_std is None
+            assert policy._action_mean is None
+            assert policy._action_std is None
             # ``save_hyperparameters`` still captures the init args, but they are
             # left as ``None`` (not overwritten with the mirrored lists).
-            assert policy.hparams["action_delta_mean"] is None
-            assert policy.hparams["action_delta_std"] is None
-
+            assert policy.hparams["action_mean"] is None
+            assert policy.hparams["action_std"] is None

@@ -65,8 +65,8 @@ def reformat_dataset_to_match_policy(policy: Policy, datamodule: DataModule) -> 
         delta_timestamps = {}
 
         # Get the LeRobot policy model for delta indices
-        # For policies with lerobot_policy attribute, use that; otherwise use policy.model
-        lerobot_model = getattr(policy, "lerobot_policy", None) or policy.model
+        # Use the policy's delta indices before a lazy model is initialized.
+        lerobot_model = getattr(policy, "lerobot_policy", None) or policy.model or policy
 
         for key in lerobot_dataset.raw_features:
             reward_delta_indices = _get_delta_indices(lerobot_model, "reward_delta_indices")
