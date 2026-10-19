@@ -24,7 +24,6 @@ from physicalai.train.schedulers import cosine_decay_with_warmup_scheduler
 from physicalai.train.utils import reformat_dataset_to_match_policy
 
 from .config import XR0Config
-from .export_precision import convert_bf16_onnx_to_fp16
 from .model import XR0Model
 from .preprocessor import make_xr0_preprocessors
 from .pretrained_utils import (
@@ -54,14 +53,10 @@ def _build_optimizer(config: XR0Config, param_groups: list[dict[str, Any]]) -> t
     torchao's low-bit variants hold the Adam moments in int4/int8 blocks of 128
     elements, cutting optimizer memory roughly 4x/2x versus fp32 moments.
     Parameters whose element count is not a multiple of the block size keep
-    plain fp32 moments, so the saving is approximate.
+    plain fp32 moments.
 
-    They also enable stochastic rounding of the bf16 parameter update whenever
-    the weights are bf16. This matters more than the memory: with
-    round-to-nearest, an AdamW step smaller than half a bf16 ULP is discarded
-    entirely, which freezes every parameter whose magnitude exceeds roughly
-    ``lr * 2**8``. Stochastic rounding makes the update unbiased in expectation
-    so small updates accumulate instead of vanishing.
+    The stochastic rounding of the bf16 parameter update is also enabled when
+    the weights are bf16 to prevent gradient update uderflow. 
 
     Args:
         config: Policy config supplying the optimizer hyperparameters.
@@ -149,27 +144,6 @@ class XR0ExportablePolicyMixin(ExportablePolicyMixin):
             **export_kwargs,
         )
 
-    @staticmethod
-    def _prepare_openvino_onnx(model_path: Path) -> Path:
-        """Trace XR0 in BF16, then convert the ONNX graph to FP16 for OpenVINO.
-
-        Returns:
-            Path to the rewritten ONNX graph.
-        """
-        return convert_bf16_onnx_to_fp16(model_path)
-
-    @staticmethod
-    def _validate_openvino_model(model: openvino.Model) -> None:
-        """Refuse to publish an XR0 IR containing BF16 dataflow.
-
-        Raises:
-            ValueError: If an OpenVINO node still emits BF16 values.
-        """
-        for op in model.get_ordered_ops():
-            for output in op.outputs():
-                if output.get_element_type() == openvino.Type.bf16:
-                    msg = f"XR0 OpenVINO export still contains BF16 at {op.get_friendly_name()}"
-                    raise ValueError(msg)
 
     def prepare_ingraph_export(self, processed: dict[str, torch.Tensor]) -> None:
         """Bake the fixed image geometry into the VLM for a self-contained export.
