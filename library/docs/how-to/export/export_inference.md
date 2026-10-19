@@ -46,43 +46,6 @@ physicalai export \
     --output_dir ./exports
 ```
 
-### XR0 precision for OpenVINO
-
-New XR0 training runs store FP32 weights by default, even when the Lightning
-trainer uses `bf16-mixed` compute. To export an FP32 XR0 checkpoint, load a
-**separate BF16 instance** for tracing; the XR0 exporter converts its BF16 ONNX
-graph to an FP16 OpenVINO IR while retaining FP32 action outputs. The original
-training checkpoint remains FP32:
-
-```python test="skip" reason="requires a trusted local XR0 checkpoint"
-from physicalai.policies import XR0
-
-# Lightning checkpoints may contain Python Feature objects. Never load an
-# untrusted checkpoint with weights_only=False.
-policy = XR0.load_from_checkpoint(
-    "experiments/my_run/checkpoints/last.ckpt",
-    map_location="cpu",
-    weights_only=False,
-    dtype="bfloat16",
-)
-policy.export("./exports/xr0", backend="openvino")
-```
-
-From the shared CLI, explicitly acknowledge a **trusted local** checkpoint:
-
-```bash
-physicalai export --policy physicalai.policies.XR0 \
-    --ckpt_path experiments/my_run/checkpoints/last.ckpt \
-    --backend openvino --output_dir ./exports/xr0 \
-    --trust_local_checkpoint
-```
-
-The checkpoint must be inside the current working directory. Existing XR0
-policies with FP32 weights are not silently cast in place: reload a BF16 copy
-for export. The final IR contains no BF16 dataflow; FP32 I/O and operations
-needed for numerical stability are retained. Validate GPU compilation on the
-target OpenVINO version separately from numerical parity.
-
 **Output structure:**
 
 ```text

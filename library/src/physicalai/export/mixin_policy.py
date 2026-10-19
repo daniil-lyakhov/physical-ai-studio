@@ -521,8 +521,6 @@ class ExportablePolicyMixin:
         _set_openvino_input_names(ov_model, extra_model_args.inputs)
         _postprocess_openvino_model(ov_model, extra_model_args.outputs)
 
-        self._validate_openvino_model(ov_model)
-
         openvino.save_model(ov_model, str(model_path), compress_to_fp16=extra_model_args.compress_to_fp16)
         if extra_model_args.export_tokenizer:
             ov_tokenizer = openvino_tokenizers.convert_tokenizer(
@@ -824,21 +822,16 @@ class ExportablePolicyMixin:
             The converted OpenVINO model.
         """
         if extra_model_args.via_onnx:
-            # ONNX exports of large models write external weight files alongside
-            # the graph. Keep all of them alive through conversion and remove
-            # them together, including on failure.
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                onnx_path = Path(tmp_dir) / "model.onnx"
+            with tempfile.NamedTemporaryFile(suffix=".onnx") as tmp:
                 self._onnx_core_export_step(
-                    model_path=onnx_path,
+                    model_path=Path(tmp.name),
                     input_sample=input_sample,
                     arg_name=arg_name,
                     **extra_export_kwargs,
                 )
-                onnx_path = self._prepare_openvino_onnx(onnx_path)
                 with _quiet_loggers(_ONNX_PROBE_NOISE_LOGGERS, level=logging.ERROR):
                     return openvino.convert_model(
-                        str(onnx_path),
+                        tmp.name,
                         example_input={arg_name: input_sample},
                         input=input_shapes,
                     )
@@ -848,15 +841,6 @@ class ExportablePolicyMixin:
             input=input_shapes,
             **extra_export_kwargs,
         )
-
-    @staticmethod
-    def _prepare_openvino_onnx(model_path: Path) -> Path:
-        """Return the ONNX graph to convert; policies may rewrite it in place."""
-        return model_path
-
-    @staticmethod
-    def _validate_openvino_model(model: openvino.Model) -> None:
-        """Check policy-specific requirements before publishing an OpenVINO IR."""
 
     def _get_default_export_input_sample(self) -> dict[str, torch.Tensor] | None:
         """Retrieve a default export input sample for the model.
