@@ -18,7 +18,7 @@ from PIL import Image
 import pytest
 import torch
 
-from physicalai.data.observation import ACTION, STATE, TASK
+from physicalai.data.observation import ACTION, STATE, TASK, Feature, FeatureType, NormalizationParameters
 from physicalai.policies.xr0.preprocessor import (
     _ASSISTANT_PRIMER,
     _MULTI_VIEW_HEADER,
@@ -27,10 +27,13 @@ from physicalai.policies.xr0.preprocessor import (
     ACTION_EPS,
     XR0Postprocessor,
     XR0Preprocessor,
+    _augment_images,
     _resize_batch,
+    _to_chunk_stats,
     _normalize_action,
     _denormalize_action,
     make_xr0_preprocessors,
+    _validate_view_map,
     _view_title,
 )
 
@@ -179,6 +182,74 @@ class TestResizeImage:
         assert int(out.max()) == 255
 
 
+def test_augment_images_seeded_reference() -> None:
+    """Random RGB views produce the expected seeded crop and color jitter."""
+    generator = torch.Generator().manual_seed(41)
+    images = [torch.randint(0, 256, (3, 3, 3), generator=generator, dtype=torch.uint8) for _ in range(2)]
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(17)  # Enables brightness and contrast; crops differ per view.
+        augmented = _augment_images(images)
+
+    expected = [
+        torch.tensor(
+            [
+                [[161, 150, 137], [119, 110, 99], [76, 68, 61]],
+                [[22, 64, 106], [102, 110, 118], [182, 156, 128]],
+                [[81, 82, 83], [91, 112, 129], [102, 140, 178]],
+            ],
+            dtype=torch.uint8,
+        ),
+        torch.tensor(
+            [
+                [[179, 180, 181], [160, 186, 213], [142, 193, 244]],
+                [[49, 32, 14], [119, 93, 66], [187, 154, 119]],
+                [[55, 91, 126], [32, 74, 119], [7, 58, 111]],
+            ],
+            dtype=torch.uint8,
+        ),
+    ]
+    assert all(torch.equal(actual, reference) for actual, reference in zip(augmented, expected, strict=True))
+
+
+@pytest.mark.parametrize(
+    ("dim", "expected_mean", "expected_std"),
+    [
+        (3, [[2, 4, 0], [6, 8, 0]], [[1, 3, 1], [5, 7, 1]]),
+        (2, [[2, 4], [6, 8]], [[1, 3], [5, 7]]),
+        (1, [[2], [6]], [[1], [5]]),
+    ],
+)
+def test_to_chunk_stats_pad_copy_or_truncate(dim: int, expected_mean: list[list[int]], expected_std: list[list[int]]) -> None:
+    """Keep per-timestep values; missing dimensions use identity stats."""
+    mean, std = _to_chunk_stats([[2, 4], [6, 8]], [[1, 3], [5, 7]], chunk_size=2, dim=dim, name="action")
+    assert mean.dtype == std.dtype == torch.float32
+    assert torch.equal(mean, torch.tensor(expected_mean, dtype=torch.float32))
+    assert torch.equal(std, torch.tensor(expected_std, dtype=torch.float32))
+
+
+def test_to_chunk_stats_accepts_1d_for_single_timestep() -> None:
+    """A length-one chunk can use per-dimension vector stats."""
+    mean, std = _to_chunk_stats([2, 4], torch.tensor([1, 3], dtype=torch.float64), chunk_size=1, dim=3, name="state")
+    assert torch.equal(mean, torch.tensor([[2.0, 4.0, 0.0]]))
+    assert torch.equal(std, torch.tensor([[1.0, 3.0, 1.0]]))
+
+
+@pytest.mark.parametrize(
+    ("mean", "std", "chunk_size", "message"),
+    [
+        ([[2, 4]], [[1]], 1, "action mean/std must have the same shape"),
+        ([2, 4], [1, 3], 2, "action stats must be per-timestep"),
+        ([[2, 4]], [[1, 3]], 2, "action stats must be per-timestep"),
+    ],
+)
+def test_to_chunk_stats_rejects_invalid_shapes(
+    mean: list, std: list, chunk_size: int, message: str
+) -> None:
+    """Reject mismatched shapes and missing or wrong temporal axes."""
+    with pytest.raises(ValueError, match=message):
+        _to_chunk_stats(mean, std, chunk_size=chunk_size, dim=3, name="action")
+
+
 class TestExtractViewImages:
     """Per-sample, per-view image extraction + resize (processor-free)."""
 
@@ -216,6 +287,32 @@ class TestExtractViewImages:
         assert int(sample[0].max()) == 255
         assert int(sample[1].max()) == 0
 
+    def test_temporal_images_use_last_frame_per_sample(self) -> None:
+        """Take the latest image from each sample's history."""
+        frames = torch.zeros(2, 2, 3, 32, 32)
+        frames[0, 0] = 1  # The first sample's earlier frame must be ignored.
+        frames[1, 1] = 1
+        views, images = XR0Preprocessor()._extract_view_images({"images.base": frames})  # noqa: SLF001
+        assert views == ["base"]
+        assert len(images) == 2
+        assert torch.equal(images[0][0], torch.zeros(3, 32, 32, dtype=torch.uint8))
+        assert torch.equal(images[1][0], torch.full((3, 32, 32), 255, dtype=torch.uint8))
+
+    def test_augment_images_flag_applies_per_sample(self) -> None:
+        """Only augment when requested, using each sample's returned images."""
+        batch = {"images.base": torch.stack([torch.zeros(3, 32, 32), torch.ones(3, 32, 32)])}
+        pre = XR0Preprocessor()
+        with patch(
+            "physicalai.policies.xr0.preprocessor._augment_images",
+            side_effect=lambda sample: [255 - image for image in sample],
+        ) as augment:
+            _, plain = pre._extract_view_images(batch)  # noqa: SLF001
+            augment.assert_not_called()
+            _, augmented = pre._extract_view_images(batch, augment_images=True)  # noqa: SLF001
+        assert augment.call_count == 2
+        assert torch.equal(augmented[0][0], 255 - plain[0][0])
+        assert torch.equal(augmented[1][0], 255 - plain[1][0])
+
     def test_augmentation_crops_after_resize_without_changing_geometry(self) -> None:
         pre = XR0Preprocessor()
         image = torch.arange(64 * 64, dtype=torch.int32).reshape(64, 64).remainder(256).to(torch.uint8)
@@ -246,6 +343,35 @@ class TestExtractViewImages:
         draws.assert_called_once_with(6, device=image.device)
         assert torch.equal(images[0][0], images[0][1])
         assert int(images[0][0].max()) < 128
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        None,
+        {},
+        {"images.ego": "ego", "images.base": "base", "images.left": "wrist_left", "images.right": "wrist_right"},
+    ],
+)
+def test_validate_view_map_returns_copy(mapping: dict[str, str] | None) -> None:
+    """Accept canonical views and return an independent mapping."""
+    validated = _validate_view_map(mapping)
+    assert validated == (mapping or {})
+    if mapping is not None:
+        assert validated is not mapping
+
+
+@pytest.mark.parametrize(
+    ("mapping", "message"),
+    [
+        ({"images.front": "front_cam"}, "canonical XR0 view names"),
+        ({"images.first": "ego", "images.second": "ego"}, "must be unique"),
+    ],
+)
+def test_validate_view_map_rejects_invalid_views(mapping: dict[str, str], message: str) -> None:
+    """Reject unknown and duplicate canonical views."""
+    with pytest.raises(ValueError, match=message):
+        _validate_view_map(mapping)
 
 
 class TestImageKeyViewMap:
@@ -428,6 +554,35 @@ class TestPrepareAction:
 class TestPostprocessor:
     """Action denormalize + delta re-add + unpad, against references."""
 
+    def test_init_defaults_to_identity(self) -> None:
+        """Without features, use identity stats and no action-width trimming."""
+        post = XR0Postprocessor(max_action_dim=3, chunk_size=2)
+        assert post.action_mode == "absolute"
+        assert post.action_dim is None
+        assert torch.equal(post.action_mean, torch.zeros(2, 3))
+        assert torch.equal(post.action_std, torch.ones(2, 3))
+
+    @pytest.mark.parametrize(("provide_mean", "provide_std"), [(False, False), (True, False), (False, True), (True, True)])
+    def test_init_uses_feature_stats_unless_both_overrides_are_given(self, provide_mean: bool, provide_std: bool) -> None:
+        """Infer the action width from features even when explicit stats override them."""
+        feature = Feature(
+            ftype=FeatureType.ACTION,
+            normalization_data=NormalizationParameters(mean=[[2, 4], [6, 8]], std=[[1, 3], [5, 7]]),
+        )
+        post = XR0Postprocessor(
+            max_action_dim=3,
+            chunk_size=2,
+            action_mode="delta",
+            features={"action": feature},
+            action_mean=[[10, 20], [30, 40]] if provide_mean else None,
+            action_std=[[11, 21], [31, 41]] if provide_std else None,
+        )
+        both = provide_mean and provide_std
+        assert post.action_mode == "delta"
+        assert post.action_dim == 2
+        assert torch.equal(post.action_mean, torch.tensor([[10, 20, 0], [30, 40, 0]] if both else [[2, 4, 0], [6, 8, 0]]))
+        assert torch.equal(post.action_std, torch.tensor([[11, 21, 1], [31, 41, 1]] if both else [[1, 3, 1], [5, 7, 1]]))
+
     @staticmethod
     def _post(
         max_action_dim: int = 3,
@@ -451,6 +606,12 @@ class TestPostprocessor:
         post = self._post()
         batch = {STATE: torch.zeros(2, 3)}
         assert post(batch) == batch
+
+    def test_chunk_length_must_match_stats(self) -> None:
+        """Reject predictions whose horizon differs from the normalization buffers."""
+        post = self._post(chunk_size=2)
+        with pytest.raises(ValueError, match="expected an action chunk of 2 timesteps.*got 3"):
+            post({ACTION: torch.zeros(1, 3, 3)})
 
     @pytest.mark.parametrize(
         ("action_dim", "reference"),
@@ -502,6 +663,75 @@ class TestPostprocessor:
         out = post({ACTION: action, STATE: state})[ACTION]
         assert out.shape == reference.shape
         assert torch.allclose(out, reference, atol=1e-5)
+
+
+def test_action_stats_from_feature_or_identity() -> None:
+    """Use action feature statistics, falling back to identity when missing."""
+    pre = XR0Preprocessor(chunk_size=2, max_action_dim=3)
+    feature = Feature(
+        ftype=FeatureType.ACTION,
+        normalization_data=NormalizationParameters(mean=[[2, 4], [6, 8]], std=[[1, 3], [5, 7]]),
+    )
+    mean, std = pre._action_stats({"action": feature})  # noqa: SLF001
+    assert torch.equal(mean, torch.tensor([[2, 4], [6, 8]]))
+    assert torch.equal(std, torch.tensor([[1, 3], [5, 7]]))
+    mean, std = pre._action_stats(None)  # noqa: SLF001
+    assert torch.equal(mean, torch.zeros(2, 3))
+    assert torch.equal(std, torch.ones(2, 3))
+
+
+def test_state_stats_only_when_enabled() -> None:
+    """Use state feature statistics only with state normalization enabled."""
+    feature = Feature(
+        ftype=FeatureType.STATE,
+        normalization_data=NormalizationParameters(mean=[2, 4], std=[1, 3]),
+    )
+    pre = XR0Preprocessor(max_state_dim=3, normalize_state=True)
+    mean, std = pre._state_stats({"state": feature})  # noqa: SLF001
+    assert torch.equal(mean, torch.tensor([2, 4]))
+    assert torch.equal(std, torch.tensor([1, 3]))
+    mean, std = pre._state_stats(None)  # noqa: SLF001
+    assert torch.equal(mean, torch.zeros(1, 3))
+    assert torch.equal(std, torch.ones(1, 3))
+    raw = XR0Preprocessor(max_state_dim=3)
+    mean, std = raw._state_stats({"state": feature})  # noqa: SLF001
+    assert torch.equal(mean, torch.zeros(1, 3))
+    assert torch.equal(std, torch.ones(1, 3))
+
+
+@pytest.mark.parametrize(("provide_mean", "provide_std"), [(False, False), (True, False), (False, True), (True, True)])
+def test_action_stats_override_requires_both(provide_mean: bool, provide_std: bool) -> None:
+    """Use explicit action stats only when both mean and std are supplied."""
+    feature = Feature(
+        ftype=FeatureType.ACTION,
+        normalization_data=NormalizationParameters(mean=[[2, 4], [6, 8]], std=[[1, 3], [5, 7]]),
+    )
+    pre = XR0Preprocessor(
+        max_action_dim=3,
+        chunk_size=2,
+        features={"action": feature},
+        action_mean=[[10, 20], [30, 40]] if provide_mean else None,
+        action_std=[[11, 21], [31, 41]] if provide_std else None,
+    )
+    both = provide_mean and provide_std
+    assert torch.equal(pre.action_mean, torch.tensor([[10, 20, 0], [30, 40, 0]] if both else [[2, 4, 0], [6, 8, 0]]))
+    assert torch.equal(pre.action_std, torch.tensor([[11, 21, 1], [31, 41, 1]] if both else [[1, 3, 1], [5, 7, 1]]))
+
+
+@pytest.mark.parametrize(("provide_mean", "provide_std"), [(False, False), (True, False), (False, True), (True, True)])
+def test_state_stats_override_requires_both(provide_mean: bool, provide_std: bool) -> None:
+    """Use explicit state stats only when both mean and std are supplied."""
+    feature = Feature(ftype=FeatureType.STATE, normalization_data=NormalizationParameters(mean=[2, 4], std=[1, 3]))
+    pre = XR0Preprocessor(
+        max_state_dim=3,
+        normalize_state=True,
+        features={"state": feature},
+        state_mean=[10, 20] if provide_mean else None,
+        state_std=[11, 21] if provide_std else None,
+    )
+    both = provide_mean and provide_std
+    assert torch.equal(pre.state_mean, torch.tensor([[10, 20, 0]] if both else [[2, 4, 0]]))
+    assert torch.equal(pre.state_std, torch.tensor([[11, 21, 1]] if both else [[1, 3, 1]]))
 
 
 class TestMakeXr0Preprocessors:

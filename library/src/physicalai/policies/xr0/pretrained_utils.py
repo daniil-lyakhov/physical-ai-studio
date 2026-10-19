@@ -357,19 +357,9 @@ def extract_xr0_dataset_stats(
 ) -> dict[str, dict[str, object]] | None:
     """Extract action-normalization stats from a pretrained XR0 checkpoint.
 
-    The source publishes per-robot action ``mean`` / ``std`` in the processor's
-    ``preprocessor_config.json`` under ``action_config``, stored per
-    action-timestep as ``(T, 32)``. The time axis is preserved, since XR0
-    normalizes the action chunk per timestep. Only the leading dimensions with
-    ``std > 1e-5`` at any timestep are active (mirroring the source
-    ``get_action_mask``); trailing padding dimensions are dropped so the
-    postprocessor emits the true action size (e.g. 7 for LIBERO).
-
-    When ``chunk_size`` is given and differs from the published ``T``, the stats
-    are repeated along the time axis -- but only after verifying they are
-    time-invariant, so no information is fabricated. The released checkpoints
-    publish ``T = 10`` (the reference eval's execution horizon) with identical
-    rows, while the model predicts a 30-step chunk.
+    Load per-timestep action mean/std from ``preprocessor_config.json``.
+    Trim dimensions after the last with ``std > 1e-5``. If the requested
+    ``chunk_size`` differs, repeat rows only when the stats are time-invariant.
 
     Args:
         pretrained_name_or_path: Local checkpoint dir/file or HuggingFace repo id.
@@ -468,7 +458,7 @@ def compute_action_chunk_stats(  # noqa: PLR0914
     chunk_size: int,
     action_dim: int,
     max_action_dim: int = 32,
-    action_mode: Literal["absolute", "delta"] = "delta",
+    action_mode: Literal["absolute", "delta"] = "absolute",
     max_batches: int | None = None,
     subset_size: int | None = None,
     setup_stage: str | None = "fit",
@@ -492,8 +482,8 @@ def compute_action_chunk_stats(  # noqa: PLR0914
         chunk_size: Number of action steps per chunk (the temporal dimension).
         action_dim: True (unpadded) action dimension of the dataset.
         max_action_dim: Padded action dimension of the returned buffers.
-        action_mode: ``"delta"`` (default) subtracts the current state from the
-            action target; ``"absolute"`` accumulates the raw action.
+        action_mode: ``"absolute"`` (default) accumulates the raw action;
+            ``"delta"`` subtracts the current state from the action target.
         max_batches: Optional cap on the number of batches to consume (for a quick
             estimate). ``None`` consumes the full train set.
         subset_size: Optional number of samples to use from the start of the

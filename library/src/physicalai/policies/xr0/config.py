@@ -101,8 +101,7 @@ class XR0Config(Config):
             rounding to the parameter update when ``dtype="bfloat16"``, without
             which updates smaller than half a bf16 ULP round away and large
             parameters never move. ``"adamw"`` selects :class:`torch.optim.AdamW`.
-            The low-bit variants require the ``torchao`` dependency, which ships
-            with the ``cu128`` and ``xpu`` extras.
+            The low-bit variants require the ``torchao`` dependency.
         optimizer_lr: Learning rate for the optimizer. Defaults to 1e-4.
         optimizer_betas: Beta coefficients for Adam optimizer. Defaults to
             (0.9, 0.95).
