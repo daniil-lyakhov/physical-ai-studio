@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-import openvino
 import torch
 from physicalai.inference.data import InferenceFeature, InferenceFeatureDtype, InferenceFeatureType
 from physicalai.inference.manifest import ComponentSpec
@@ -56,7 +55,7 @@ def _build_optimizer(config: XR0Config, param_groups: list[dict[str, Any]]) -> t
     plain fp32 moments.
 
     The stochastic rounding of the bf16 parameter update is also enabled when
-    the weights are bf16 to prevent gradient update uderflow. 
+    the weights are bf16 to prevent gradient update uderflow.
 
     Args:
         config: Policy config supplying the optimizer hyperparameters.
@@ -79,7 +78,7 @@ def _build_optimizer(config: XR0Config, param_groups: list[dict[str, Any]]) -> t
     # torchao ships only with the `cu128` / `xpu` extras, so import it lazily to
     # keep CPU-only installs working.
     try:
-        from torchao.optim import AdamW4bit, AdamW8bit  # noqa: PLC0415
+        from torchao.optim import AdamW4bit, AdamW8bit  # noqa: PLC0415  # pyrefly: ignore[missing-import]
     except ImportError as exc:
         msg = (
             f"optimizer_type={config.optimizer_type!r} requires the 'torchao' package. "
@@ -127,23 +126,13 @@ class XR0ExportablePolicyMixin(ExportablePolicyMixin):
                 :meth:`_get_default_export_input_sample` when ``None``.
             **export_kwargs: Additional keyword arguments forwarded to the OpenVINO
                 conversion process.
-
-        Raises:
-            ValueError: If a separate BF16 export instance was not loaded.
         """
-        if self.model is None or self.config.dtype != "bfloat16" or self.model._dtype != torch.bfloat16:  # noqa: SLF001
-            msg = (
-                "XR0 OpenVINO export requires a separately loaded BF16 policy "
-                "(load_from_checkpoint(..., dtype='bfloat16'))."
-            )
-            raise ValueError(msg)
         self._bake_ingraph_export()
         super().to_openvino(
             output_path,
             input_sample,
             **export_kwargs,
         )
-
 
     def prepare_ingraph_export(self, processed: dict[str, torch.Tensor]) -> None:
         """Bake the fixed image geometry into the VLM for a self-contained export.
@@ -324,13 +313,8 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         self,
         pretrained_name_or_path: str | Path | None = None,
         vlm_model_id: str = "Qwen/Qwen3-VL-4B-Instruct",
-<<<<<<< HEAD
         vlm_attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "sdpa",
-        dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16",
-=======
-        vlm_attn_implementation: Literal["eager", "sdpa", "flash_attention_2"] = "flash_attention_2",
         dtype: Literal["bfloat16", "float16", "float32"] = "float32",
->>>>>>> 0c7ef8b1 (CLI support)
         n_obs_steps: int = 1,
         chunk_size: int = 30,
         n_action_steps: int = 30,
@@ -598,6 +582,8 @@ class XR0(XR0ExportablePolicyMixin, Policy):
 
         Raises:
             TypeError: If the train dataset is not a physicalai Dataset.
+            ValueError: If the action feature is missing, not flat, or exceeds
+                ``max_action_dim``.
         """
         datamodule = self.trainer.datamodule  # type: ignore[attr-defined]
         train_dataset = datamodule.train_dataset

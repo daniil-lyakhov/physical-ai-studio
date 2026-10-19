@@ -392,7 +392,7 @@ class XR0Preprocessor(torch.nn.Module):
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
 
-        # Explicit ``state_mean`` / ``state_std`` 
+        # Explicit ``state_mean`` / ``state_std``
         # take precedence over feature-derived stats so the
         # exported graph reproduces the training normalization exactly.
         if state_mean is not None and state_std is not None:
