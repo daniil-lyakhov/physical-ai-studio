@@ -624,8 +624,6 @@ class XR0(XR0ExportablePolicyMixin, Policy):
                 setup_stage=None,
                 device="cpu",
             )
-            # Each rank scans its own shuffled loader; use rank 0's stats everywhere.
-            mean, std = self.trainer.strategy.broadcast((mean, std), src=0)
             stats_dict[ACTION] = {
                 **stats_dict[ACTION],
                 "mean": mean[:, :action_dim].tolist(),
