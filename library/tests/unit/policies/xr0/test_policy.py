@@ -214,8 +214,7 @@ class TestActionStatsSetup:
         datamodule = types.SimpleNamespace(
             train_dataset=dataset, train_dataloader=lambda: [{ACTION: actions, STATE: states}]
         )
-        strategy = types.SimpleNamespace(broadcast=lambda obj, src: obj)
-        policy._trainer = types.SimpleNamespace(datamodule=datamodule, strategy=strategy)  # noqa: SLF001
+        policy._trainer = types.SimpleNamespace(datamodule=datamodule)  # noqa: SLF001
         sequence: list[str] = []
 
         def reformat(_policy: XR0, _data: object) -> None:
@@ -281,11 +280,11 @@ class TestActionStatsSetup:
         dataset.action_features = {ACTION: Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(2,))}
         dataset.stats = {ACTION: {"shape": (2,), "mean": [100.0, 100.0], "std": [1.0, 1.0]}}
         datamodule = types.SimpleNamespace(train_dataset=dataset)
-        rank0_stats = (torch.tensor([[2, 3, 0], [4, 5, 0]]), torch.tensor([[1, 2, 1], [3, 4, 1]]))
-        strategy = types.SimpleNamespace(broadcast=MagicMock(return_value=rank0_stats))
-        policy._trainer = types.SimpleNamespace(datamodule=datamodule, strategy=strategy)  # noqa: SLF001
+        policy._trainer = types.SimpleNamespace(datamodule=datamodule)  # noqa: SLF001
         reformat = MagicMock()
-        scan = MagicMock(return_value=(torch.zeros(2, 3), torch.ones(2, 3)))
+        scan = MagicMock(
+            return_value=(torch.tensor([[2, 3, 0], [4, 5, 0]]), torch.tensor([[1, 2, 1], [3, 4, 1]]))
+        )
         initialize = MagicMock()
         monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", reformat)
         monkeypatch.setattr(xr0_policy, "compute_action_chunk_stats", scan)
@@ -304,7 +303,6 @@ class TestActionStatsSetup:
             setup_stage=None,
             device="cpu",
         )
-        strategy.broadcast.assert_called_once_with(scan.return_value, src=0)
         stats = policy.hparams["dataset_stats"][ACTION]
         assert stats == {"shape": (2,), "mean": [[2, 3], [4, 5]], "std": [[1, 2], [3, 4]]}
         assert dataset.stats[ACTION]["mean"] == [100.0, 100.0]
