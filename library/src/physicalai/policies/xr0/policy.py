@@ -62,39 +62,38 @@ def _build_optimizer(config: XR0Config, param_groups: list[dict[str, Any]]) -> t
         param_groups: Parameter groups carrying their weight-decay overrides.
 
     Returns:
-        The configured optimizer.
-
-    Raises:
-        ImportError: If a low-bit optimizer is requested but torchao is missing.
+        The configured optimizer. Falls back to :class:`torch.optim.AdamW` with a
+        warning when a low-bit optimizer is requested but torchao is missing.
     """
-    if config.optimizer_type == "adamw":
-        return torch.optim.AdamW(
-            param_groups,
-            lr=config.optimizer_lr,
-            betas=config.optimizer_betas,
-            eps=config.optimizer_eps,
-        )
+    if config.optimizer_type != "adamw":
+        # torchao ships only with the `cu128` (Linux x86-64) / `xpu` extras, so
+        # import it lazily to keep other installs working.
+        try:
+            from torchao.optim import AdamW4bit, AdamW8bit  # noqa: PLC0415  # pyrefly: ignore[missing-import]
+        except ImportError:
+            logger.warning(
+                "optimizer_type=%r requires the 'torchao' package, which is not installed; "
+                "falling back to torch.optim.AdamW (fp32 moments: more optimizer memory, "
+                "no bf16 stochastic rounding). Install torchao (`uv sync --extra cu128` on "
+                "Linux x86-64, or `uv sync --extra xpu`) or set optimizer_type='adamw'.",
+                config.optimizer_type,
+            )
+        else:
+            # Explicit mapping rather than getattr(): no dynamic attribute lookup.
+            optimizer_cls = AdamW4bit if config.optimizer_type == "adamw4bit" else AdamW8bit
+            return optimizer_cls(
+                param_groups,
+                lr=config.optimizer_lr,
+                betas=config.optimizer_betas,
+                eps=config.optimizer_eps,
+                bf16_stochastic_round=config.dtype == "bfloat16",
+            )
 
-    # torchao ships only with the `cu128` / `xpu` extras, so import it lazily to
-    # keep CPU-only installs working.
-    try:
-        from torchao.optim import AdamW4bit, AdamW8bit  # noqa: PLC0415  # pyrefly: ignore[missing-import]
-    except ImportError as exc:
-        msg = (
-            f"optimizer_type={config.optimizer_type!r} requires the 'torchao' package. "
-            "Install a hardware extra that provides it (`uv sync --extra cu128` or "
-            "`uv sync --extra xpu`), or set optimizer_type='adamw'."
-        )
-        raise ImportError(msg) from exc
-
-    # Explicit mapping rather than getattr(): no dynamic attribute lookup.
-    optimizer_cls = AdamW4bit if config.optimizer_type == "adamw4bit" else AdamW8bit
-    return optimizer_cls(
+    return torch.optim.AdamW(
         param_groups,
         lr=config.optimizer_lr,
         betas=config.optimizer_betas,
         eps=config.optimizer_eps,
-        bf16_stochastic_round=config.dtype == "bfloat16",
     )
 
 
@@ -605,15 +604,18 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         # action targets; delta mode also needs to subtract the current state.
         reformat_dataset_to_match_policy(self, datamodule)
         stats_dict = dict(train_dataset.stats)
-        if self._action_mean is None and self._action_std is None:
-            action_feature = train_dataset.action_features.get(ACTION)
-            if action_feature is None or action_feature.shape is None or len(action_feature.shape) != 1:
-                msg = "XR0 requires a flat action feature named 'action'"
-                raise ValueError(msg)
-            action_dim = int(action_feature.shape[0])
-            if action_dim > self.config.max_action_dim:
-                msg = f"action width {action_dim} exceeds max_action_dim={self.config.max_action_dim}"
-                raise ValueError(msg)
+        action_feature = train_dataset.action_features.get(ACTION)
+        if action_feature is None or action_feature.shape is None or len(action_feature.shape) != 1:
+            msg = "XR0 requires a flat action feature named 'action'"
+            raise ValueError(msg)
+        action_dim = int(action_feature.shape[0])
+        if action_dim > self.config.max_action_dim:
+            msg = f"action width {action_dim} exceeds max_action_dim={self.config.max_action_dim}"
+            raise ValueError(msg)
+        # Scan only when no per-timestep stats are known yet (new run or
+        # fine-tuning). Stats from ``action_mean``/``action_std`` or a loaded
+        # checkpoint are kept so resume/eval use the stats the weights saw.
+        if self._action_mean is None or self._action_std is None:
             mean, std = compute_action_chunk_stats(
                 datamodule,
                 chunk_size=self.config.chunk_size,
@@ -624,11 +626,17 @@ class XR0(XR0ExportablePolicyMixin, Policy):
                 setup_stage=None,
                 device="cpu",
             )
-            stats_dict[ACTION] = {
-                **stats_dict[ACTION],
-                "mean": mean[:, :action_dim].tolist(),
-                "std": std[:, :action_dim].tolist(),
-            }
+            self._action_mean = torch.as_tensor(mean[:, :action_dim], dtype=torch.float32)
+            self._action_std = torch.as_tensor(std[:, :action_dim], dtype=torch.float32)
+            self.hparams["action_mean"] = self._action_mean.tolist()
+            self.hparams["action_std"] = self._action_std.tolist()
+        # Start from the dataset's action entry (min/max/quantiles + type/name/shape),
+        # or from the feature metadata when the dataset has no action stats.
+        action_stats = dict(stats_dict.get(ACTION) or self._feature_stat_entry(action_feature))
+        # Replace mean/std with XR0's per-timestep chunk statistics.
+        action_stats["mean"] = self._action_mean.tolist()
+        action_stats["std"] = self._action_std.tolist()
+        stats_dict[ACTION] = action_stats
         self.hparams["dataset_stats"] = stats_dict
         if self.model is None:
             self._initialize_model(stats_dict)
@@ -650,6 +658,25 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         # runs before Lightning's eval-mode check, so this also clears the warning.
         if stage == "fit" and self.model is not None:
             self.model.train()
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Restore the action stats the checkpointed weights were trained with.
+
+        The pre/post-processor stat buffers are not part of ``state_dict``, and
+        ``trainer.fit/validate/...(ckpt_path=...)`` runs ``setup`` (and its stats
+        scan) before restoring the checkpoint. Reapply the saved stats here.
+        """
+        super().on_load_checkpoint(checkpoint)
+        stats = checkpoint.get("hyper_parameters", {}).get("dataset_stats")
+        if not stats or ACTION not in stats:
+            return
+        self._action_mean = torch.as_tensor(stats[ACTION]["mean"], dtype=torch.float32)
+        self._action_std = torch.as_tensor(stats[ACTION]["std"], dtype=torch.float32)
+        self.hparams["action_mean"] = self._action_mean.tolist()
+        self.hparams["action_std"] = self._action_std.tolist()
+        self.hparams["dataset_stats"] = stats
+        if self.model is not None:
+            self._rebuild_preprocessors(stats)
 
     def forward(self, batch: Observation) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """Forward pass: training loss (train) or action chunk (eval).
@@ -950,8 +977,6 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         if self.model is None or self._input_features is None:
             return None
 
-        num_image_features = sum(1 for feature in self._input_features if feature.ftype == FeatureType.VISUAL)
-
         schema: list[InferenceFeature] = []
         for feature in self._input_features:
             if feature.ftype not in {FeatureType.STATE, FeatureType.VISUAL}:
@@ -970,12 +995,11 @@ class XR0(XR0ExportablePolicyMixin, Policy):
                 )
             else:
                 feature_name = str(feature.name or "").removeprefix("observation.").removeprefix(f"{IMAGES}.")
-                name = IMAGES if num_image_features == 1 else f"{IMAGES}.{feature_name}"
                 schema.append(
                     InferenceFeature(
                         ftype=InferenceFeatureType.VISUAL,
                         shape=tuple(feature.shape),
-                        name=name,
+                        name=f"{IMAGES}.{feature_name}",
                         dtype=InferenceFeatureDtype.FLOAT32,
                     ),
                 )

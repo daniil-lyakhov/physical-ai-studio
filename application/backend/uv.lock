@@ -3196,6 +3196,7 @@ tests = [
 ]
 xpu = [
     { name = "torch", version = "2.11.0+xpu", source = { registry = "https://download.pytorch.org/whl/xpu" } },
+    { name = "torchao" },
     { name = "torchvision", version = "0.26.0+xpu", source = { registry = "https://download.pytorch.org/whl/xpu" } },
 ]
 
@@ -3262,6 +3263,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.11,<2.12", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "physicalai-studio", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cuda'", specifier = ">=2.11,<2.12", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "physicalai-studio", extra = "cuda" } },
     { name = "torch", marker = "extra == 'xpu'", specifier = ">=2.11,<2.12", index = "https://download.pytorch.org/whl/xpu", conflict = { package = "physicalai-studio", extra = "xpu" } },
+    { name = "torchao", marker = "extra == 'xpu'", specifier = ">=0.17.0", index = "https://pypi.org/simple" },
     { name = "torchcodec", specifier = "==0.11.1" },
     { name = "torchvision", marker = "extra == 'cpu'", specifier = ">=0.26,<0.27", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "physicalai-studio", extra = "cpu" } },
     { name = "torchvision", marker = "extra == 'cuda'", specifier = ">=0.26,<0.27", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "physicalai-studio", extra = "cuda" } },
@@ -3420,7 +3422,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'cpu'", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "physicalai-train", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cu128'", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "physicalai-train", extra = "cu128" } },
     { name = "torch", marker = "extra == 'xpu'", index = "https://download.pytorch.org/whl/xpu", conflict = { package = "physicalai-train", extra = "xpu" } },
-    { name = "torchao", marker = "extra == 'cu128'", specifier = ">=0.17.0,<0.18.0", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "physicalai-train", extra = "cu128" } },
+    { name = "torchao", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cu128'", specifier = ">=0.17.0,<0.18.0", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "physicalai-train", extra = "cu128" } },
     { name = "torchao", marker = "extra == 'xpu'", specifier = ">=0.17.0", index = "https://download.pytorch.org/whl/xpu", conflict = { package = "physicalai-train", extra = "xpu" } },
     { name = "torchvision", marker = "extra == 'cpu'", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "physicalai-train", extra = "cpu" } },
     { name = "torchvision", marker = "extra == 'cu128'", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "physicalai-train", extra = "cu128" } },
@@ -5109,10 +5111,11 @@ wheels = [
 
 [[package]]
 name = "torchao"
-version = "0.18.0+xpu"
-source = { registry = "https://download.pytorch.org/whl/xpu" }
+version = "0.18.0"
+source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://download.pytorch.org/whl/xpu/torchao-0.18.0%2Bxpu-py3-none-any.whl", hash = "sha256:7873ff8f3a2db89c3ed38ef85cd3aadf4817549d2c00e8431241cf2f4ecc2994", upload-time = "2026-08-03T19:00:28Z" },
+    { url = "https://files.pythonhosted.org/packages/19/55/ed9ad98f0f09d5a1124d09830043d13a39e63539f9590d2bdb6d71cbc4a4/torchao-0.18.0-cp310-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6540b148e40ba81cbd4de86392225a076a1591146e9cebb099b3b234ba9feebe", size = 3372585, upload-time = "2026-08-03T19:43:10.993Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/4d/485477bb8f05bd501016059c6d8abd742f830cb1b24ab7704e086c7cc35a/torchao-0.18.0-py3-none-any.whl", hash = "sha256:5c2b4485341bf28b7fed2c4fc95b9f298e209f41685350f067de85527a05585e", size = 1369798, upload-time = "2026-08-03T19:43:12.649Z" },
 ]
 
 [[package]]

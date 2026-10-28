@@ -53,8 +53,13 @@ dependencies = [
 cpu = ["torch", "torchvision"]
 # torchao must come from the pytorch-cu128 index: the PyPI wheels for 0.18+ are
 # built against CUDA 13 (`libcudart.so.13`) and fail to dlopen next to a cu128
-# torch. See [tool.uv.sources] for the index pin.
-cu128 = ["torch", "torchvision", "torchao>=0.17.0,<0.18.0"]
+# torch. See [tool.uv.sources] for the index pin. The cu128 index only has a
+# Linux x86-64 torchao wheel (no sdist), so gate it to keep Windows installs working.
+cu128 = [
+    "torch",
+    "torchvision",
+    "torchao>=0.17.0,<0.18.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 xpu = [
     "torch",
     "torchvision",

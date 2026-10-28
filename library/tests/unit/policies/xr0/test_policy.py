@@ -141,12 +141,16 @@ def test_build_optimizer_low_bit(optimizer_type: str, dtype: str, monkeypatch: p
     assert optimizer is chosen.return_value
 
 
-def test_build_optimizer_requires_torchao(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Low-bit optimizers fail clearly when the optional dependency is missing."""
+def test_build_optimizer_falls_back_without_torchao(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Low-bit optimizers fall back to plain AdamW with a warning when torchao is missing."""
     monkeypatch.setitem(sys.modules, "torchao", None)
     monkeypatch.setitem(sys.modules, "torchao.optim", None)
-    with pytest.raises(ImportError, match="requires the 'torchao' package"):
-        _build_optimizer(XR0Config(), [{"params": [torch.nn.Parameter(torch.ones(1))]}])
+    with caplog.at_level("WARNING"):
+        optimizer = _build_optimizer(XR0Config(), [{"params": [torch.nn.Parameter(torch.ones(1))]}])
+    assert type(optimizer) is torch.optim.AdamW
+    assert "requires the 'torchao' package" in caplog.text
 
 
 class TestXR0Policy:
@@ -307,6 +311,53 @@ class TestActionStatsSetup:
         assert stats == {"shape": (2,), "mean": [[2, 3], [4, 5]], "std": [[1, 2], [3, 4]]}
         assert dataset.stats[ACTION]["mean"] == [100.0, 100.0]
         initialize.assert_called_once_with(policy.hparams["dataset_stats"])
+        # Scanned stats are kept so a reloaded checkpoint skips the scan.
+        assert policy.hparams["action_mean"] == [[2, 3], [4, 5]]
+        assert policy.hparams["action_std"] == [[1, 2], [3, 4]]
+        policy.setup("validate")
+        scan.assert_called_once()
+
+    def test_on_load_checkpoint_restores_action_stats(self) -> None:
+        policy = XR0(chunk_size=2, n_action_steps=1, max_action_dim=3)
+        policy._action_mean = torch.zeros(2, 2)  # noqa: SLF001  # rescanned in setup
+        policy._action_std = torch.ones(2, 2)  # noqa: SLF001
+        policy.model = MagicMock()
+        rebuild = MagicMock()
+        policy._rebuild_preprocessors = rebuild  # noqa: SLF001
+        saved = {ACTION: {"shape": (2,), "mean": [[2.0, 3.0], [4.0, 5.0]], "std": [[1.0, 2.0], [3.0, 4.0]]}}
+
+        policy.on_load_checkpoint({"hyper_parameters": {"dataset_stats": saved}, "state_dict": {}})
+
+        assert policy.hparams["action_mean"] == [[2.0, 3.0], [4.0, 5.0]]
+        assert policy.hparams["action_std"] == [[1.0, 2.0], [3.0, 4.0]]
+        assert policy.hparams["dataset_stats"] == saved
+        rebuild.assert_called_once_with(saved)
+
+    def test_setup_builds_action_stats_without_dataset_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # An action feature with ``normalization_data=None`` is absent from Dataset.stats;
+        # the scanned stats must still be stored, with metadata taken from the feature.
+        import physicalai.policies.xr0.policy as xr0_policy  # noqa: PLC0415
+
+        policy = XR0(chunk_size=2, n_action_steps=1, max_action_dim=3)
+        dataset = MagicMock(spec=Dataset)
+        dataset.observation_features = {}
+        dataset.action_features = {ACTION: Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(2,))}
+        dataset.stats = {}
+        policy._trainer = types.SimpleNamespace(datamodule=types.SimpleNamespace(train_dataset=dataset))  # noqa: SLF001
+        monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", lambda *_args: None)
+        scan = MagicMock(return_value=(torch.tensor([[2, 3, 0], [4, 5, 0]]), torch.tensor([[1, 2, 1], [3, 4, 1]])))
+        monkeypatch.setattr(xr0_policy, "compute_action_chunk_stats", scan)
+        monkeypatch.setattr(policy, "_initialize_model", MagicMock())
+
+        policy.setup("fit")
+
+        assert policy.hparams["dataset_stats"][ACTION] == {
+            "type": FeatureType.ACTION.value,
+            "name": ACTION,
+            "shape": (2,),
+            "mean": [[2, 3], [4, 5]],
+            "std": [[1, 2], [3, 4]],
+        }
 
     def test_explicit_stats_skip_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import physicalai.policies.xr0.policy as xr0_policy  # noqa: PLC0415
@@ -328,6 +379,28 @@ class TestActionStatsSetup:
         datamodule.train_dataloader.assert_not_called()
         assert policy.hparams["action_mean"] == mean.tolist()
         assert policy.hparams["action_std"] == std.tolist()
+
+    @pytest.mark.parametrize("given", ["action_mean", "action_std"])
+    def test_partial_explicit_stats_still_scan(self, given: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Preprocessors ignore an incomplete override pair, so setup must scan.
+        import physicalai.policies.xr0.policy as xr0_policy  # noqa: PLC0415
+
+        policy = XR0(chunk_size=2, n_action_steps=1, max_action_dim=3, **{given: torch.ones(2, 3)})
+        dataset = MagicMock(spec=Dataset)
+        dataset.observation_features = {}
+        dataset.action_features = {ACTION: Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(2,))}
+        dataset.stats = {ACTION: {"shape": (2,), "mean": [0.0, 0.0], "std": [1.0, 1.0]}}
+        policy._trainer = types.SimpleNamespace(datamodule=types.SimpleNamespace(train_dataset=dataset))  # noqa: SLF001
+        monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", lambda *_args: None)
+        scan = MagicMock(return_value=(torch.tensor([[2, 3, 0], [4, 5, 0]]), torch.tensor([[1, 2, 1], [3, 4, 1]])))
+        monkeypatch.setattr(xr0_policy, "compute_action_chunk_stats", scan)
+        monkeypatch.setattr(policy, "_initialize_model", MagicMock())
+
+        policy.setup("fit")
+
+        scan.assert_called_once()
+        assert policy.hparams["dataset_stats"][ACTION]["mean"] == [[2, 3], [4, 5]]
+        assert policy.hparams["dataset_stats"][ACTION]["std"] == [[1, 2], [3, 4]]
 
 
 class TestXR0Features:
@@ -426,10 +499,10 @@ class TestXR0Export:
         schema = policy.inputs_schema
         assert schema is not None
         by_name = {feature.name: feature for feature in schema}
-        assert set(by_name) == {STATE, IMAGES, TASK}
+        assert set(by_name) == {STATE, f"{IMAGES}.base", TASK}
         assert by_name[STATE].ftype is InferenceFeatureType.STATE
         assert by_name[STATE].shape == (8,)
-        assert by_name[IMAGES].ftype is InferenceFeatureType.VISUAL
+        assert by_name[f"{IMAGES}.base"].ftype is InferenceFeatureType.VISUAL
         assert by_name[TASK].ftype is InferenceFeatureType.LANGUAGE
 
     def test_outputs_schema_from_features(self) -> None:
@@ -459,8 +532,21 @@ class TestXR0Export:
         policy._output_features = [Feature(name=ACTION, ftype=FeatureType.ACTION, shape=(6,))]
 
         names = {feature.name for feature in policy.inputs_schema or []}
-        # Two cameras -> per-view names (no single-camera IMAGES collapse).
         assert names == {STATE, f"{IMAGES}.base", f"{IMAGES}.wrist_left", TASK}
+
+    def test_single_camera_sample_matches_view_map(self) -> None:
+        # A single mapped camera must keep its name in the export sample, otherwise
+        # the preprocessor's exact-key view-map check rejects it during export.
+        from physicalai.policies.xr0.preprocessor import XR0Preprocessor  # noqa: PLC0415
+
+        policy = XR0(chunk_size=30)
+        policy.model = object()  # type: ignore[assignment]  # sentinel to bypass lazy-init guard
+        policy._input_features, policy._output_features = XR0._stats_to_features(_minimal_export_stats())
+
+        sample = policy.sample_input
+        assert sample is not None
+        views, _ = XR0Preprocessor(image_key_view_map={f"{IMAGES}.base": "ego"})._extract_view_images(sample)  # noqa: SLF001
+        assert views == ["ego"]
 
 
 class TestXR0DeltaMode:
@@ -532,4 +618,3 @@ class TestXR0DeltaMode:
             # left as ``None`` (not overwritten with the mirrored lists).
             assert policy.hparams["action_mean"] is None
             assert policy.hparams["action_std"] is None
-
