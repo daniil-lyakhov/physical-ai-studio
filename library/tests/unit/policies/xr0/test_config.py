@@ -20,7 +20,7 @@ def test_defaults() -> None:
     assert cfg.dit_num_layers == 16
     assert cfg.dtype == "float32"
     assert cfg.image_key_view_map == {}
-    assert cfg.optimizer_type == "adamw4bit"
+    assert cfg.optimizer_type == "adamw8bit"
     assert cfg.optimizer_lr == 1e-4
 
 

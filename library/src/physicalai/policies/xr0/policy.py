@@ -284,8 +284,8 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         action_stats_max_batches: Optional cap on training batches scanned for
             action stats. ``None`` scans the full training dataset.
         normalization_mode: Normalization method for state/action features.
-        optimizer_type: AdamW implementation: ``"adamw4bit"`` (default),
-            ``"adamw8bit"`` or ``"adamw"``. The low-bit variants need torchao.
+        optimizer_type: AdamW implementation: ``"adamw8bit"`` (default),
+            ``"adamw4bit"`` or ``"adamw"``. The low-bit variants need torchao.
         optimizer_lr: Learning rate.
         optimizer_betas: Adam beta coefficients.
         optimizer_eps: Optimizer epsilon.
@@ -350,7 +350,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         action_std: Sequence[float] | torch.Tensor | None = None,
         action_stats_max_batches: int | None = None,
         normalization_mode: Literal["MEAN_STD", "QUANTILES"] = "QUANTILES",
-        optimizer_type: Literal["adamw", "adamw4bit", "adamw8bit"] = "adamw4bit",
+        optimizer_type: Literal["adamw", "adamw4bit", "adamw8bit"] = "adamw8bit",
         optimizer_lr: float = 1.0e-4,
         optimizer_betas: tuple[float, float] = (0.9, 0.95),
         optimizer_eps: float = 1e-8,
