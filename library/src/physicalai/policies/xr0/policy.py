@@ -626,10 +626,14 @@ class XR0(XR0ExportablePolicyMixin, Policy):
                 setup_stage=None,
                 device="cpu",
             )
-            self._action_mean = torch.as_tensor(mean[:, :action_dim], dtype=torch.float32)
-            self._action_std = torch.as_tensor(std[:, :action_dim], dtype=torch.float32)
-            self.hparams["action_mean"] = self._action_mean.tolist()
-            self.hparams["action_std"] = self._action_std.tolist()
+            self._action_mean = torch.as_tensor(mean, dtype=torch.float32)
+            self._action_std = torch.as_tensor(std, dtype=torch.float32)
+        # Trim scanned or explicit (possibly ``max_action_dim``-padded) stats to
+        # the real action width so padding never leaks into the stats.
+        self._action_mean = self._action_mean[..., :action_dim]
+        self._action_std = self._action_std[..., :action_dim]
+        self.hparams["action_mean"] = self._action_mean.tolist()
+        self.hparams["action_std"] = self._action_std.tolist()
         # Start from the dataset's action entry (min/max/quantiles + type/name/shape),
         # or from the feature metadata when the dataset has no action stats.
         action_stats = dict(stats_dict.get(ACTION) or self._feature_stat_entry(action_feature))

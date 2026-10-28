@@ -583,6 +583,17 @@ class TestPostprocessor:
         assert torch.equal(post.action_mean, torch.tensor([[10, 20, 0], [30, 40, 0]] if both else [[2, 4, 0], [6, 8, 0]]))
         assert torch.equal(post.action_std, torch.tensor([[11, 21, 1], [31, 41, 1]] if both else [[1, 3, 1], [5, 7, 1]]))
 
+    def test_action_dim_prefers_declared_feature_width(self) -> None:
+        """Stats padded to ``max_action_dim`` must not widen the unpadded action output."""
+        feature = Feature(
+            ftype=FeatureType.ACTION,
+            shape=(2,),
+            normalization_data=NormalizationParameters(mean=[[0, 0, 0, 0]] * 2, std=[[1, 1, 1, 1]] * 2),
+        )
+        post = XR0Postprocessor(max_action_dim=4, chunk_size=2, features={"action": feature})
+        assert post.action_dim == 2
+        assert post({ACTION: torch.zeros(1, 2, 4)})[ACTION].shape[-1] == 2
+
     @staticmethod
     def _post(
         max_action_dim: int = 3,

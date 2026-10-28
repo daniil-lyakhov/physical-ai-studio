@@ -730,9 +730,10 @@ class XR0Postprocessor(torch.nn.Module):
                 continue
             if action_mean is None or action_std is None:
                 raw_mean, raw_std = torch.as_tensor(norm.mean), torch.as_tensor(norm.std)
-            # The unpadded action width is the feature's last axis, not its
-            # element count: the stats are per-timestep ``(chunk_size, D)``.
-            feat_dim = int(torch.as_tensor(norm.mean).shape[-1])
+            # Prefer the feature's declared width: explicit stats may be padded
+            # to ``max_action_dim``. Fall back to the per-timestep stats' last
+            # axis ``(chunk_size, D)`` when the shape is unknown.
+            feat_dim = int(feature.shape[-1]) if feature.shape else int(torch.as_tensor(norm.mean).shape[-1])
             self.action_dim = min(max_action_dim, feat_dim)
             break
 

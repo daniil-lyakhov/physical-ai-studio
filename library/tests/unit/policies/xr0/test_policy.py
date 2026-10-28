@@ -377,8 +377,10 @@ class TestActionStatsSetup:
         policy.setup("fit")
 
         datamodule.train_dataloader.assert_not_called()
-        assert policy.hparams["action_mean"] == mean.tolist()
-        assert policy.hparams["action_std"] == std.tolist()
+        # Padded ``max_action_dim``-wide overrides are trimmed to the real action width.
+        assert policy.hparams["action_mean"] == mean[:, :2].tolist()
+        assert policy.hparams["action_std"] == std[:, :2].tolist()
+        assert policy.hparams["dataset_stats"][ACTION]["mean"] == mean[:, :2].tolist()
 
     @pytest.mark.parametrize("given", ["action_mean", "action_std"])
     def test_partial_explicit_stats_still_scan(self, given: str, monkeypatch: pytest.MonkeyPatch) -> None:
