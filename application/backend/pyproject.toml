@@ -80,9 +80,7 @@ cuda = [
 xpu = [
     "torch>=2.11,<2.12",
     "torchvision>=0.26,<0.27",
-    # cpu/cuda get torchao via executorch; xpu needs it directly for XR0's
-    # default low-bit optimizer (`adamw8bit`).
-    "torchao>=0.17.0",
+    "torchao>=0.17.0,<0.18.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 tests = [

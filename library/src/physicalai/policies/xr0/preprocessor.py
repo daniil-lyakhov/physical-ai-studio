@@ -51,6 +51,9 @@ _BATCHED_IMAGE_NDIM = 4
 _BATCHED_ACTION_NDIM = 2
 _STATS_NDIM = 2
 
+_STATE_NAME = "state"
+_ACTION_NAME = "action"
+
 # Pinned commit SHA for the default Qwen3-VL processor download. A concrete
 # revision keeps the fetched tokenizer/processor reproducible and avoids the
 # supply-chain risk of resolving to a moving HEAD (see library security rule 9).
@@ -387,7 +390,7 @@ class XR0Preprocessor(torch.nn.Module):
             raw_std,
             chunk_size=self.chunk_size,
             dim=self.max_action_dim,
-            name="action",
+            name=_ACTION_NAME,
         )
         self.register_buffer("action_mean", mean, persistent=False)
         self.register_buffer("action_std", std, persistent=False)
@@ -404,7 +407,7 @@ class XR0Preprocessor(torch.nn.Module):
             raw_std,
             chunk_size=self.state_len,
             dim=self.max_state_dim,
-            name="state",
+            name=_STATE_NAME,
         )
         self.register_buffer("state_mean", s_mean, persistent=False)
         self.register_buffer("state_std", s_std, persistent=False)
@@ -747,7 +750,7 @@ class XR0Postprocessor(torch.nn.Module):
             raw_std,
             chunk_size=self.chunk_size,
             dim=max_action_dim,
-            name="action",
+            name=_ACTION_NAME,
         )
 
         self.register_buffer("action_mean", mean, persistent=False)
