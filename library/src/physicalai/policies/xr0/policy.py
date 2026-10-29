@@ -585,7 +585,7 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             msg = f"action width {action_dim} exceeds max_action_dim={self.config.max_action_dim}"
             raise ValueError(msg)
 
-        # Build the model first to utilize ``XR0Model.action_delta_indices``.
+        # Build the model first to utilise ``XR0Model.action_delta_indices``.
         if self.model is None:
             self._initialize_model()
 
