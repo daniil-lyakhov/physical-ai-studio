@@ -465,7 +465,8 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             self._dataset_stats = dataset_stats
 
         if dataset_stats is not None:
-            self._initialize_model(dataset_stats)
+            self._initialize_model()
+            self._rebuild_preprocessors(dataset_stats)
 
     def _set_hparam_keys(self) -> None:
         """Sync top-level checkpoint hparams from the resolved policy config."""
@@ -475,8 +476,8 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             self.hparams[key] = value
         self.hparams["config"] = self.config.to_dict()
 
-    def _initialize_model(self, dataset_stats: dict[str, dict[str, Any]]) -> None:
-        """Build the model and preprocessors from dataset statistics."""
+    def _initialize_model(self) -> None:
+        """Build the model from the config and load the pretrained weights, if any."""
         cfg = self.config
         self.model = XR0Model(
             vlm_model_id=cfg.vlm_model_id,
@@ -503,6 +504,9 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         if self._pretrained_path is not None:
             self._load_pretrained_weights(self._pretrained_path)
 
+    def _rebuild_preprocessors(self, dataset_stats: dict[str, dict[str, Any]]) -> None:
+        """(Re)build the pre/post-processors from dataset stats, keeping model weights."""
+        cfg = self.config
         self._preprocessor, self._postprocessor = make_xr0_preprocessors(
             max_state_dim=cfg.max_state_dim,
             max_action_dim=cfg.max_action_dim,
@@ -523,33 +527,6 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         # ``inputs_schema`` / ``outputs_schema`` are feature-driven.
         if self._input_features is None or self._output_features is None:
             self._input_features, self._output_features = self._stats_to_features(dataset_stats)
-
-    def _rebuild_preprocessors(self, dataset_stats: dict[str, dict[str, Any]]) -> None:
-        """Rebuild the pre/post-processors from dataset stats, keeping model weights.
-
-        Used when the model was already built eagerly (e.g. from a pretrained
-        checkpoint) but fine-tuning needs the dataset's own normalization.
-        """
-        cfg = self.config
-        self._preprocessor, self._postprocessor = make_xr0_preprocessors(
-            max_state_dim=cfg.max_state_dim,
-            max_action_dim=cfg.max_action_dim,
-            stats=dataset_stats,
-            chunk_size=cfg.chunk_size,
-            state_len=cfg.state_len,
-            processor_name=cfg.vlm_model_id,
-            image_key_view_map=cfg.image_key_view_map,
-            normalize_state=cfg.normalize_state,
-            action_mode=cfg.action_mode,
-            action_mean=self._action_mean,
-            action_std=self._action_std,
-        )
-        self._dataset_stats = dataset_stats
-
-    @property
-    def action_delta_indices(self) -> list[int]:
-        """Expose the action horizon before the model is initialized."""
-        return list(range(self.config.chunk_size))
 
     def _load_pretrained_weights(self, pretrained_path: Path) -> None:
         """Load remapped pretrained weights into ``self.model`` (non-strict).
@@ -599,11 +576,6 @@ class XR0(XR0ExportablePolicyMixin, Policy):
             self.hparams["input_features"] = input_features
             self.hparams["output_features"] = output_features
 
-        # Chunk before scanning stats (and before lazy model initialization).
-        # Dataset.stats holds frame-level LeRobot stats, not XR0's per-timestep
-        # action targets; delta mode also needs to subtract the current state.
-        reformat_dataset_to_match_policy(self, datamodule)
-        stats_dict = dict(train_dataset.stats)
         action_feature = train_dataset.action_features.get(ACTION)
         if action_feature is None or action_feature.shape is None or len(action_feature.shape) != 1:
             msg = "XR0 requires a flat action feature named 'action'"
@@ -612,6 +584,17 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         if action_dim > self.config.max_action_dim:
             msg = f"action width {action_dim} exceeds max_action_dim={self.config.max_action_dim}"
             raise ValueError(msg)
+
+        # Build the model first to utilize ``XR0Model.action_delta_indices``.
+        if self.model is None:
+            self._initialize_model()
+
+        # Make each sample an action chunk of ``chunk_size`` steps. This must run
+        # before the stats scan below: XR0 normalizes each chunk timestep with
+        # its own mean/std, so the per-frame ``Dataset.stats``
+        # cannot be used for actions.
+        reformat_dataset_to_match_policy(self, datamodule)
+        stats_dict = dict(train_dataset.stats)
         # Scan only when no per-timestep stats are known yet (new run or
         # fine-tuning). Stats from ``action_mean``/``action_std`` or a loaded
         # checkpoint are kept so resume/eval use the stats the weights saw.
@@ -642,17 +625,10 @@ class XR0(XR0ExportablePolicyMixin, Policy):
         action_stats["std"] = self._action_std.tolist()
         stats_dict[ACTION] = action_stats
         self.hparams["dataset_stats"] = stats_dict
-        if self.model is None:
-            self._initialize_model(stats_dict)
-        else:
-            # The model was built eagerly in ``__init__`` (e.g. from a pretrained
-            # checkpoint whose normalization stats belong to a *different*
-            # embodiment -- delta actions with tiny std). For fine-tuning, the
-            # normalization must come from the fine-tuning dataset, otherwise the
-            # action/state get divided by the wrong (tiny) std and the flow
-            # target explodes. Rebuild the pre/post-processors from the datamodule
-            # stats while keeping the already-loaded model weights.
-            self._rebuild_preprocessors(stats_dict)
+        # Always (re)build from the datamodule stats: an eagerly built pretrained
+        # model carries another embodiment's normalization (e.g. tiny delta std),
+        # which would blow up the flow target when fine-tuning.
+        self._rebuild_preprocessors(stats_dict)
 
         # The Qwen3-VL backbone is built via ``from_pretrained``, which returns an
         # eval-mode module, and Lightning does not implicitly flip module

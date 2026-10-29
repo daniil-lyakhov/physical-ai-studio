@@ -24,7 +24,6 @@ import torch
 
 from physicalai.data import Feature, FeatureType, Observation
 from physicalai.data.dataset import Dataset
-from physicalai.data.lerobot.dataset import _LeRobotDatasetAdapter  # noqa: PLC2701
 from physicalai.data.observation import ACTION, IMAGES, STATE, TASK
 from physicalai.export import ExportBackend
 from physicalai.export.backends import TorchExportParameters
@@ -32,7 +31,6 @@ from physicalai.inference.data import InferenceFeatureDtype, InferenceFeatureTyp
 from physicalai.policies import get_physicalai_policy_class, get_policy
 from physicalai.policies.xr0 import XR0, XR0Config, XR0Model, make_xr0_preprocessors
 from physicalai.policies.xr0.policy import _build_optimizer  # noqa: PLC2701
-from physicalai.train.utils import reformat_dataset_to_match_policy
 
 
 def _minimal_export_stats() -> dict[str, dict[str, Any]]:
@@ -187,20 +185,6 @@ class TestXR0Policy:
 class TestActionStatsSetup:
     """Training stats come from chunked data, not LeRobot frame metadata."""
 
-    def test_lazy_chunking_uses_chunk_size_not_execution_horizon(self) -> None:
-        policy = XR0(chunk_size=4, n_action_steps=2)
-        raw = types.SimpleNamespace(
-            features={ACTION: {}, "observation.state": {}},
-            fps=30,
-            tolerance_s=1e-4,
-            delta_indices={},
-        )
-        dataset = _LeRobotDatasetAdapter.from_lerobot(raw)
-
-        reformat_dataset_to_match_policy(policy, types.SimpleNamespace(train_dataset=dataset))
-
-        assert dataset.delta_indices[ACTION] == [0, 1, 2, 3]
-
     @pytest.mark.parametrize("mode", ["absolute", "delta"])
     def test_setup_collects_and_checkpoints_stats(self, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
         import physicalai.policies.xr0.policy as xr0_policy  # noqa: PLC0415
@@ -224,24 +208,27 @@ class TestActionStatsSetup:
         def reformat(_policy: XR0, _data: object) -> None:
             sequence.append("chunked")
 
-        def initialize(stats: dict[str, dict[str, Any]]) -> None:
+        def initialize() -> None:
             sequence.append("initialized")
+
+        def rebuild(stats: dict[str, dict[str, Any]]) -> None:
+            sequence.append("rebuilt")
             assert stats[ACTION]["mean"] == policy.hparams["dataset_stats"][ACTION]["mean"]
 
         monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", reformat)
         monkeypatch.setattr(policy, "_initialize_model", initialize)
+        monkeypatch.setattr(policy, "_rebuild_preprocessors", rebuild)
         policy.setup("fit")
 
         target = actions.clone()
         if mode == "delta":
             target[..., :1] -= states[:, None, :]
-        assert sequence == ["chunked", "initialized"]
+        assert sequence == ["initialized", "chunked", "rebuilt"]
         assert torch.allclose(torch.tensor(policy.hparams["dataset_stats"][ACTION]["mean"]), target.mean(0))
         assert torch.allclose(
             torch.tensor(policy.hparams["dataset_stats"][ACTION]["std"]), target.std(0, unbiased=False)
         )
         assert dataset.stats[ACTION]["mean"] == [100.0, 100.0]
-        assert policy.action_delta_indices == [0, 1]
 
     @pytest.mark.parametrize(
         ("shape", "missing", "message"),
@@ -290,9 +277,11 @@ class TestActionStatsSetup:
             return_value=(torch.tensor([[2, 3, 0], [4, 5, 0]]), torch.tensor([[1, 2, 1], [3, 4, 1]]))
         )
         initialize = MagicMock()
+        rebuild = MagicMock()
         monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", reformat)
         monkeypatch.setattr(xr0_policy, "compute_action_chunk_stats", scan)
         monkeypatch.setattr(policy, "_initialize_model", initialize)
+        monkeypatch.setattr(policy, "_rebuild_preprocessors", rebuild)
 
         policy.setup("fit")
 
@@ -310,7 +299,8 @@ class TestActionStatsSetup:
         stats = policy.hparams["dataset_stats"][ACTION]
         assert stats == {"shape": (2,), "mean": [[2, 3], [4, 5]], "std": [[1, 2], [3, 4]]}
         assert dataset.stats[ACTION]["mean"] == [100.0, 100.0]
-        initialize.assert_called_once_with(policy.hparams["dataset_stats"])
+        initialize.assert_called_once_with()
+        rebuild.assert_called_once_with(policy.hparams["dataset_stats"])
         # Scanned stats are kept so a reloaded checkpoint skips the scan.
         assert policy.hparams["action_mean"] == [[2, 3], [4, 5]]
         assert policy.hparams["action_std"] == [[1, 2], [3, 4]]
@@ -348,6 +338,7 @@ class TestActionStatsSetup:
         scan = MagicMock(return_value=(torch.tensor([[2, 3, 0], [4, 5, 0]]), torch.tensor([[1, 2, 1], [3, 4, 1]])))
         monkeypatch.setattr(xr0_policy, "compute_action_chunk_stats", scan)
         monkeypatch.setattr(policy, "_initialize_model", MagicMock())
+        monkeypatch.setattr(policy, "_rebuild_preprocessors", MagicMock())
 
         policy.setup("fit")
 
@@ -372,7 +363,8 @@ class TestActionStatsSetup:
         datamodule = types.SimpleNamespace(train_dataset=dataset, train_dataloader=MagicMock())
         policy._trainer = types.SimpleNamespace(datamodule=datamodule)  # noqa: SLF001
         monkeypatch.setattr(xr0_policy, "reformat_dataset_to_match_policy", lambda *_args: None)
-        monkeypatch.setattr(policy, "_initialize_model", lambda _stats: None)
+        monkeypatch.setattr(policy, "_initialize_model", MagicMock())
+        monkeypatch.setattr(policy, "_rebuild_preprocessors", MagicMock())
 
         policy.setup("fit")
 
@@ -397,6 +389,7 @@ class TestActionStatsSetup:
         scan = MagicMock(return_value=(torch.tensor([[2, 3, 0], [4, 5, 0]]), torch.tensor([[1, 2, 1], [3, 4, 1]])))
         monkeypatch.setattr(xr0_policy, "compute_action_chunk_stats", scan)
         monkeypatch.setattr(policy, "_initialize_model", MagicMock())
+        monkeypatch.setattr(policy, "_rebuild_preprocessors", MagicMock())
 
         policy.setup("fit")
 
